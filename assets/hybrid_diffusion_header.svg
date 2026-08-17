@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="260" viewBox="0 0 1200 260" role="img" aria-labelledby="title desc">
+  <title id="title">HybridDiffusion</title>
+  <desc id="desc">The HybridDiffusion wordmark, with a warm ochre D and a small spark above it.</desc>
+
+  <rect width="1200" height="260" fill="#faf8f3"/>
+
+  <g font-family="Georgia, 'Times New Roman', serif" font-size="118"
+     font-weight="600" letter-spacing="-3">
+    <text x="96" y="184" fill="#1a1a18">Hybrid</text>
+    <text x="518" y="184" fill="#a07a49" font-style="italic">D</text>
+    <text x="608" y="184" fill="#1a1a18">iffusion</text>
+  </g>
+
+  <path d="M575 38L579 56L594 48L586 63L603 67L586 71L594 86L579 78L575 96L571 78L556 86L564 71L547 67L564 63L556 48L571 56Z"
+        fill="#a07a49"/>
+</svg>

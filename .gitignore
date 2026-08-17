@@ -1,0 +1,46 @@
+__pycache__
+.idea
+.DS_Store
+*.egg-info
+build
+outputs
+dist/*
+.vscode
+.vs
+uv.lock
+/.venv/
+/.cache/
+/cache/
+
+# data
+data
+out
+wandb
+
+# results
+results
+
+# hf assets
+assets/hf/*
+assets/tokenizer/*
+
+# temp files
+*.log
+.fuse_hidden*
+error.json
+_remote_module_non_scriptable.py
+
+# Editor temporaries (VIM)
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+Session.vim
+Sessionx.vim
+.netrwhist
+*~
+.~lock.*
+
+# env files
+.env

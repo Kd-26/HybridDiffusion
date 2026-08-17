@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+results/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+.claude
+.cursor
+
+# local working dirs
+.cache/
+.venv/
+cache/
+checkpoints/
+
+# Recreated by scripts/setup_eval_env.sh from pinned external build data.
+third_party/flashinfer/flashinfer/data
+
+# backup files
+*.bak

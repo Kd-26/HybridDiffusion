@@ -1,0 +1,32 @@
+{"text":"Synthetic training sample 00. Alpha beta gamma delta epsilon. This fixture contains no external dataset content."}
+{"text":"Synthetic training sample 01. One two three four five. This fixture is generated solely for smoke testing."}
+{"text":"Synthetic training sample 02. Red green blue orange purple. Local deterministic input for a training test."}
+{"text":"Synthetic training sample 03. North south east west center. No network or dataset download is required."}
+{"text":"Synthetic training sample 04. Spring summer autumn winter. Repeated tokens exercise sequence packing."}
+{"text":"Synthetic training sample 05. Mercury Venus Earth Mars Jupiter. The statements are intentionally generic."}
+{"text":"Synthetic training sample 06. Circle square triangle rectangle. This row is test-only generated content."}
+{"text":"Synthetic training sample 07. Copper silver gold iron carbon. The tokenizer receives plain UTF-8 text."}
+{"text":"Synthetic training sample 08. Monday Tuesday Wednesday Thursday Friday. Deterministic smoke-test record."}
+{"text":"Synthetic training sample 09. Zero one two three four five six. The model output is not evaluated semantically."}
+{"text":"Synthetic training sample 10. River mountain forest desert ocean. This local row avoids real corpus data."}
+{"text":"Synthetic training sample 11. Piano violin flute drum trumpet. It exists only to make a finite dataset shard."}
+{"text":"Synthetic training sample 12. Hydrogen helium lithium beryllium. Generated text for unit and launch checks."}
+{"text":"Synthetic training sample 13. Apple pear peach plum melon. Every record is safe to redistribute with the tests."}
+{"text":"Synthetic training sample 14. Clock table chair window door. The content has no source or attribution dependency."}
+{"text":"Synthetic training sample 15. Cat dog bird fish horse. This is not an example drawn from a production dataset."}
+{"text":"Synthetic training sample 16. January February March April May. Repetition across epochs is expected."}
+{"text":"Synthetic training sample 17. Dawn noon dusk midnight. The loader may concatenate records into sequences."}
+{"text":"Synthetic training sample 18. Oak pine maple birch cedar. It supports deterministic checkpoint smoke tests."}
+{"text":"Synthetic training sample 19. Solid liquid gas plasma. Generated locally without private or public data access."}
+{"text":"Synthetic training sample 20. Addition subtraction multiplication division. A generic tokenizer input record."}
+{"text":"Synthetic training sample 21. Black white gray cyan magenta. The sequence has no experimental meaning."}
+{"text":"Synthetic training sample 22. Small medium large extra. Data-parallel ranks can shard these numbered records."}
+{"text":"Synthetic training sample 23. Morning afternoon evening night. The fixture intentionally stays compact."}
+{"text":"Synthetic training sample 24. First second third fourth fifth. This row validates iteration and batching."}
+{"text":"Synthetic training sample 25. Left right above below beside. It can be reused indefinitely by debug training."}
+{"text":"Synthetic training sample 26. Paper pencil ruler eraser notebook. Generated test vocabulary only."}
+{"text":"Synthetic training sample 27. Warm cool dry wet mild. No real conversations or user information are present."}
+{"text":"Synthetic training sample 28. Train validate save resume finish. This row names the intended smoke workflow."}
+{"text":"Synthetic training sample 29. Token batch block step loss. The words exercise common training log vocabulary."}
+{"text":"Synthetic training sample 30. Local portable public deterministic synthetic. This record describes itself."}
+{"text":"Synthetic training sample 31. End of generated fixture. It is sufficient for eight deterministic data shards."}

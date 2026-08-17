@@ -1,0 +1,117 @@
+# Qwen3.5-2B all-mask shift, causal x_t, causal x_0, LSFT-3K + Math + IF, block 1
+
+[job]
+dump_folder = "outputs"
+description = "Qwen3.5-2B all-mask shift causal_xt causal_x0, lsft3k_math_if, block 1"
+print_config = true
+
+[profiling]
+enable_profiling = false
+
+[metrics]
+log_freq = 1
+disable_color_printing = false
+enable_tensorboard = false
+enable_wandb = false
+save_tb_folder = "outputs/tb"
+wandb_mode = "online"
+
+[model]
+name = "qwen3_5_hybrid_diffusion_sft"
+flavor = "2B"
+hf_assets_path = "${MODEL_PATH}"
+
+[optimizer]
+name = "AdamW"
+lr = 1e-5
+eps = 1e-8
+weight_decay = 0.0
+beta1 = 0.9
+beta2 = 0.999
+
+[lr_scheduler]
+warmup_steps = 100
+decay_ratio = 0.0
+decay_type = "cosine"
+min_lr_factor = 1.0
+
+[training]
+local_batch_size = 8
+global_batch_size = 256
+seq_len = 4096
+max_norm = 1.0
+steps = 3000
+
+[[training.dataset_mix]]
+name = "nemotron_long_sft_3k"
+path = "${DATA_ROOT}/Long-SFT-3K"
+weight = 0.4
+
+[[training.dataset_mix]]
+name = "nemotron_math_domain"
+path = "${DATA_ROOT}/Nemotron-Math-Domain"
+weight = 0.4
+
+[[training.dataset_mix]]
+name = "nemotron_if_domain_cascade"
+path = "${DATA_ROOT}/Nemotron-IF-Domain-Cascade"
+weight = 0.2
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = -1
+fsdp_reshard_after_forward = "default"
+tensor_parallel_degree = 1
+enable_async_tensor_parallel = false
+pipeline_parallel_degree = 1
+pipeline_parallel_schedule = "1F1B"
+context_parallel_degree = 1
+expert_parallel_degree = 1
+expert_tensor_parallel_degree = 1
+
+[checkpoint]
+enable = true
+folder = "checkpoints"
+initial_load_model_only = true
+initial_ckpt_load_plan = "ckpt_model:mem_model"
+interval = 250
+last_save_model_only = false
+export_dtype = "bfloat16"
+async_mode = "async"
+
+[activation_checkpoint]
+mode = "full"
+selective_ac_option = "op"
+
+[dllm]
+enable_packing = true
+block_size = 1
+use_flex_attention = true
+complementary_mask = false
+antithetic_sampling = false
+mask_token_id = 248077
+pad_token_id = 248044
+sft_label_mode = "response"
+use_fused_ce = true
+causal_x0 = true
+causal_xt = true
+all_masked = true
+logit_shift = true
+loss_auto_balance = false
+loss_normalize = false
+ar_loss_weight = 0.2
+
+[experimental]
+custom_import = "torchtitan.models.qwen3_5"
+
+[compile]
+enable = false
+
+[training_data_visualization]
+enable = false
+freq = 100
+num_samples = 2
+log_to_wandb = false
+async_worker = true
+upload_to_s3 = false
+wandb_log_url_only = false

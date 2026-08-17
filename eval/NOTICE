@@ -1,0 +1,12 @@
+HybridDiffusion evaluation and inference runtime
+Copyright 2026 Yuchen Zhu and HybridDiffusion contributors
+
+This product contains a modified distribution of SGLang, licensed under the
+Apache License 2.0. SGLang copyright and attribution notices embedded in the
+source remain in force.
+
+This product bundles a modified FlashInfer source tree. Its copyright,
+attribution, and bundled-component notices are preserved in
+third_party/flashinfer/LICENSE and third_party/flashinfer/NOTICE.
+
+Other third-party files retain their original notices and licenses.
