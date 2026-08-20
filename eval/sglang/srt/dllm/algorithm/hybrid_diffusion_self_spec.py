@@ -30,11 +30,13 @@ Config keys (passed via --dllm-algorithm-config YAML):
       top-k/top-p p/q. This is an experimental faster approximation.
 """
 
+import copy
 import importlib.util
 import logging
 import json
 import os
 import time
+from dataclasses import replace
 from typing import Any, Dict, List, Tuple, Union
 
 import torch
@@ -57,9 +59,14 @@ from sglang.srt.dllm.config import (
     DllmConfig,
     SelfSpecVariant,
 )
+from sglang.srt.dllm.region.execution_spec import hash_positions, hash_token_ids
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.mem_cache.region_state_cache import (
+    KVPrefixReference,
+    RegionStateKey,
+)
 
 logger = logging.getLogger(__name__)
 _EXTRA_BUFFER_TRACE = (
@@ -388,6 +395,16 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         self._kv_trim_info: Dict[int, dict] = {}
         self._advance_override: Dict[int, int] = {}
         self._mamba_track_commit_info: Dict[int, int] = {}
+        self.exact_prefix_handoff = bool(
+            getattr(config, "exact_prefix_handoff", False)
+        )
+        self._region_state_cache_max_entries = int(
+            getattr(config, "region_state_cache_max_entries", 128)
+        )
+        self._strict_region_state_validation = bool(
+            getattr(config, "strict_region_state_validation", True)
+        )
+        self._hybrid_state_keys: Dict[int, RegionStateKey] = {}
 
         self._stats = {
             "total_forwards": 0,
@@ -479,6 +496,10 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         self._spec_draft_probs.pop(req_pool_idx, None)
         self._force_next_token.pop(req_pool_idx, None)
         self._mamba_track_commit_info.pop(req_pool_idx, None)
+        key = self._hybrid_state_keys.pop(req_pool_idx, None)
+        backend = getattr(self, "_configured_region_backend", None)
+        if key is not None and backend is not None:
+            backend.invalidate_request_state(key.request_id)
 
     def _write_trace_records(
         self,
@@ -528,8 +549,257 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             return None
         from sglang.srt.layers.attention.linear.gdn_dllm_backend import GDNDllmBackend
         if isinstance(linear_backend, GDNDllmBackend):
+            if self.exact_prefix_handoff:
+                linear_backend.configure_region_state_cache(
+                    max_entries=self._region_state_cache_max_entries,
+                    strict_validation=self._strict_region_state_validation,
+                )
+                self._configured_region_backend = linear_backend
             return linear_backend
         return None
+
+    def _hybrid_key_for_bid(
+        self, forward_batch: ForwardBatch, bid: int, req_pool_idx: int
+    ) -> RegionStateKey:
+        def field(name, default):
+            values = getattr(forward_batch, name, None)
+            return values[bid] if values is not None else default
+
+        boundary = int(field("hybrid_ar_boundaries_cpu", -1))
+        if boundary < 0:
+            raise RuntimeError("exact prefix handoff is missing ar_boundary metadata")
+        request_ids = getattr(forward_batch, "rids", None) or []
+        request_id = (
+            str(request_ids[bid])
+            if bid < len(request_ids)
+            else f"req_pool_idx:{req_pool_idx}"
+        )
+        return RegionStateKey(
+            request_id=request_id,
+            request_pool_idx=int(req_pool_idx),
+            request_slot_generation=int(
+                field("hybrid_request_slot_generations_cpu", 0)
+            ),
+            region_id="causal_prefix",
+            region_version=int(field("hybrid_region_versions_cpu", 0)),
+            boundary=boundary,
+            token_hash=str(field("hybrid_token_hashes_cpu", "")),
+            position_hash=str(field("hybrid_position_hashes_cpu", "")),
+            model_identity=str(field("hybrid_model_identities_cpu", "")),
+            model_revision=str(field("hybrid_model_revisions_cpu", "")),
+            adapter_identity=str(field("hybrid_adapter_identities_cpu", "")),
+            adapter_revision=str(field("hybrid_adapter_revisions_cpu", "")),
+            attention_contract_id=str(
+                field("hybrid_attention_contract_ids_cpu", "")
+            ),
+            parent_region_versions=(),
+        )
+
+    @staticmethod
+    def _hybrid_kv_reference(
+        model_runner: ModelRunner, key: RegionStateKey
+    ) -> KVPrefixReference:
+        locations = model_runner.req_to_token_pool.req_to_token[
+            key.request_pool_idx, : key.boundary
+        ].detach().clone()
+        return KVPrefixReference(
+            request_id=key.request_id,
+            request_pool_idx=key.request_pool_idx,
+            request_slot_generation=key.request_slot_generation,
+            pool_identity=id(model_runner.req_to_token_pool),
+            locations=locations,
+            valid_length=key.boundary,
+        )
+
+    def _snapshot_hybrid_boundaries(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        bids: List[int],
+        req_pool_indices_cpu: List[int],
+    ) -> None:
+        if not self.exact_prefix_handoff or not bids:
+            return
+        backend = self._get_gdn_dllm_backend(model_runner)
+        if backend is None:
+            raise RuntimeError("exact_prefix_handoff requires the dLLM GDN backend")
+        for bid in bids:
+            rpx = int(req_pool_indices_cpu[bid])
+            key = self._hybrid_key_for_bid(forward_batch, bid, rpx)
+            seq_lens = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens is not None and int(seq_lens[bid]) < key.boundary:
+                # Chunked inline prefill has not reached the canonical boundary.
+                continue
+            mamba_idx = backend._current_mamba_slot(rpx)
+            backend.snapshot_region_state(
+                state_key=key,
+                mamba_cache_idx=mamba_idx,
+                kv_prefix=self._hybrid_kv_reference(model_runner, key),
+            )
+            self._hybrid_state_keys[rpx] = key
+
+    def _restore_hybrid_boundaries(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        bids: List[int],
+        req_pool_indices_cpu: List[int],
+    ) -> None:
+        if not self.exact_prefix_handoff or not bids:
+            return
+        backend = self._get_gdn_dllm_backend(model_runner)
+        if backend is None:
+            raise RuntimeError("exact_prefix_handoff requires the dLLM GDN backend")
+        for bid in bids:
+            rpx = int(req_pool_indices_cpu[bid])
+            requested = self._hybrid_key_for_bid(forward_batch, bid, rpx)
+            current = self._hybrid_state_keys.get(rpx)
+            if current != requested:
+                if current is not None:
+                    backend.region_state_cache.invalidate_key(current)
+                    self._hybrid_state_keys.pop(rpx, None)
+                self._recompute_hybrid_boundary(
+                    model_runner, forward_batch, bid, requested, backend
+                )
+                continue
+            lookup = backend.restore_region_state(
+                state_key=requested,
+                mamba_cache_idx=backend._current_mamba_slot(rpx),
+                current_slot_generation=requested.request_slot_generation,
+            )
+            if not lookup.hit:
+                backend.region_state_cache.invalidate_key(requested)
+                self._hybrid_state_keys.pop(rpx, None)
+                self._recompute_hybrid_boundary(
+                    model_runner, forward_batch, bid, requested, backend
+                )
+
+    def _recompute_hybrid_boundary(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        bid: int,
+        key: RegionStateKey,
+        backend,
+    ) -> None:
+        """Safely rebuild a missing boundary with the native causal path."""
+        stable_tokens_by_request = getattr(
+            forward_batch, "hybrid_stable_token_ids_cpu", None
+        )
+        if stable_tokens_by_request is None or bid >= len(stable_tokens_by_request):
+            raise RuntimeError("safe prefix recomputation is missing stable token IDs")
+        stable_tokens = list(stable_tokens_by_request[bid])
+        if len(stable_tokens) != key.boundary:
+            raise RuntimeError(
+                "safe prefix recomputation token count does not match ar_boundary"
+            )
+        if hash_token_ids(stable_tokens) != key.token_hash:
+            raise RuntimeError(
+                "safe prefix recomputation token hash does not match the state key"
+            )
+
+        device = forward_batch.input_ids.device
+        mamba_idx = backend._current_mamba_slot(key.request_pool_idx)
+        mamba_cache = backend.req_to_token_pool.mamba_pool.mamba_cache
+        for conv_state in mamba_cache.conv:
+            conv_state[:, mamba_idx].zero_()
+        mamba_cache.temporal[:, mamba_idx].zero_()
+
+        replay = copy.copy(forward_batch)
+        # DLLM_MIXED has extend semantics but is intentionally non-graphable;
+        # a variable-length recovery replay must never enter a captured block graph.
+        replay.forward_mode = ForwardMode.DLLM_MIXED
+        replay.batch_size = 1
+        replay.input_ids = torch.tensor(stable_tokens, dtype=torch.int64, device=device)
+        replay.req_pool_indices = forward_batch.req_pool_indices[bid : bid + 1]
+        replay.seq_lens = torch.tensor(
+            [key.boundary], dtype=forward_batch.seq_lens.dtype, device=device
+        )
+        replay.seq_lens_cpu = torch.tensor([key.boundary], dtype=torch.int64)
+        replay.orig_seq_lens = replay.seq_lens.to(dtype=torch.int32)
+        replay.seq_lens_sum = key.boundary
+        replay.out_cache_loc = model_runner.req_to_token_pool.req_to_token[
+            key.request_pool_idx, : key.boundary
+        ]
+        replay.positions = torch.arange(
+            key.boundary, dtype=forward_batch.positions.dtype, device=device
+        )
+        replay.extend_num_tokens = key.boundary
+        replay.extend_seq_lens = torch.tensor(
+            [key.boundary], dtype=torch.int32, device=device
+        )
+        replay.extend_prefix_lens = torch.zeros(1, dtype=torch.int32, device=device)
+        replay.extend_start_loc = torch.zeros(1, dtype=torch.int32, device=device)
+        replay.extend_seq_lens_cpu = [key.boundary]
+        replay.extend_prefix_lens_cpu = [0]
+        replay.extend_logprob_start_lens_cpu = None
+        replay.dllm_request_token_counts = [key.boundary]
+        replay.dllm_attn_mask_types_cpu = [DLLM_ATTN_MASK_CAUSAL_PREFILL]
+        replay.dllm_attn_mask_types = torch.tensor(
+            [DLLM_ATTN_MASK_CAUSAL_PREFILL], dtype=torch.int32, device=device
+        )
+        replay.dllm_force_causal = True
+        replay.dllm_force_bidir_mask = False
+        replay.dllm_bidir_custom_mask = None
+        replay.dllm_gdn_persist_state = None
+        replay.dllm_gdn_save_for_commit = False
+        replay.dllm_gdn_cache_intermediate_for_commit = False
+        replay.rids = [key.request_id]
+        if forward_batch.lora_ids is not None:
+            replay.lora_ids = [forward_batch.lora_ids[bid]]
+        if self.conditional_lora and replay.lora_ids is not None:
+            replay.lora_segment_ids = [None]
+            replay.lora_segment_lens_cpu = [key.boundary]
+            model_runner.lora_manager.prepare_lora_batch(replay)
+
+        model_runner.forward(replay, pp_proxy_tensors=None)
+        backend.snapshot_region_state(
+            state_key=key,
+            mamba_cache_idx=mamba_idx,
+            kv_prefix=self._hybrid_kv_reference(model_runner, key),
+        )
+        self._hybrid_state_keys[key.request_pool_idx] = key
+
+    def _commit_hybrid_boundaries(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        req_pool_indices_cpu: List[int],
+        decode_bids: List[int],
+        advances: List[int],
+        accepted_tokens: List[List[int]],
+    ) -> None:
+        if not self.exact_prefix_handoff or not decode_bids:
+            return
+        backend = self._get_gdn_dllm_backend(model_runner)
+        assert backend is not None
+        for bid in decode_bids:
+            rpx = int(req_pool_indices_cpu[bid])
+            old_key = self._hybrid_state_keys[rpx]
+            advance = int(advances[bid])
+            new_boundary = old_key.boundary + advance
+            stable_tokens_by_request = getattr(
+                forward_batch, "hybrid_stable_token_ids_cpu", None
+            )
+            if stable_tokens_by_request is None:
+                raise RuntimeError("accepted-state commit is missing stable token IDs")
+            stable_tokens = list(stable_tokens_by_request[bid])
+            new_key = replace(
+                old_key,
+                region_version=old_key.region_version + 1,
+                boundary=new_boundary,
+                token_hash=hash_token_ids(
+                    stable_tokens + accepted_tokens[bid][:advance]
+                ),
+                position_hash=hash_positions(0, new_boundary),
+            )
+            backend.commit_region_state(
+                state_key=new_key,
+                mamba_cache_idx=backend._current_mamba_slot(rpx),
+                kv_prefix=self._hybrid_kv_reference(model_runner, new_key),
+            )
+            backend.region_state_cache.invalidate_key(old_key)
+            self._hybrid_state_keys[rpx] = new_key
 
     def _get_gdn_layer(self, model_runner, layer_id):
         """Get the RadixLinearAttention layer for a GDN layer_id.
@@ -666,6 +936,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         # use the actual input layout as the source of truth for self-spec offsets.
         if sum(extend_lens_cpu) != forward_batch.input_ids.numel():
             extend_lens_cpu = [blk] * batch_size
+        forward_batch.dllm_request_token_counts = extend_lens_cpu
         # Cumulative offsets: base[bid] = sum(extend_lens[:bid])
         base_offsets = [0] * batch_size
         for bid in range(1, batch_size):
@@ -725,7 +996,11 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             forward_batch.dllm_top_k = self.top_k
             forward_batch.dllm_top_p = self.top_p
             forward_batch.dllm_temperature = self.temperature
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            out = self._forward_with_metrics(
+                model_runner,
+                forward_batch,
+                modes="prefill",
+            )
             forward_batch.dllm_return_argmax_only = False
             forward_batch.dllm_return_topk_probs = False
             full_logits = out.logits_output.full_logits
@@ -782,6 +1057,13 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
 
             self._stats["total_forwards"] += 1
             self._stats["prefill_forwards"] += 1
+            self._flush_forward_timings()
+            self._snapshot_hybrid_boundaries(
+                model_runner,
+                forward_batch,
+                list(range(batch_size)),
+                req_pool_indices_cpu,
+            )
             return out.logits_output, [], out.can_run_graph
 
         # ── Decode (possibly mixed with inline prefill) ───────────────
@@ -920,7 +1202,31 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         forward_batch.dllm_top_k = self.top_k
         forward_batch.dllm_top_p = self.top_p
         forward_batch.dllm_temperature = self.temperature
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        request_modes = [
+            (
+                "prefill"
+                if is_prefill[bid]
+                else (
+                    "self_spec_verify"
+                    if case_types[bid] == "V"
+                    else "self_spec_cold_start"
+                )
+            )
+            for bid in range(batch_size)
+        ]
+        self._restore_hybrid_boundaries(
+            model_runner,
+            forward_batch,
+            [bid for bid in range(batch_size) if not is_prefill[bid]],
+            req_pool_indices_cpu,
+        )
+        out = self._forward_with_metrics(
+            model_runner,
+            forward_batch,
+            modes=request_modes,
+            diffusion_steps=[not value for value in is_prefill],
+            gdn_restores=[not value for value in is_prefill],
+        )
         forward_batch.dllm_force_causal = False
         forward_batch.dllm_force_bidir_mask = False
         forward_batch.dllm_bidir_custom_mask = None
@@ -1013,6 +1319,11 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         # ── Steps 1+2: Verify + sample (all GPU work, then single CPU sync) ──
         verify_bids = [bid for bid in decode_bids if case_types[bid] == 'V']
         cold_bids = [bid for bid in decode_bids if case_types[bid] == 'C']
+        request_verify_start = (
+            time.perf_counter()
+            if self._instrumentation_enabled and verify_bids
+            else None
+        )
 
         reject_at = {}       # bid -> rejected spec index
         corrected = {}       # bid -> corrected token id
@@ -1466,6 +1777,13 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 offset += gs
                 draft_offset += num_masks
 
+        if request_verify_start is not None:
+            self._record_verification_time(
+                forward_batch,
+                verify_bids,
+                (time.perf_counter() - request_verify_start) * 1000.0,
+            )
+
         if self._timing_enabled:
             _t_phase3_end = time.perf_counter()
 
@@ -1516,6 +1834,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
 
         # ── Step 4: Assemble outputs ──────────────────────────────
         next_token_ids_list = []
+        output_token_modes = [[] for _ in range(batch_size)]
         kv_offset = 0
         trace_records: List[Dict[str, Any]] = []
 
@@ -1575,6 +1894,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 else:
                     out_pre = list(specs[:si])
                 output_tokens = out_pre + [ct]
+                output_token_modes[bid] = [False] * len(out_pre) + [True]
                 dllm_tokens = [t0_tokens[bid]] + out_pre + [ct]
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
                 self._force_next_token[rpx] = ct
@@ -1623,6 +1943,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 else:
                     out_specs = list(specs)
                 output_tokens = out_specs + [clean_token]
+                output_token_modes[bid] = [False] * len(out_specs) + [True]
                 dllm_tokens = [t0_tokens[bid]] + out_specs + [clean_token]
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
                 self._pending[rpx] = clean_token
@@ -1671,6 +1992,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                     output_tokens = [clean_token]
                 else:
                     output_tokens = [t0, clean_token]
+                output_token_modes[bid] = [True] * len(output_tokens)
                 dllm_tokens = [t0, clean_token] + new_spec_tokens
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
                 self._pending[rpx] = clean_token
@@ -1713,7 +2035,23 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 "logical_trim_count": trim_counts[bid],
                 "physical_free_count": free_tc,
             }
+            self._record_invalidation(
+                forward_batch,
+                batch_index=bid,
+                start=seq_lens_cpu[bid] - tc,
+                length=tc,
+            )
             kv_offset += free_tc
+        self._set_output_token_modes(
+            forward_batch,
+            token_is_ar=output_token_modes,
+        )
+        self._snapshot_hybrid_boundaries(
+            model_runner,
+            forward_batch,
+            prefill_bids,
+            req_pool_indices_cpu,
+        )
         self._write_trace_records(trace_records, full_logits, device)
         if self._timing_enabled:
             _t_phase4_output_assembled = time.perf_counter()
@@ -1841,6 +2179,14 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                         mamba_cache_indices_cpu[bid] for bid in decode_bids
                     ]
                     gdn_dllm_backend.discard_saved_batch(mamba_cache_idx_list)
+        self._commit_hybrid_boundaries(
+            model_runner,
+            forward_batch,
+            req_pool_indices_cpu,
+            decode_bids,
+            advances,
+            next_token_ids_list,
+        )
         if self._timing_enabled:
             _t_phase4_gdn_commit = time.perf_counter()
 
@@ -1972,6 +2318,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 f"unknown:{s.get('logits_mode_unknown', 0)}{row_str}{timing_str}"
             )
 
+        self._flush_forward_timings()
         return logits_output, next_token_ids_list, out.can_run_graph
 
 

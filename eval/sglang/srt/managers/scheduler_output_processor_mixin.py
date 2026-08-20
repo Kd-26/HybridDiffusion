@@ -461,6 +461,10 @@ class SchedulerOutputProcessorMixin:
                         req.dllm_phase = DllmReqPhase.STAGING_DECODE
                         req.dllm_next_advance = origin_len
                         req._inline_prefill = False
+                        if req.hybrid_execution_spec is not None:
+                            req.hybrid_prefix_sealed = True
+                            req.hybrid_cache_hit = True
+                            req.hybrid_restore_required = True
 
         kv_gpu_parts = []
         kv_cpu_parts = []
@@ -507,6 +511,10 @@ class SchedulerOutputProcessorMixin:
                         req.dllm_phase = DllmReqPhase.STAGING_DECODE
                         req.dllm_next_advance = origin_len
                         req._inline_prefill = False
+                        if req.hybrid_execution_spec is not None:
+                                req.hybrid_prefix_sealed = True
+                                req.hybrid_cache_hit = True
+                                req.hybrid_restore_required = True
                 continue
 
             self.num_generated_tokens += len(next_token_ids)
@@ -566,17 +574,25 @@ class SchedulerOutputProcessorMixin:
                         getattr(req, "dllm_phase", None),
                     )
 
-            finished = False
+            consumed_tokens = 0
+            consumed_token_ids = []
             for next_token_id in next_token_ids:
                 req.output_ids.append(next_token_id)
+                consumed_tokens += 1
+                consumed_token_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
-                    release_kv_cache(req, self.tree_cache)
-                    req.time_stats.set_completion_time()
-                    if dllm_algo is not None:
-                        dllm_algo.cleanup_request(req_pool_idx)
-                    finished = True
                     break
+            if dllm_algo is not None:
+                dllm_algo.record_consumed_tokens(req_pool_idx, consumed_tokens)
+            self._advance_hybrid_boundary(req, consumed_token_ids)
+            finished = req.finished()
+            if finished:
+                if dllm_algo is not None:
+                    dllm_algo.cleanup_request(req_pool_idx)
+                release_kv_cache(req, self.tree_cache)
+                req.time_stats.set_completion_time()
+                self._finalize_dllm_request_metrics(req, dllm_algo, req_pool_idx)
             if not finished:
                 if not getattr(batch, "_dllm_decode_mode", False) or is_inline_pf:
                     if _EXTRA_BUFFER_TRACE and req.is_dllm():

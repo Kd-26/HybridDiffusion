@@ -42,6 +42,14 @@ from sglang.srt.layers.attention.block_gdn import (
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
+from sglang.srt.mem_cache.region_state_cache import (
+    KVPrefixReference,
+    RegionState,
+    RegionStateCache,
+    RegionStateKey,
+    RegionStateLookup,
+    RegionStateMissReason,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -76,6 +84,17 @@ class GDNDllmBackend:
         self._block_query_start_cache: Dict[
             Tuple[torch.device, int, int, torch.dtype], torch.Tensor
         ] = {}
+        self.region_state_cache = RegionStateCache(max_entries=128)
+        self.strict_region_state_validation = True
+
+    def configure_region_state_cache(
+        self, *, max_entries: int, strict_validation: bool
+    ) -> None:
+        if self.region_state_cache.max_entries != int(max_entries):
+            if len(self.region_state_cache):
+                raise RuntimeError("cannot resize a nonempty region-state cache")
+            self.region_state_cache = RegionStateCache(max_entries=int(max_entries))
+        self.strict_region_state_validation = bool(strict_validation)
 
     # ------------------------------------------------------------------ #
     #  Delegate standard methods to wrapped backend                       #
@@ -1061,6 +1080,122 @@ class GDNDllmBackend:
                 track_idx_t,
                 track_steps_t,
             )
+
+    # ------------------------------------------------------------------ #
+    #  Exact causal-prefix boundary handoff                               #
+    # ------------------------------------------------------------------ #
+
+    def _current_mamba_slot(self, request_pool_idx: int) -> int:
+        mapping = self.req_to_token_pool.req_index_to_mamba_index_mapping
+        return int(mapping[int(request_pool_idx)].item())
+
+    def _validate_kv_reference(self, reference: KVPrefixReference) -> bool:
+        if reference.pool_identity != id(self.req_to_token_pool):
+            return False
+        current = self.req_to_token_pool.req_to_token[
+            reference.request_pool_idx, : reference.valid_length
+        ]
+        expected = reference.locations
+        return (
+            tuple(current.shape) == tuple(expected.shape)
+            and current.device == expected.device
+            and torch.equal(current, expected)
+        )
+
+    def snapshot_region_state(
+        self,
+        *,
+        state_key: RegionStateKey,
+        mamba_cache_idx: int,
+        kv_prefix: KVPrefixReference,
+    ) -> RegionState:
+        """Clone every mutable GDN state at one exact canonical boundary."""
+        if self._current_mamba_slot(state_key.request_pool_idx) != int(
+            mamba_cache_idx
+        ):
+            raise RuntimeError("request/MambaPool slot mismatch while sealing boundary")
+        if not self._validate_kv_reference(kv_prefix):
+            raise RuntimeError("full-attention KV ownership changed while sealing boundary")
+        mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+        # Publish only after every tensor is cloned: readers cannot observe
+        # convolution and recurrent state from different boundaries.
+        conv = tuple(
+            tensor[:, int(mamba_cache_idx)].detach().clone()
+            for tensor in mamba_cache.conv
+        )
+        recurrent = mamba_cache.temporal[:, int(mamba_cache_idx)].detach().clone()
+        state = RegionState(
+            key=state_key,
+            kv_prefix=kv_prefix,
+            kv_valid_length=state_key.boundary,
+            kv_owner_request_id=state_key.request_id,
+            gdn_conv_states=conv,
+            gdn_recurrent_states=recurrent,
+            boundary=state_key.boundary,
+        )
+        self.region_state_cache.put(state)
+        return state
+
+    def restore_region_state(
+        self,
+        *,
+        state_key: RegionStateKey,
+        mamba_cache_idx: int,
+        current_slot_generation: int,
+    ) -> RegionStateLookup:
+        """Restore a sealed state before one independent suffix forward."""
+        lookup = self.region_state_cache.get(
+            state_key, current_slot_generation=current_slot_generation
+        )
+        if not lookup.hit:
+            return lookup
+        state = lookup.state
+        assert state is not None
+        if self._current_mamba_slot(state_key.request_pool_idx) != int(
+            mamba_cache_idx
+        ):
+            return RegionStateLookup(
+                state=None,
+                miss_reason=RegionStateMissReason.RECYCLED_REQUEST_SLOT,
+            )
+        if not self._validate_kv_reference(state.kv_prefix):
+            return RegionStateLookup(
+                state=None,
+                miss_reason=RegionStateMissReason.POSITION_MISMATCH,
+            )
+        mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+        for destination, source in zip(
+            mamba_cache.conv, state.gdn_conv_states
+        ):
+            if destination.device != source.device or destination.dtype != source.dtype:
+                raise RuntimeError("GDN convolution snapshot device/dtype mismatch")
+            destination[:, int(mamba_cache_idx)].copy_(source)
+        recurrent = state.gdn_recurrent_states
+        destination = mamba_cache.temporal[:, int(mamba_cache_idx)]
+        if destination.device != recurrent.device or destination.dtype != recurrent.dtype:
+            raise RuntimeError("GDN recurrent snapshot device/dtype mismatch")
+        destination.copy_(recurrent)
+        return lookup
+
+    def commit_region_state(
+        self,
+        *,
+        state_key: RegionStateKey,
+        mamba_cache_idx: int,
+        kv_prefix: KVPrefixReference,
+    ) -> RegionState:
+        """Atomically publish the complete state after accepted-token commit."""
+        return self.snapshot_region_state(
+            state_key=state_key,
+            mamba_cache_idx=mamba_cache_idx,
+            kv_prefix=kv_prefix,
+        )
+
+    def invalidate_region_state(self, request_id: str, region_id: str) -> int:
+        return self.region_state_cache.invalidate_region(request_id, region_id)
+
+    def invalidate_request_state(self, request_id: str) -> int:
+        return self.region_state_cache.invalidate_request(request_id)
 
     # ------------------------------------------------------------------ #
     #  Cleanup                                                            #

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import enum
+import time
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.region.execution_spec import HybridExecutionSpec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -30,6 +32,39 @@ class ReqDllmMixin:
         # Variable advance: override how much dllm_block_offset advances
         # in the next _init_fill_ids_for_dllm call (default = block_size).
         self.dllm_next_advance: Optional[int] = None
+        # Monotonic request-local origin for behavior-neutral latency metrics.
+        self.dllm_metrics_start_time = time.perf_counter()
+        self.dllm_initial_kv_cache_hits: Optional[int] = None
+
+        # Cluster-1 hybrid handoff metadata. The feature is disabled by default,
+        # so these fields are inert for every existing configuration.
+        self.hybrid_execution_spec: Optional[HybridExecutionSpec] = None
+        self.hybrid_region_state_key = None
+        self.hybrid_prefix_sealed = False
+        self.hybrid_cache_hit = False
+        self.hybrid_restore_required = False
+        self.hybrid_commit_required = False
+        self.hybrid_request_slot_generation = time.monotonic_ns()
+        self.hybrid_token_hash = ""
+        self.hybrid_position_hash = ""
+        self.hybrid_model_identity = ""
+        self.hybrid_model_revision = ""
+        self.hybrid_adapter_revision = ""
+        if dllm_config is not None and getattr(
+            dllm_config, "exact_prefix_handoff", False
+        ):
+            self.hybrid_execution_spec = HybridExecutionSpec.prefix_diffusion(
+                ar_boundary=len(self.origin_input_ids),
+                sequence_length=len(self.origin_input_ids) + dllm_config.block_size,
+                diffusion_steps=int(
+                    dllm_config.algorithm_config.get("diffusion_steps", 1)
+                ),
+                attention_contract_id=getattr(
+                    dllm_config,
+                    "attention_contract",
+                    "causal_prefix_diffusion_suffix_v1",
+                ),
+            )
 
         if self.dllm_config is not None:
             if len(self.origin_input_ids) < self.dllm_config.block_size:

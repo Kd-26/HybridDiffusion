@@ -409,6 +409,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_prefill_only: bool = False
     dllm_attn_mask_types: Optional[torch.Tensor] = None
     dllm_attn_mask_types_cpu: Optional[List[int]] = None
+    # Behavior-neutral request instrumentation metadata.  These CPU values
+    # describe the exact request/token and layer mix represented by this
+    # forward so algorithms do not need to infer it from padded tensors.
+    dllm_request_token_counts: Optional[List[int]] = None
+    dllm_model_layer_count: int = 0
+    dllm_attention_layer_count: int = 0
+    dllm_gdn_layer_count: int = 0
+    # Cluster-1 handoff metadata remains CPU-side and fixed-size per request.
+    hybrid_ar_boundaries_cpu: Optional[List[int]] = None
+    hybrid_attention_contract_ids_cpu: Optional[List[str]] = None
+    hybrid_region_versions_cpu: Optional[List[int]] = None
+    hybrid_restore_gdn_state: Optional[List[bool]] = None
+    hybrid_commit_gdn_state: Optional[List[bool]] = None
+    hybrid_request_slot_generations_cpu: Optional[List[int]] = None
+    hybrid_token_hashes_cpu: Optional[List[str]] = None
+    hybrid_position_hashes_cpu: Optional[List[str]] = None
+    hybrid_model_identities_cpu: Optional[List[str]] = None
+    hybrid_model_revisions_cpu: Optional[List[str]] = None
+    hybrid_adapter_identities_cpu: Optional[List[str]] = None
+    hybrid_adapter_revisions_cpu: Optional[List[str]] = None
+    hybrid_stable_token_ids_cpu: Optional[List[List[int]]] = None
 
     # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
     multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
@@ -505,6 +526,47 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
+
+        if batch.dllm_config is not None:
+            if batch.extend_seq_lens is not None:
+                ret.dllm_request_token_counts = [
+                    int(value) for value in batch.extend_seq_lens
+                ]
+            elif ret.batch_size > 0 and batch.input_ids is not None:
+                total_tokens = int(batch.input_ids.numel())
+                if total_tokens % ret.batch_size == 0:
+                    ret.dllm_request_token_counts = [
+                        total_tokens // ret.batch_size
+                    ] * ret.batch_size
+
+            text_config = model_runner.model_config.hf_text_config
+            layer_types = list(getattr(text_config, "layers_block_type", []) or [])
+            ret.dllm_model_layer_count = int(
+                getattr(text_config, "num_hidden_layers", len(layer_types))
+            )
+            if layer_types:
+                ret.dllm_attention_layer_count = sum(
+                    layer_type == "attention" for layer_type in layer_types
+                )
+                ret.dllm_gdn_layer_count = sum(
+                    layer_type == "linear_attention" for layer_type in layer_types
+                )
+            for field_name in (
+                "hybrid_ar_boundaries_cpu",
+                "hybrid_attention_contract_ids_cpu",
+                "hybrid_region_versions_cpu",
+                "hybrid_restore_gdn_state",
+                "hybrid_commit_gdn_state",
+                "hybrid_request_slot_generations_cpu",
+                "hybrid_token_hashes_cpu",
+                "hybrid_position_hashes_cpu",
+                "hybrid_model_identities_cpu",
+                "hybrid_model_revisions_cpu",
+                "hybrid_adapter_identities_cpu",
+                "hybrid_adapter_revisions_cpu",
+                "hybrid_stable_token_ids_cpu",
+            ):
+                setattr(ret, field_name, getattr(batch, field_name, None))
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (

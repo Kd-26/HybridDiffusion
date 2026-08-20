@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -7,6 +8,10 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.dllm.region.execution_spec import (
+    hash_positions,
+    hash_token_ids,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -28,6 +33,117 @@ class SchedulerDllmMixin:
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
+
+    def _prepare_hybrid_request(self: Scheduler, req: Req) -> None:
+        """Validate and populate scheduler-owned Cluster-1 compatibility data."""
+        spec = getattr(req, "hybrid_execution_spec", None)
+        if spec is None:
+            return
+        spec.validate()
+        if not req.hybrid_token_hash:
+            req.hybrid_token_hash = hash_token_ids(
+                req.origin_input_ids[: spec.ar_boundary]
+            )
+        req.hybrid_position_hash = hash_positions(0, spec.ar_boundary)
+        req.hybrid_model_identity = str(
+            getattr(self.server_args, "model_path", "")
+        )
+        req.hybrid_model_revision = str(
+            getattr(self.server_args, "revision", "") or ""
+        )
+        req.hybrid_region_state_key = (
+            str(req.rid),
+            spec.region_ids[0],
+            spec.region_versions[0],
+            spec.ar_boundary,
+            req.hybrid_token_hash,
+            req.hybrid_position_hash,
+            req.hybrid_model_identity,
+            req.hybrid_model_revision,
+            str(getattr(req, "lora_id", "") or ""),
+            req.hybrid_adapter_revision,
+            spec.attention_contract_id,
+        )
+        req.hybrid_restore_required = bool(
+            req.hybrid_prefix_sealed and not req.is_dllm_prefill()
+        )
+        req.hybrid_commit_required = not req.is_dllm_prefill()
+
+    @staticmethod
+    def _advance_hybrid_boundary(req: Req, accepted_tokens: List[int]) -> None:
+        """Publish a new scheduler spec only for tokens actually consumed."""
+        spec = getattr(req, "hybrid_execution_spec", None)
+        if spec is None or not accepted_tokens:
+            return
+        boundary = spec.ar_boundary + len(accepted_tokens)
+        req.hybrid_execution_spec = spec.advance_boundary(
+            boundary,
+            sequence_length=boundary + req.dllm_config.block_size,
+        )
+        req.hybrid_token_hash = hash_token_ids(
+            (req.origin_input_ids + req.output_ids)[:boundary]
+        )
+        req.hybrid_position_hash = hash_positions(0, boundary)
+        req.hybrid_region_state_key = (
+            str(req.rid),
+            req.hybrid_execution_spec.region_ids[0],
+            req.hybrid_execution_spec.region_versions[0],
+            boundary,
+            req.hybrid_token_hash,
+            req.hybrid_position_hash,
+            req.hybrid_model_identity,
+            req.hybrid_model_revision,
+            str(getattr(req, "lora_id", "") or ""),
+            req.hybrid_adapter_revision,
+            req.hybrid_execution_spec.attention_contract_id,
+        )
+        req.hybrid_prefix_sealed = True
+        req.hybrid_cache_hit = True
+        req.hybrid_restore_required = True
+        req.hybrid_commit_required = False
+
+    def _finalize_dllm_request_metrics(
+        self: Scheduler, req: Req, dllm_algo, req_pool_idx: int
+    ) -> None:
+        """Emit one stable JSON record before the request-pool slot is reused."""
+        if dllm_algo is None or not hasattr(dllm_algo, "pop_request_metrics"):
+            return
+        metric = dllm_algo.pop_request_metrics(req_pool_idx)
+        if metric is None:
+            return
+        if getattr(self, "tp_rank", 0) != 0:
+            return
+
+        metric.prompt_tokens = len(req.origin_input_ids)
+        initial_hits = getattr(req, "dllm_initial_kv_cache_hits", None)
+        if initial_hits is None:
+            initial_hits = min(len(req.prefix_indices), metric.prompt_tokens)
+        metric.kv_cache_hits = max(int(initial_hits), 0)
+        start_time = getattr(req, "dllm_metrics_start_time", None)
+        completion_time = getattr(req.time_stats, "completion_time", 0.0)
+        if start_time is not None and completion_time > 0:
+            metric.total_latency_ms = max(
+                (completion_time - start_time) * 1000.0,
+                0.0,
+            )
+
+        record = metric.to_record()
+        # Keep the exact emitted record available to in-process callers/tests.
+        req.dllm_request_metrics = record
+        serialized = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        logger.info("[DLLM_REQUEST_METRICS] %s", serialized)
+
+        output_path = os.getenv("SGLANG_DLLM_REQUEST_METRICS_PATH")
+        if output_path:
+            try:
+                with open(output_path, "a", encoding="utf-8") as output_file:
+                    output_file.write(serialized + "\n")
+            except OSError as exc:
+                logger.warning(
+                    "Unable to append DLLM request metrics to %s: %s",
+                    output_path,
+                    exc,
+                )
 
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
@@ -136,6 +252,10 @@ class SchedulerDllmMixin:
                         req.dllm_phase = DllmReqPhase.STAGING_DECODE
                         req.dllm_next_advance = origin_len
                         req._inline_prefill = False
+                        if req.hybrid_execution_spec is not None:
+                            req.hybrid_prefix_sealed = True
+                            req.hybrid_cache_hit = True
+                            req.hybrid_restore_required = True
                 continue
 
             self.num_generated_tokens += len(next_token_ids)
@@ -171,15 +291,24 @@ class SchedulerDllmMixin:
                     dllm_tokens
                 )
 
+            consumed_tokens = 0
+            consumed_token_ids = []
             for next_token_id in next_token_ids:
                 req.output_ids.append(next_token_id)
+                consumed_tokens += 1
+                consumed_token_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
-                    release_kv_cache(req, self.tree_cache)
-                    req.time_stats.set_completion_time()
-                    if dllm_algo is not None:
-                        dllm_algo.cleanup_request(req_pool_idx)
                     break
+            if dllm_algo is not None:
+                dllm_algo.record_consumed_tokens(req_pool_idx, consumed_tokens)
+            self._advance_hybrid_boundary(req, consumed_token_ids)
+            if req.finished():
+                if dllm_algo is not None:
+                    dllm_algo.cleanup_request(req_pool_idx)
+                release_kv_cache(req, self.tree_cache)
+                req.time_stats.set_completion_time()
+                self._finalize_dllm_request_metrics(req, dllm_algo, req_pool_idx)
 
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -257,6 +386,10 @@ class SchedulerDllmMixin:
                             req.dllm_phase = DllmReqPhase.STAGING_DECODE
                             req.dllm_next_advance = origin_len
                             req._inline_prefill = False
+                            if req.hybrid_execution_spec is not None:
+                                req.hybrid_prefix_sealed = True
+                                req.hybrid_cache_hit = True
+                                req.hybrid_restore_required = True
                     continue
 
                 self.num_generated_tokens += new_tokens
@@ -297,15 +430,28 @@ class SchedulerDllmMixin:
                     # LowConfidence / JointThreshold path: just mirror fill_ids
                     req.fill_ids[-new_tokens:] = next_token_ids[:]
 
+                consumed_tokens = 0
+                consumed_token_ids = []
                 for next_token_id in next_token_ids:
                     req.output_ids.append(next_token_id)
+                    consumed_tokens += 1
+                    consumed_token_ids.append(next_token_id)
                     req.check_finished()
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
-                        req.time_stats.set_completion_time()
-                        if dllm_algo is not None:
-                            dllm_algo.cleanup_request(req.req_pool_idx)
                         break
+                if dllm_algo is not None:
+                    dllm_algo.record_consumed_tokens(
+                        req.req_pool_idx, consumed_tokens
+                    )
+                self._advance_hybrid_boundary(req, consumed_token_ids)
+                if req.finished():
+                    if dllm_algo is not None:
+                        dllm_algo.cleanup_request(req.req_pool_idx)
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.set_completion_time()
+                    self._finalize_dllm_request_metrics(
+                        req, dllm_algo, req.req_pool_idx
+                    )
 
             if not decode_mode:
                 self.stream_output(batch.reqs, batch.return_logprob)
@@ -451,6 +597,12 @@ class SchedulerDllmMixin:
         self: Scheduler, can_run_list: List[Req], forward_mode: ForwardMode
     ) -> ScheduleBatch:
         """Create and prepare a new DLLM batch."""
+        for req in can_run_list:
+            self._prepare_hybrid_request(req)
+            if req.dllm_initial_kv_cache_hits is None:
+                req.dllm_initial_kv_cache_hits = min(
+                    len(req.prefix_indices), len(req.origin_input_ids)
+                )
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -495,6 +647,10 @@ class SchedulerDllmMixin:
 
             # Prepare and add request
             req.init_next_round_input(self.tree_cache)
+            if req.dllm_initial_kv_cache_hits is None:
+                req.dllm_initial_kv_cache_hits = min(
+                    len(req.prefix_indices), len(req.origin_input_ids)
+                )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=True,
@@ -600,6 +756,10 @@ class SchedulerDllmMixin:
         for i, req in enumerate(new_reqs):
             req.req_pool_idx = req_pool_indices[i]
             req.init_next_round_input(self.tree_cache)
+            if req.dllm_initial_kv_cache_hits is None:
+                req.dllm_initial_kv_cache_hits = min(
+                    len(req.prefix_indices), len(req.origin_input_ids)
+                )
             prefix_len = len(req.prefix_indices)
             origin_remaining = len(req.origin_input_ids) - prefix_len
             if origin_remaining <= 0:

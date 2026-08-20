@@ -2940,6 +2940,63 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_mamba_track_boundaries_cpu=getattr(
                 self, "dllm_mamba_track_boundaries_cpu", None
             ),
+            hybrid_ar_boundaries_cpu=[
+                req.hybrid_execution_spec.ar_boundary
+                if getattr(req, "hybrid_execution_spec", None) is not None
+                else -1
+                for req in self.reqs
+            ],
+            hybrid_attention_contract_ids_cpu=[
+                req.hybrid_execution_spec.attention_contract_id
+                if getattr(req, "hybrid_execution_spec", None) is not None
+                else ""
+                for req in self.reqs
+            ],
+            hybrid_region_versions_cpu=[
+                req.hybrid_execution_spec.region_versions[0]
+                if getattr(req, "hybrid_execution_spec", None) is not None
+                else -1
+                for req in self.reqs
+            ],
+            hybrid_restore_gdn_state=[
+                bool(getattr(req, "hybrid_restore_required", False))
+                for req in self.reqs
+            ],
+            hybrid_commit_gdn_state=[
+                bool(getattr(req, "hybrid_commit_required", False))
+                for req in self.reqs
+            ],
+            hybrid_request_slot_generations_cpu=[
+                int(getattr(req, "hybrid_request_slot_generation", 0))
+                for req in self.reqs
+            ],
+            hybrid_token_hashes_cpu=[
+                str(getattr(req, "hybrid_token_hash", "")) for req in self.reqs
+            ],
+            hybrid_position_hashes_cpu=[
+                str(getattr(req, "hybrid_position_hash", "")) for req in self.reqs
+            ],
+            hybrid_model_identities_cpu=[
+                str(getattr(req, "hybrid_model_identity", "")) for req in self.reqs
+            ],
+            hybrid_model_revisions_cpu=[
+                str(getattr(req, "hybrid_model_revision", "")) for req in self.reqs
+            ],
+            hybrid_adapter_identities_cpu=[
+                str(getattr(req, "lora_id", "") or "") for req in self.reqs
+            ],
+            hybrid_adapter_revisions_cpu=[
+                str(getattr(req, "hybrid_adapter_revision", ""))
+                for req in self.reqs
+            ],
+            hybrid_stable_token_ids_cpu=[
+                (req.origin_input_ids + req.output_ids)[
+                    : req.hybrid_execution_spec.ar_boundary
+                ]
+                if getattr(req, "hybrid_execution_spec", None) is not None
+                else []
+                for req in self.reqs
+            ],
             _dllm_overlap_fn=getattr(self, "_dllm_overlap_fn", None),
             reqs=self.reqs,
             has_grammar=self.has_grammar,
@@ -3150,6 +3207,21 @@ class ModelWorkerBatch:
     dllm_mamba_track_indices_cpu: Optional[List[int]] = None
     dllm_mamba_track_steps_cpu: Optional[List[int]] = None
     dllm_mamba_track_boundaries_cpu: Optional[List[int]] = None
+    # Cluster-1 CPU primitives. They are deliberately not CUDA graph tensors.
+    hybrid_ar_boundaries_cpu: Optional[List[int]] = None
+    hybrid_attention_contract_ids_cpu: Optional[List[str]] = None
+    hybrid_region_versions_cpu: Optional[List[int]] = None
+    hybrid_restore_gdn_state: Optional[List[bool]] = None
+    hybrid_commit_gdn_state: Optional[List[bool]] = None
+    hybrid_request_slot_generations_cpu: Optional[List[int]] = None
+    hybrid_token_hashes_cpu: Optional[List[str]] = None
+    hybrid_position_hashes_cpu: Optional[List[str]] = None
+    hybrid_model_identities_cpu: Optional[List[str]] = None
+    hybrid_model_revisions_cpu: Optional[List[str]] = None
+    hybrid_adapter_identities_cpu: Optional[List[str]] = None
+    hybrid_adapter_revisions_cpu: Optional[List[str]] = None
+    # Variable-length CPU fallback input; never captured as a graph tensor.
+    hybrid_stable_token_ids_cpu: Optional[List[List[int]]] = None
     _dllm_overlap_fn: Optional[Any] = None
 
     # For constrained decoding
