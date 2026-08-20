@@ -4,6 +4,8 @@ from typing import Any
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.dllm.region.execution_spec import HYBRID_ATTENTION_CONTRACT_V1
+
 
 DLLM_ATTN_MASK_CAUSAL_PREFILL = 0
 DLLM_ATTN_MASK_BIDIR_BLOCK = 1
@@ -27,6 +29,10 @@ class DllmConfig:
         max_running_requests: int,
         causal_prefill: bool = False,
         variant: str = "causal_shift",
+        exact_prefix_handoff: bool = False,
+        attention_contract: str = HYBRID_ATTENTION_CONTRACT_V1,
+        strict_region_state_validation: bool = True,
+        region_state_cache_max_entries: int = 128,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -35,6 +41,28 @@ class DllmConfig:
         self.max_running_requests = max_running_requests
         self.causal_prefill = causal_prefill
         self.variant = SelfSpecVariant(variant)
+        self.exact_prefix_handoff = bool(exact_prefix_handoff)
+        self.attention_contract = str(attention_contract)
+        self.strict_region_state_validation = bool(strict_region_state_validation)
+        self.region_state_cache_max_entries = int(region_state_cache_max_entries)
+        self._validate_exact_prefix_handoff()
+
+    def _validate_exact_prefix_handoff(self) -> None:
+        if self.region_state_cache_max_entries <= 0:
+            raise ValueError("region_state_cache_max_entries must be positive")
+        if self.attention_contract != HYBRID_ATTENTION_CONTRACT_V1:
+            raise ValueError(
+                f"Unsupported dLLM attention_contract={self.attention_contract!r}"
+            )
+        if not self.exact_prefix_handoff:
+            return
+        if self.algorithm != "HybridDiffusionSelfSpec":
+            raise ValueError(
+                "exact_prefix_handoff currently requires "
+                "dllm_algorithm=HybridDiffusionSelfSpec"
+            )
+        if not self.causal_prefill:
+            raise ValueError("exact_prefix_handoff requires causal_prefill=true")
 
     @staticmethod
     def from_server_args(
@@ -158,4 +186,16 @@ class DllmConfig:
             max_running_requests=max_running_requests,
             causal_prefill=causal_prefill,
             variant=variant,
+            exact_prefix_handoff=algorithm_config.get(
+                "exact_prefix_handoff", False
+            ),
+            attention_contract=algorithm_config.get(
+                "attention_contract", HYBRID_ATTENTION_CONTRACT_V1
+            ),
+            strict_region_state_validation=algorithm_config.get(
+                "strict_region_state_validation", True
+            ),
+            region_state_cache_max_entries=algorithm_config.get(
+                "region_state_cache_max_entries", 128
+            ),
         )
