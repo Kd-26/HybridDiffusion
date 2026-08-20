@@ -137,12 +137,17 @@ class LowConfidenceShiftHybridDiffusion(LowConfidence):
         rpx_list = self._req_pool_indices_cpu(forward_batch)
 
         if torch.sum(mask_index).item() == 0:
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            out = self._forward_with_metrics(
+                model_runner,
+                forward_batch,
+                modes="prefill",
+            )
             self._stats["total_forwards"] += 1
             self._stats["prefill_forwards"] += 1
             logits_output = out.logits_output
             if logits_output is not None:
                 self._capture_prefill_seeds(logits_output, forward_batch, rpx_list)
+            self._flush_forward_timings()
             return logits_output, [], out.can_run_graph
 
         expected_tokens = batch_size * self.block_size
@@ -189,7 +194,14 @@ class LowConfidenceShiftHybridDiffusion(LowConfidence):
                 break
 
             self._set_denoise_flags(forward_batch)
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            out = self._forward_with_metrics(
+                model_runner,
+                forward_batch,
+                modes="diffusion_denoise",
+                diffusion_steps=True,
+                gdn_restores=True,
+                recomputed=step > 0,
+            )
             self._stats["total_forwards"] += 1
             self._stats["decode_forwards"] += 1
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
@@ -237,7 +249,12 @@ class LowConfidenceShiftHybridDiffusion(LowConfidence):
                 block_input_ids[transfer_index] = sampled[transfer_index]
 
         self._set_commit_flags(forward_batch)
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        out = self._forward_with_metrics(
+            model_runner,
+            forward_batch,
+            modes="diffusion_commit",
+            recomputed=True,
+        )
         self._stats["total_forwards"] += 1
         self._stats["decode_forwards"] += 1
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
@@ -253,7 +270,15 @@ class LowConfidenceShiftHybridDiffusion(LowConfidence):
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
         self._stats["total_tokens"] += sum(len(t) for t in next_token_ids_list)
+        self._set_output_token_modes(
+            forward_batch,
+            token_is_ar=[
+                [start_list[bid] + index == 0 for index in range(len(tokens))]
+                for bid, tokens in enumerate(next_token_ids_list)
+            ],
+        )
         self._clear_flags(forward_batch)
+        self._flush_forward_timings()
         return logits_output, next_token_ids_list, can_run_cuda_graph
 
     @staticmethod

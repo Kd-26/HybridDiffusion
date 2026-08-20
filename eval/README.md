@@ -92,6 +92,29 @@ released configuration selects the paper's Exact-Truncated policy
 (`argmax_softmax_verify`) and Truncated-Argmax
 (`argmax_truncated_verify`) remain available as explicit policy alternatives.
 
+### 4B reference instrumentation
+
+Per-request reference metrics are opt-in and gated to the Qwen3.5 4B
+architecture. Emit one JSONL record per completed request with:
+
+```bash
+SGLANG_DLLM_REQUEST_METRICS=1 \
+SGLANG_DLLM_REQUEST_METRICS_PATH=/persistent/hybrid-diffusion-4b-metrics.jsonl \
+  scripts/serve.sh self-spec yuchen-zhu-zyc/HybridDiffusion-4B
+```
+
+Each record includes the selected-mode counts, prompt/AR/stable/active tokens,
+diffusion steps, prefix-KV hits, GDN restores, invalidated ranges, recomputed
+token-layer positions, attention/GDN/verification time, request latency, and
+observed peak allocated GPU memory. Records are also written to the server log
+with the `[DLLM_REQUEST_METRICS]` prefix.
+
+CUDA-graph replay is opaque to Python module hooks. Such forwards are counted
+in `component_untimed_forwards`; `component_timed_forwards` reports coverage of
+the attention/GDN totals. Use SGLang's `--disable-cuda-graph` option when a
+complete component-time breakdown is required. Instrumentation is disabled by
+default and does not alter token selection or cache/state decisions.
+
 ## Model zoo
 
 | Model | Hugging Face checkpoint | Weights | Architecture |

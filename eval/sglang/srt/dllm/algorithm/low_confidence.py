@@ -89,10 +89,15 @@ class LowConfidence(DllmAlgorithm):
 
         # Fast path: if there is no mask token, forward and save kv cache
         if torch.sum(mask_index).item() == 0:
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            out = self._forward_with_metrics(
+                model_runner,
+                forward_batch,
+                modes="prefill",
+            )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
             next_token_ids = []
+            self._flush_forward_timings()
             return logits_output, next_token_ids, can_run_cuda_graph
 
         # Calculate start positions for each block
@@ -113,7 +118,14 @@ class LowConfidence(DllmAlgorithm):
             forward_batch.dllm_gdn_persist_state = False
             forward_batch.dllm_gdn_causal_mode = int(self.causal_xt)
             forward_batch.dllm_gdn_block_size = self.block_size
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            out = self._forward_with_metrics(
+                model_runner,
+                forward_batch,
+                modes="diffusion_denoise",
+                diffusion_steps=True,
+                gdn_restores=True,
+                recomputed=_iter > 0,
+            )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
             for batch_id in range(batch_size):
@@ -150,7 +162,12 @@ class LowConfidence(DllmAlgorithm):
         forward_batch.dllm_gdn_persist_state = True
         forward_batch.dllm_gdn_causal_mode = int(self.causal_xt)
         forward_batch.dllm_gdn_block_size = self.block_size
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        out = self._forward_with_metrics(
+            model_runner,
+            forward_batch,
+            modes="diffusion_commit",
+            recomputed=True,
+        )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         # Here next token ids is tricky to implement the dynamic lengths,
         # so we return a list of tensors
@@ -158,6 +175,12 @@ class LowConfidence(DllmAlgorithm):
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
+
+        self._set_output_token_modes(
+            forward_batch,
+            token_is_ar=[[False] * len(tokens) for tokens in next_token_ids_list],
+        )
+        self._flush_forward_timings()
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

@@ -44,7 +44,12 @@ class JointThreshold(DllmAlgorithm):
 
         mask_index = forward_batch.input_ids == self.mask_id
         if not mask_index.any():
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            out = self._forward_with_metrics(
+                model_runner,
+                forward_batch,
+                modes="prefill",
+            )
+            self._flush_forward_timings()
             return out.logits_output, [], out.can_run_graph
 
         start_list = []
@@ -67,7 +72,7 @@ class JointThreshold(DllmAlgorithm):
         any_changed_in_last_step = False
 
         max_iterations = self.block_size + self.max_post_edit_steps
-        for _ in range(max_iterations):
+        for iteration in range(max_iterations):
             if finished.all():
                 break
 
@@ -75,7 +80,14 @@ class JointThreshold(DllmAlgorithm):
             forward_batch.dllm_gdn_persist_state = False
             forward_batch.dllm_gdn_causal_mode = int(self.causal_xt)
             forward_batch.dllm_gdn_block_size = self.block_size
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            out = self._forward_with_metrics(
+                model_runner,
+                forward_batch,
+                modes="diffusion_edit",
+                diffusion_steps=True,
+                gdn_restores=True,
+                recomputed=iteration > 0,
+            )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
             any_changed_in_last_step = False
@@ -142,13 +154,24 @@ class JointThreshold(DllmAlgorithm):
         forward_batch.dllm_gdn_persist_state = True
         forward_batch.dllm_gdn_causal_mode = int(self.causal_xt)
         forward_batch.dllm_gdn_block_size = self.block_size
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        out = self._forward_with_metrics(
+            model_runner,
+            forward_batch,
+            modes="diffusion_commit",
+            recomputed=True,
+        )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
         next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
+
+        self._set_output_token_modes(
+            forward_batch,
+            token_is_ar=[[False] * len(tokens) for tokens in next_token_ids_list],
+        )
+        self._flush_forward_timings()
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 
