@@ -92,28 +92,53 @@ released configuration selects the paper's Exact-Truncated policy
 (`argmax_softmax_verify`) and Truncated-Argmax
 (`argmax_truncated_verify`) remain available as explicit policy alternatives.
 
-### 4B reference instrumentation
+### Cluster-0 request instrumentation
 
-Per-request reference metrics are opt-in and gated to the Qwen3.5 4B
-architecture. Emit one JSONL record per completed request with:
+Per-request reference metrics are opt-in for causal, AR-Trust, and
+Diffusion-Trust execution. Model scale is read from an explicit validated
+`SGLANG_DLLM_MODEL_SCALE` value or the runtime/Hugging Face model name; supported
+values are `2B`, `4B`, and `9B`, with `unknown` emitted rather than guessing.
+Emit one JSONL record per completed request with:
 
 ```bash
 SGLANG_DLLM_REQUEST_METRICS=1 \
-SGLANG_DLLM_REQUEST_METRICS_PATH=/persistent/hybrid-diffusion-4b-metrics.jsonl \
-  scripts/serve.sh self-spec yuchen-zhu-zyc/HybridDiffusion-4B
+SGLANG_DLLM_REQUEST_METRICS_PATH=/persistent/hybrid-diffusion-metrics.jsonl \
+  scripts/serve.sh self-spec yuchen-zhu-zyc/HybridDiffusion-2B -- \
+    --disable-cuda-graph
 ```
 
-Each record includes the selected-mode counts, prompt/AR/stable/active tokens,
-diffusion steps, prefix-KV hits, GDN restores, invalidated ranges, recomputed
-token-layer positions, attention/GDN/verification time, request latency, and
-observed peak allocated GPU memory. Records are also written to the server log
-with the `[DLLM_REQUEST_METRICS]` prefix.
+`selected_mode` is the fixed request route (`causal`, `ar_trust`, or
+`diffusion_trust`); `phase_counts` separately records prefill, causal decode,
+denoise, self-spec draft/verify, and correction operations. `active_tokens`
+counts submitted positions once per forward. `diffusion_steps` counts actual
+denoise/draft forwards. `kv_cache_hits` is the initial prompt-prefix result of
+the real cache lookup. GDN restores and invalidations increment only after the
+corresponding backend operation succeeds; recomputation requires a later
+forward to revisit the invalidated logical positions and is multiplied by the
+actual runtime layer count.
+
+`model_forward_time_ms` is the enclosing CUDA-event interval. Non-overlapping
+attention, GDN, and MLP intervals plus `other_model_time_ms` explain it;
+`forward_timer_coverage` and `model_component_coverage` report the two distinct
+coverage ratios. Batch sizes above one are labeled `cuda_events_batch_shared`.
+`total_latency_ms` spans scheduler receipt through completion.
+`peak_memory_bytes` is `torch.cuda.max_memory_allocated()` after resetting the
+process allocator peak when the scheduler accepts the request; the validation
+protocol therefore uses one running request and labels the scope
+`process_peak_since_request_start`. Unavailable values are `null` with a reason
+in `unavailable_metrics`, never fabricated as zero. Records are flushed to the
+JSONL file and logged with `[DLLM_REQUEST_METRICS]` by TP rank zero only.
+
+For a warm-up-only server, set
+`SGLANG_DLLM_REQUEST_METRICS_SUPPRESS_OUTPUT=1`. When warming the measured
+server, wait for warm-up completion and truncate the JSONL path before sending
+the first measured request; each record is opened, appended, and flushed
+independently, so this cleanly separates warm-up from measurement.
 
 CUDA-graph replay is opaque to Python module hooks. Such forwards are counted
-in `component_untimed_forwards`; `component_timed_forwards` reports coverage of
-the attention/GDN totals. Use SGLang's `--disable-cuda-graph` option when a
-complete component-time breakdown is required. Instrumentation is disabled by
-default and does not alter token selection or cache/state decisions.
+in `component_untimed_forwards`; use `--disable-cuda-graph` for the Cluster-0
+component-time protocol. Instrumentation is disabled by default and its forward
+path remains the original direct call, without added synchronization.
 
 ## Model zoo
 

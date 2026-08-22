@@ -123,8 +123,6 @@ class LowConfidence(DllmAlgorithm):
                 forward_batch,
                 modes="diffusion_denoise",
                 diffusion_steps=True,
-                gdn_restores=True,
-                recomputed=_iter > 0,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
@@ -165,8 +163,7 @@ class LowConfidence(DllmAlgorithm):
         out = self._forward_with_metrics(
             model_runner,
             forward_batch,
-            modes="diffusion_commit",
-            recomputed=True,
+            modes=[()] * batch_size,
         )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         # Here next token ids is tricky to implement the dynamic lengths,

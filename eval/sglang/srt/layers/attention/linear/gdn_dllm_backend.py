@@ -413,6 +413,12 @@ class GDNDllmBackend:
                 seq_lens_cpu=torch.tensor(decode_lens_cpu),
             ).transpose(0, 1)[: len(decode_token_indices)]
             conv_states[decode_cache_indices] = conv_state_backup
+            restore_callback = getattr(
+                forward_batch, "dllm_metrics_gdn_restore_callback", None
+            )
+            if restore_callback is not None:
+                # Count only after the real backend restore assignment succeeds.
+                restore_callback(decode_bids)
 
             query, key, value = torch.split(
                 decode_mixed, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
@@ -617,6 +623,12 @@ class GDNDllmBackend:
         # Restore conv_state if not persisting
         if not persist_state:
             conv_states[cache_indices] = conv_state_backup
+            restore_callback = getattr(
+                forward_batch, "dllm_metrics_gdn_restore_callback", None
+            )
+            if restore_callback is not None:
+                # This callback is observational and is absent on the normal path.
+                restore_callback(range(batch_size))
 
         if (
             cache_intermediate_for_commit

@@ -677,6 +677,10 @@ class Req(ReqDllmMixin):
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
+        # Cluster-0 instrumentation records only the first prompt-prefix lookup.
+        # A reused pool slot cannot inherit this request-owned value.
+        self.request_metrics_initial_kv_cache_hits: Optional[int] = None
+        self._request_metrics_finalized = False
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
         self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
         self.mamba_ping_pong_track_buffer_cpu: Optional[List[int]] = None
@@ -1044,6 +1048,17 @@ class Req(ReqDllmMixin):
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
+
+        if self.request_metrics_initial_kv_cache_hits is None:
+            # This is the real match_prefix result used by allocation.  Host
+            # hits are included because they are restored before execution.
+            device_hits = (
+                len(self.prefix_indices) if self.prefix_indices is not None else 0
+            )
+            host_hits = max(int(getattr(self, "host_hit_length", 0) or 0), 0)
+            self.request_metrics_initial_kv_cache_hits = min(
+                device_hits + host_hits, len(self.origin_input_ids)
+            )
 
         if (
             self.is_retracted

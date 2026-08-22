@@ -226,8 +226,13 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
-                        req.time_stats.set_completion_time()
+                        if self._request_metrics_active(req):
+                            req.time_stats.set_completion_time()
+                            self._finalize_request_metrics(req)
+                            release_kv_cache(req, self.tree_cache)
+                        else:
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
@@ -486,6 +491,8 @@ class SchedulerOutputProcessorMixin:
                     device=self.token_to_kv_pool_allocator.device,
                 )
             )
+        # Record only after the allocator accepted the real trim operation.
+        self._record_dllm_trim_invalidations(batch, kv_trim_info)
 
         for idx in range(batch.batch_size()):
             if not result.next_token_ids:
@@ -567,16 +574,30 @@ class SchedulerOutputProcessorMixin:
                     )
 
             finished = False
+            consumed_tokens = 0
             for next_token_id in next_token_ids:
                 req.output_ids.append(next_token_id)
+                consumed_tokens += 1
                 req.check_finished()
                 if req.finished():
-                    release_kv_cache(req, self.tree_cache)
-                    req.time_stats.set_completion_time()
+                    if dllm_algo is not None:
+                        dllm_algo.record_consumed_tokens(
+                            req_pool_idx, consumed_tokens
+                        )
+                    if self._request_metrics_active(req):
+                        req.time_stats.set_completion_time()
+                        self._finalize_request_metrics(req)
+                        release_kv_cache(req, self.tree_cache)
+                    else:
+                        # Preserve the original disabled-path ordering.
+                        release_kv_cache(req, self.tree_cache)
+                        req.time_stats.set_completion_time()
                     if dllm_algo is not None:
                         dllm_algo.cleanup_request(req_pool_idx)
                     finished = True
                     break
+            if not finished and dllm_algo is not None:
+                dllm_algo.record_consumed_tokens(req_pool_idx, consumed_tokens)
             if not finished:
                 if not getattr(batch, "_dllm_decode_mode", False) or is_inline_pf:
                     if _EXTRA_BUFFER_TRACE and req.is_dllm():
@@ -793,6 +814,11 @@ class SchedulerOutputProcessorMixin:
                 req.multimodal_inputs.release_features()
             self.maybe_collect_routed_experts(req)
 
+            metrics_finalized_before_release = self._request_metrics_active(req)
+            if metrics_finalized_before_release:
+                req.time_stats.set_completion_time()
+                self._finalize_request_metrics(req)
+
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
@@ -802,7 +828,8 @@ class SchedulerOutputProcessorMixin:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
-            req.time_stats.set_completion_time()
+            if not metrics_finalized_before_release:
+                req.time_stats.set_completion_time()
 
         self.maybe_collect_customized_info(i, req, logits_output)
 

@@ -5,6 +5,7 @@ import os
 import time
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
+from sglang.srt.dllm.algorithm.instrumentation import emit_metrics_record
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -28,6 +29,126 @@ class SchedulerDllmMixin:
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
+
+    def _request_metrics_owner(self: Scheduler, req: Req):
+        if req.is_dllm():
+            return getattr(self.tp_worker, "dllm_algorithm", None)
+        return getattr(self.tp_worker, "causal_request_metrics", None)
+
+    def _request_metrics_active(self: Scheduler, req: Req) -> bool:
+        owner = self._request_metrics_owner(req)
+        recorder = getattr(owner, "_instrumentation", owner)
+        enabled = getattr(recorder, "enabled", None)
+        return bool(enabled is not None and enabled())
+
+    def _finalize_request_metrics(self: Scheduler, req: Req) -> None:
+        """Finalize and emit once, before another scheduling turn can reuse the slot."""
+        if getattr(req, "_request_metrics_finalized", False):
+            return
+        owner = self._request_metrics_owner(req)
+        if owner is None or req.req_pool_idx is None:
+            return
+        if bool(getattr(getattr(req, "finished_reason", None), "is_error", False)):
+            cleanup = getattr(owner, "cleanup_request", None)
+            if cleanup is not None:
+                cleanup(req.req_pool_idx)
+            req._request_metrics_finalized = True
+            return
+        pop = getattr(owner, "pop_request_metrics", None)
+        if pop is None:
+            return
+        metric = pop(req.req_pool_idx)
+        if metric is None:
+            return
+
+        req._request_metrics_finalized = True
+        metric.prompt_tokens = max(len(req.origin_input_ids), 0)
+        metric.kv_cache_hits = max(
+            min(
+                int(getattr(req, "request_metrics_initial_kv_cache_hits", 0) or 0),
+                metric.prompt_tokens,
+            ),
+            0,
+        )
+        metric.set_final_token_counts(stable=len(req.output_ids_through_stop))
+        start = getattr(req.time_stats, "scheduler_recv_time", 0.0)
+        end = getattr(req.time_stats, "completion_time", 0.0)
+        if start > 0 and end >= start:
+            metric.total_latency_ms = (end - start) * 1000.0
+        else:
+            metric.unavailable_metrics["total_latency_ms"] = (
+                "scheduler_receipt_or_completion_timestamp_unavailable"
+            )
+        if metric.model_scale == "unknown":
+            metric.unavailable_metrics["model_scale"] = (
+                "validated_runtime_model_scale_unavailable"
+            )
+        if metric.memory_scope == "process_peak_since_request_start":
+            import torch
+
+            if torch.cuda.is_available():
+                metric.peak_memory_bytes = max(
+                    metric.peak_memory_bytes or 0,
+                    int(torch.cuda.max_memory_allocated()),
+                )
+
+        record = emit_metrics_record(
+            metric, tp_rank=int(getattr(self.tp_worker, "tp_rank", 0))
+        )
+        if record is not None:
+            req.request_metrics = record
+
+    def _cleanup_request_metrics(self: Scheduler, req: Req) -> None:
+        owner = self._request_metrics_owner(req)
+        recorder = getattr(owner, "_instrumentation", owner)
+        cleanup_id = getattr(recorder, "cleanup_request_id", None)
+        if cleanup_id is not None:
+            cleanup_id(req.rid)
+        if owner is not None and req.req_pool_idx is not None:
+            cleanup = getattr(owner, "cleanup_request", None)
+            if cleanup is not None:
+                cleanup(req.req_pool_idx)
+
+    def _start_request_metrics(self: Scheduler, req: Req) -> None:
+        owner = self._request_metrics_owner(req)
+        recorder = getattr(owner, "_instrumentation", owner)
+        start_memory = getattr(recorder, "start_request_memory", None)
+        if start_memory is not None:
+            no_other_request = (
+                not self.waiting_queue
+                and not getattr(self.running_batch, "reqs", [])
+                and not getattr(getattr(self, "cur_batch", None), "reqs", [])
+            )
+            start_memory(
+                req.rid,
+                device=self.tp_worker.device,
+                exclusive_request=(
+                    int(self.max_running_requests) == 1 and no_other_request
+                ),
+            )
+
+    def _record_dllm_trim_invalidations(
+        self: Scheduler, batch: ScheduleBatch, kv_trim_info: dict
+    ) -> None:
+        algo = getattr(self.tp_worker, "dllm_algorithm", None)
+        recorder = getattr(algo, "_instrumentation", None)
+        if recorder is None:
+            return
+        for req in batch.reqs:
+            info = kv_trim_info.get(req.req_pool_idx)
+            if not info:
+                continue
+            freed = int(info.get("physical_free_count", 0) or 0)
+            cpu_indices = info.get("kv_indices")
+            had_real_indices = info.get("kv_indices_gpu") is not None or (
+                cpu_indices is not None and len(cpu_indices) > 0
+            )
+            if freed > 0 and had_real_indices:
+                recorder.record_invalidation(
+                    req.req_pool_idx,
+                    start=int(info.get("logical_start", 0)),
+                    length=freed,
+                )
 
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
@@ -111,6 +232,7 @@ class SchedulerDllmMixin:
                     kv_gpu_parts.append(gpu_indices)
         if kv_gpu_parts:
             self.token_to_kv_pool_allocator.free(torch.cat(kv_gpu_parts))
+        self._record_dllm_trim_invalidations(batch, kv_trim_info)
 
         for idx in range(batch.batch_size()):
             if not result.next_token_ids:
@@ -171,15 +293,30 @@ class SchedulerDllmMixin:
                     dllm_tokens
                 )
 
+            consumed_tokens = 0
+            finished = False
             for next_token_id in next_token_ids:
                 req.output_ids.append(next_token_id)
+                consumed_tokens += 1
                 req.check_finished()
                 if req.finished():
-                    release_kv_cache(req, self.tree_cache)
-                    req.time_stats.set_completion_time()
+                    if dllm_algo is not None:
+                        dllm_algo.record_consumed_tokens(
+                            req_pool_idx, consumed_tokens
+                        )
+                    if self._request_metrics_active(req):
+                        req.time_stats.set_completion_time()
+                        self._finalize_request_metrics(req)
+                        release_kv_cache(req, self.tree_cache)
+                    else:
+                        release_kv_cache(req, self.tree_cache)
+                        req.time_stats.set_completion_time()
                     if dllm_algo is not None:
                         dllm_algo.cleanup_request(req_pool_idx)
+                    finished = True
                     break
+            if not finished and dllm_algo is not None:
+                dllm_algo.record_consumed_tokens(req_pool_idx, consumed_tokens)
 
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -227,6 +364,7 @@ class SchedulerDllmMixin:
                         kv_gpu_parts.append(gpu_idx)
             if kv_gpu_parts:
                 self.token_to_kv_pool_allocator.free(torch.cat(kv_gpu_parts))
+            self._record_dllm_trim_invalidations(batch, kv_trim_info)
 
             for idx in range(batch.batch_size()):
                 req = batch.reqs[idx]
@@ -297,15 +435,32 @@ class SchedulerDllmMixin:
                     # LowConfidence / JointThreshold path: just mirror fill_ids
                     req.fill_ids[-new_tokens:] = next_token_ids[:]
 
+                consumed_tokens = 0
+                finished = False
                 for next_token_id in next_token_ids:
                     req.output_ids.append(next_token_id)
+                    consumed_tokens += 1
                     req.check_finished()
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
-                        req.time_stats.set_completion_time()
+                        if dllm_algo is not None:
+                            dllm_algo.record_consumed_tokens(
+                                req.req_pool_idx, consumed_tokens
+                            )
+                        if self._request_metrics_active(req):
+                            req.time_stats.set_completion_time()
+                            self._finalize_request_metrics(req)
+                            release_kv_cache(req, self.tree_cache)
+                        else:
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
                         if dllm_algo is not None:
                             dllm_algo.cleanup_request(req.req_pool_idx)
+                        finished = True
                         break
+                if not finished and dllm_algo is not None:
+                    dllm_algo.record_consumed_tokens(
+                        req.req_pool_idx, consumed_tokens
+                    )
 
             if not decode_mode:
                 self.stream_output(batch.reqs, batch.return_logprob)

@@ -433,7 +433,14 @@ class TpModelWorker(BaseTpWorker):
             )
 
     def _init_dllm_algorithm(self):
-        from sglang.srt.dllm.algorithm.base import DllmAlgorithm
+        from sglang.srt.dllm.algorithm.base import (
+            DllmAlgorithm,
+            RequestMetricsRecorder,
+        )
+
+        # Causal requests use the common recorder directly; they are not
+        # represented as a diffusion algorithm.
+        self.causal_request_metrics = RequestMetricsRecorder("causal")
 
         if self.server_args.dllm_algorithm is not None:
             self.dllm_algorithm = DllmAlgorithm.from_server_args(self.server_args)
@@ -528,11 +535,29 @@ class TpModelWorker(BaseTpWorker):
             if ar_timing:
                 self._ar_timing_sync()
                 _t_forward_start = time.perf_counter()
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
-            )
+            if self.causal_request_metrics.enabled(self.model_runner):
+                phase = (
+                    "causal_decode"
+                    if forward_batch.forward_mode.is_decode()
+                    else "prefill"
+                )
+                out = self.causal_request_metrics.forward(
+                    self.model_runner,
+                    forward_batch,
+                    phases=phase,
+                    forward_call=lambda: self.model_runner.forward(
+                        forward_batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                        skip_attn_backend_init=skip_attn_backend_init,
+                    ),
+                )
+                self.causal_request_metrics.flush_forward_timings()
+            else:
+                out = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                )
             if ar_timing:
                 self._ar_timing_sync()
                 _t_forward_end = time.perf_counter()
@@ -607,11 +632,29 @@ class TpModelWorker(BaseTpWorker):
 
             return batch_result
         else:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
-            )
+            if self.causal_request_metrics.enabled(self.model_runner):
+                phase = (
+                    "causal_decode"
+                    if forward_batch.forward_mode.is_decode()
+                    else "prefill"
+                )
+                out = self.causal_request_metrics.forward(
+                    self.model_runner,
+                    forward_batch,
+                    phases=phase,
+                    forward_call=lambda: self.model_runner.forward(
+                        forward_batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                        skip_attn_backend_init=skip_attn_backend_init,
+                    ),
+                )
+                self.causal_request_metrics.flush_forward_timings()
+            else:
+                out = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,

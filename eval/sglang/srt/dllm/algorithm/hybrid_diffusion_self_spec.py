@@ -479,6 +479,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         self._spec_draft_probs.pop(req_pool_idx, None)
         self._force_next_token.pop(req_pool_idx, None)
         self._mamba_track_commit_info.pop(req_pool_idx, None)
+        super().cleanup_request(req_pool_idx)
 
     def _write_trace_records(
         self,
@@ -725,7 +726,11 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             forward_batch.dllm_top_k = self.top_k
             forward_batch.dllm_top_p = self.top_p
             forward_batch.dllm_temperature = self.temperature
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            out = self._forward_with_metrics(
+                model_runner,
+                forward_batch,
+                modes="prefill",
+            )
             forward_batch.dllm_return_argmax_only = False
             forward_batch.dllm_return_topk_probs = False
             full_logits = out.logits_output.full_logits
@@ -782,6 +787,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
 
             self._stats["total_forwards"] += 1
             self._stats["prefill_forwards"] += 1
+            self._flush_forward_timings()
             return out.logits_output, [], out.can_run_graph
 
         # ── Decode (possibly mixed with inline prefill) ───────────────
@@ -920,7 +926,20 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         forward_batch.dllm_top_k = self.top_k
         forward_batch.dllm_top_p = self.top_p
         forward_batch.dllm_temperature = self.temperature
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        request_phases = []
+        for bid in range(batch_size):
+            if is_prefill[bid]:
+                request_phases.append("prefill")
+            elif case_types[bid] == "V":
+                request_phases.append(("self_spec_verify", "self_spec_draft"))
+            else:
+                request_phases.append(("causal_decode", "self_spec_draft"))
+        out = self._forward_with_metrics(
+            model_runner,
+            forward_batch,
+            modes=request_phases,
+            diffusion_steps=[not value for value in is_prefill],
+        )
         forward_batch.dllm_force_causal = False
         forward_batch.dllm_force_bidir_mask = False
         forward_batch.dllm_bidir_custom_mask = None
@@ -940,6 +959,10 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         full_argmax = getattr(logits_output, "full_argmax", None)
         full_topk_ids = getattr(logits_output, "full_topk_ids", None)
         full_topk_probs = getattr(logits_output, "full_topk_probs", None)
+        # Resolve the enclosing model CUDA event before measuring decision work,
+        # so verification does not double count asynchronous model execution.
+        self._flush_forward_timings()
+        request_verification_start = time.perf_counter()
         logits_mode = getattr(logits_output, "dllm_logits_mode", None)
         if logits_mode is None:
             if full_logits is not None:
@@ -1516,6 +1539,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
 
         # ── Step 4: Assemble outputs ──────────────────────────────
         next_token_ids_list = []
+        output_token_modes = []
         kv_offset = 0
         trace_records: List[Dict[str, Any]] = []
 
@@ -1558,6 +1582,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             # Prefill requests: no output tokens, handled above
             if is_prefill[bid]:
                 next_token_ids_list.append([])
+                output_token_modes.append([])
                 continue
 
             tc = trim_counts[bid]
@@ -1575,6 +1600,8 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 else:
                     out_pre = list(specs[:si])
                 output_tokens = out_pre + [ct]
+                token_modes = [False] * len(out_pre) + [True]
+                self._record_phase(rpx, "self_spec_correction")
                 dllm_tokens = [t0_tokens[bid]] + out_pre + [ct]
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
                 self._force_next_token[rpx] = ct
@@ -1623,6 +1650,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 else:
                     out_specs = list(specs)
                 output_tokens = out_specs + [clean_token]
+                token_modes = [False] * len(out_specs) + [True]
                 dllm_tokens = [t0_tokens[bid]] + out_specs + [clean_token]
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
                 self._pending[rpx] = clean_token
@@ -1671,6 +1699,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                     output_tokens = [clean_token]
                 else:
                     output_tokens = [t0, clean_token]
+                token_modes = [True] * len(output_tokens)
                 dllm_tokens = [t0, clean_token] + new_spec_tokens
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
                 self._pending[rpx] = clean_token
@@ -1701,6 +1730,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                         })
 
             next_token_ids_list.append(output_tokens)
+            output_token_modes.append(token_modes)
             self._dllm_write_override[rpx] = dllm_tokens
             self._advance_override[rpx] = adv
             self._kv_trim_info[rpx] = {
@@ -1712,6 +1742,8 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 "trim_count": tc,
                 "logical_trim_count": trim_counts[bid],
                 "physical_free_count": free_tc,
+                # The allocator frees these exact logical tail positions.
+                "logical_start": seq_lens_cpu[bid] - free_tc,
             }
             kv_offset += free_tc
         self._write_trace_records(trace_records, full_logits, device)
@@ -1843,6 +1875,14 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                     gdn_dllm_backend.discard_saved_batch(mamba_cache_idx_list)
         if self._timing_enabled:
             _t_phase4_gdn_commit = time.perf_counter()
+
+        self._set_output_token_modes(forward_batch, output_token_modes)
+        if decode_bids:
+            self._record_verification_time(
+                forward_batch,
+                decode_bids,
+                (time.perf_counter() - request_verification_start) * 1000.0,
+            )
 
         # Debug logging for single request
         if self._debug_steps and batch_size == 1 and not is_prefill[0]:

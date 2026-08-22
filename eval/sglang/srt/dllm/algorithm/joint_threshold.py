@@ -83,10 +83,8 @@ class JointThreshold(DllmAlgorithm):
             out = self._forward_with_metrics(
                 model_runner,
                 forward_batch,
-                modes="diffusion_edit",
+                modes="diffusion_denoise",
                 diffusion_steps=True,
-                gdn_restores=True,
-                recomputed=iteration > 0,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
@@ -157,8 +155,7 @@ class JointThreshold(DllmAlgorithm):
         out = self._forward_with_metrics(
             model_runner,
             forward_batch,
-            modes="diffusion_commit",
-            recomputed=True,
+            modes=[()] * batch_size,
         )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 

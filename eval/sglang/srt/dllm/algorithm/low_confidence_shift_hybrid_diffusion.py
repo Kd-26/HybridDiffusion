@@ -53,6 +53,7 @@ class LowConfidenceShiftHybridDiffusion(LowConfidence):
 
     def cleanup_request(self, req_pool_idx: int) -> None:
         self._seed_tokens.pop(req_pool_idx, None)
+        super().cleanup_request(req_pool_idx)
 
     def _sample_tokens(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.temperature <= 0.0:
@@ -199,8 +200,6 @@ class LowConfidenceShiftHybridDiffusion(LowConfidence):
                 forward_batch,
                 modes="diffusion_denoise",
                 diffusion_steps=True,
-                gdn_restores=True,
-                recomputed=step > 0,
             )
             self._stats["total_forwards"] += 1
             self._stats["decode_forwards"] += 1
@@ -252,8 +251,7 @@ class LowConfidenceShiftHybridDiffusion(LowConfidence):
         out = self._forward_with_metrics(
             model_runner,
             forward_batch,
-            modes="diffusion_commit",
-            recomputed=True,
+            modes=[()] * batch_size,
         )
         self._stats["total_forwards"] += 1
         self._stats["decode_forwards"] += 1
