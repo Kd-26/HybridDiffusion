@@ -97,10 +97,10 @@ def canonicalize_kv_prefix_locations(
     if (
         pool_size is not None
         and canonical.numel()
-        and not bool((canonical <= int(pool_size)).all().item())
+        and not bool((canonical < int(pool_size)).all().item())
     ):
         raise ValueError(
-            f"KV prefix locations exceed KV pool size {int(pool_size)}"
+            f"KV prefix locations must be below KV pool size {int(pool_size)}"
         )
     return canonical
 
@@ -203,6 +203,10 @@ class RegionStateCache:
 
     def contains(self, key: RegionStateKey) -> bool:
         return key in self._entries
+
+    def peek(self, key: RegionStateKey) -> Optional[RegionState]:
+        """Inspect an entry for diagnostics without changing LRU/statistics."""
+        return self._entries.get(key)
 
     def invalidate_region(self, request_id: str, region_id: str) -> int:
         return self._invalidate(

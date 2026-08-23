@@ -1,0 +1,323 @@
+import ast
+import copy
+import importlib.util
+import logging
+import sys
+import types
+import typing
+from pathlib import Path
+
+import torch
+
+
+ROOT = Path(__file__).parents[1]
+ALGORITHM_PATH = ROOT / "eval/sglang/srt/dllm/algorithm/hybrid_diffusion_self_spec.py"
+CACHE_PATH = ROOT / "eval/sglang/srt/mem_cache/region_state_cache.py"
+EXECUTION_SPEC_PATH = ROOT / "eval/sglang/srt/dllm/region/execution_spec.py"
+
+
+def _load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+CACHE = _load_module("production_handoff_region_cache", CACHE_PATH)
+EXECUTION_SPEC = _load_module("production_handoff_execution_spec", EXECUTION_SPEC_PATH)
+
+
+def _algorithm_method(name):
+    source = ast.parse(ALGORITHM_PATH.read_text())
+    algorithm = next(
+        node
+        for node in source.body
+        if isinstance(node, ast.ClassDef) and node.name == "HybridDiffusionSelfSpec"
+    )
+    function = copy.deepcopy(
+        next(
+            node
+            for node in algorithm.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+    )
+    function.decorator_list = []
+    namespace = {
+        "Any": typing.Any,
+        "Dict": typing.Dict,
+        "ForwardBatch": object,
+        "ForwardMode": types.SimpleNamespace(DLLM_MIXED="dllm_mixed"),
+        "List": typing.List,
+        "ModelRunner": object,
+        "RegionStateKey": CACHE.RegionStateKey,
+        "Union": typing.Union,
+        "DLLM_ATTN_MASK_CAUSAL_PREFILL": 0,
+        "canonicalize_kv_prefix_locations": (CACHE.canonicalize_kv_prefix_locations),
+        "copy": copy,
+        "hash_token_ids": EXECUTION_SPEC.hash_token_ids,
+        "logger": logging.getLogger(__name__),
+        "torch": torch,
+    }
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+    exec(compile(module, str(ALGORITHM_PATH), "exec"), namespace)
+    return namespace[name]
+
+
+CANONICAL_REPLAY_LOCATIONS = _algorithm_method("_canonical_replay_kv_locations")
+SNAPSHOT_BOUNDARIES = _algorithm_method("_snapshot_hybrid_boundaries")
+RESTORE_BOUNDARIES = _algorithm_method("_restore_hybrid_boundaries")
+RECOMPUTE_BOUNDARY = _algorithm_method("_recompute_hybrid_boundary")
+
+
+def _make_key(*, generation=11, boundary=4):
+    tokens = list(range(boundary))
+    return CACHE.RegionStateKey(
+        request_id="request-a",
+        request_pool_idx=1,
+        request_slot_generation=generation,
+        region_id="causal_prefix",
+        region_version=0,
+        boundary=boundary,
+        token_hash=EXECUTION_SPEC.hash_token_ids(tokens),
+        position_hash=EXECUTION_SPEC.hash_positions(0, boundary),
+        model_identity="model",
+        model_revision="revision",
+        adapter_identity="",
+        adapter_revision="",
+        attention_contract_id="causal_prefix_diffusion_suffix_v1",
+    )
+
+
+class _ReqPool:
+    def __init__(self):
+        self.req_to_token = torch.tensor(
+            [[0, 1, 2, 3, 4, 5], [1, 3, 5, 7, 2, 4]],
+            dtype=torch.int32,
+        )
+        self.req_index_to_mamba_index_mapping = torch.tensor([0, 1])
+        self.mamba_pool = types.SimpleNamespace(
+            mamba_cache=types.SimpleNamespace(
+                conv=[torch.zeros(1, 2, 3)],
+                temporal=torch.zeros(1, 2, 3),
+            )
+        )
+
+
+class _LifecycleBackend:
+    def __init__(self, pool):
+        self.req_to_token_pool = pool
+        self.region_state_cache = CACHE.RegionStateCache()
+        self.restore_calls = 0
+
+    def _current_mamba_slot(self, request_pool_idx):
+        return int(
+            self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                request_pool_idx
+            ].item()
+        )
+
+    def snapshot_region_state(self, *, state_key, mamba_cache_idx, kv_prefix):
+        mamba = self.req_to_token_pool.mamba_pool.mamba_cache
+        state = CACHE.RegionState(
+            key=state_key,
+            kv_prefix=kv_prefix,
+            kv_valid_length=state_key.boundary,
+            kv_owner_request_id=state_key.request_id,
+            gdn_conv_states=tuple(
+                tensor[:, mamba_cache_idx].clone() for tensor in mamba.conv
+            ),
+            gdn_recurrent_states=mamba.temporal[:, mamba_cache_idx].clone(),
+            boundary=state_key.boundary,
+        )
+        self.region_state_cache.put(state)
+        return state
+
+    def restore_region_state(
+        self, *, state_key, mamba_cache_idx, current_slot_generation
+    ):
+        self.restore_calls += 1
+        return self.region_state_cache.get(
+            state_key, current_slot_generation=current_slot_generation
+        )
+
+
+def _kv_reference(runner, key):
+    locations = CACHE.canonicalize_kv_prefix_locations(
+        runner.req_to_token_pool.req_to_token[key.request_pool_idx, : key.boundary],
+        key.boundary,
+        pool_size=runner.token_to_kv_pool.size,
+    )
+    return CACHE.KVPrefixReference(
+        request_id=key.request_id,
+        request_pool_idx=key.request_pool_idx,
+        request_slot_generation=key.request_slot_generation,
+        pool_identity=id(runner.req_to_token_pool),
+        locations=locations,
+        valid_length=key.boundary,
+    )
+
+
+def _algorithm(backend, key):
+    algorithm = types.SimpleNamespace(
+        exact_prefix_handoff=True,
+        conditional_lora=False,
+        _exact_handoff_debug=False,
+        _exact_handoff_debug_sync=False,
+        _hybrid_state_keys={},
+    )
+    algorithm._get_gdn_dllm_backend = lambda _runner: backend
+    algorithm._hybrid_key_for_bid = lambda _batch, _bid, _rpx: key
+    algorithm._hybrid_kv_reference = _kv_reference
+    algorithm._hybrid_key_log_fields = lambda value: {"request_id": value.request_id}
+    algorithm._hybrid_debug_log = lambda *_args, **_kwargs: None
+    algorithm._hybrid_debug_synchronize = lambda *_args, **_kwargs: None
+    algorithm._canonical_replay_kv_locations = CANONICAL_REPLAY_LOCATIONS
+    return algorithm
+
+
+def test_recovery_locations_canonicalize_int32_page_table():
+    pool = _ReqPool()
+    runner = types.SimpleNamespace(
+        req_to_token_pool=pool,
+        token_to_kv_pool=types.SimpleNamespace(size=8),
+    )
+    locations = CANONICAL_REPLAY_LOCATIONS(runner, _make_key(), torch.device("cpu"))
+    assert pool.req_to_token.dtype is torch.int32
+    assert locations.dtype is torch.int64
+    assert locations.ndim == 1
+    assert locations.is_contiguous()
+    assert locations.device == pool.req_to_token.device
+
+
+def test_prefill_snapshot_then_first_decode_is_a_real_restore_hit():
+    pool = _ReqPool()
+    backend = _LifecycleBackend(pool)
+    key = _make_key()
+    runner = types.SimpleNamespace(
+        req_to_token_pool=pool,
+        token_to_kv_pool=types.SimpleNamespace(size=8),
+    )
+    algorithm = _algorithm(backend, key)
+    batch = types.SimpleNamespace(seq_lens_cpu=torch.tensor([key.boundary]))
+
+    SNAPSHOT_BOUNDARIES(algorithm, runner, batch, [0], [key.request_pool_idx])
+    recomputes = []
+    algorithm._recompute_hybrid_boundary = lambda *args: recomputes.append(args)
+    RESTORE_BOUNDARIES(algorithm, runner, batch, [0], [key.request_pool_idx])
+
+    assert backend.restore_calls == 1
+    assert backend.region_state_cache.hit_count == 1
+    assert recomputes == []
+
+
+def test_region_cache_hit_does_not_depend_on_local_key_index():
+    pool = _ReqPool()
+    backend = _LifecycleBackend(pool)
+    key = _make_key()
+    runner = types.SimpleNamespace(
+        req_to_token_pool=pool,
+        token_to_kv_pool=types.SimpleNamespace(size=8),
+    )
+    algorithm = _algorithm(backend, key)
+    batch = types.SimpleNamespace(seq_lens_cpu=torch.tensor([key.boundary]))
+    SNAPSHOT_BOUNDARIES(algorithm, runner, batch, [0], [key.request_pool_idx])
+    algorithm._hybrid_state_keys.clear()
+    recomputes = []
+    algorithm._recompute_hybrid_boundary = lambda *args: recomputes.append(args)
+
+    RESTORE_BOUNDARIES(algorithm, runner, batch, [0], [key.request_pool_idx])
+
+    assert backend.region_state_cache.hit_count == 1
+    assert algorithm._hybrid_state_keys[key.request_pool_idx] == key
+    assert recomputes == []
+
+
+class _AttentionBackend:
+    def __init__(self):
+        self.prepared = []
+
+    def init_forward_metadata(self, replay):
+        assert replay.batch_size == 1
+        assert replay.out_cache_loc.dtype is torch.int64
+        assert replay.out_cache_loc.is_contiguous()
+        assert torch.all(replay.out_cache_loc >= 0)
+        assert torch.all(replay.out_cache_loc < 8)
+        self.prepared.append(replay)
+
+
+class _Runner:
+    def __init__(self, pool):
+        self.req_to_token_pool = pool
+        self.token_to_kv_pool = types.SimpleNamespace(size=8)
+        self.attn_backend = _AttentionBackend()
+        self.lora_manager = None
+        self.forwarded = []
+
+    def forward(self, replay, **kwargs):
+        assert kwargs["skip_attn_backend_init"] is True
+        assert replay.out_cache_loc.dtype is torch.int64
+        self.forwarded.append(replay)
+
+
+def _decode_batch(key):
+    return types.SimpleNamespace(
+        input_ids=torch.zeros(3, dtype=torch.int64),
+        positions=torch.zeros(3, dtype=torch.int64),
+        req_pool_indices=torch.tensor([key.request_pool_idx], dtype=torch.int32),
+        seq_lens=torch.tensor([key.boundary + 3], dtype=torch.int32),
+        hybrid_stable_token_ids_cpu=[list(range(key.boundary))],
+        lora_ids=None,
+    )
+
+
+def test_forced_miss_recovery_uses_safe_indices_and_next_restore_hits():
+    pool = _ReqPool()
+    backend = _LifecycleBackend(pool)
+    key = _make_key()
+    runner = _Runner(pool)
+    algorithm = _algorithm(backend, key)
+
+    RECOMPUTE_BOUNDARY(algorithm, runner, _decode_batch(key), 0, key, backend)
+
+    assert len(runner.forwarded) == 1
+    assert runner.forwarded[0].out_cache_loc.dtype is torch.int64
+    assert runner.forwarded[0].out_cache_loc.numel() == key.boundary
+    lookup = backend.restore_region_state(
+        state_key=key,
+        mamba_cache_idx=1,
+        current_slot_generation=key.request_slot_generation,
+    )
+    assert lookup.hit
+
+
+def test_request_slot_reuse_cannot_restore_stale_state():
+    pool = _ReqPool()
+    backend = _LifecycleBackend(pool)
+    old_key = _make_key(generation=11)
+    new_key = _make_key(generation=12)
+    runner = types.SimpleNamespace(
+        req_to_token_pool=pool,
+        token_to_kv_pool=types.SimpleNamespace(size=8),
+    )
+    backend.snapshot_region_state(
+        state_key=old_key,
+        mamba_cache_idx=1,
+        kv_prefix=_kv_reference(runner, old_key),
+    )
+    algorithm = _algorithm(backend, new_key)
+    algorithm._hybrid_state_keys[old_key.request_pool_idx] = old_key
+    recomputes = []
+    algorithm._recompute_hybrid_boundary = lambda *args: recomputes.append(args)
+
+    RESTORE_BOUNDARIES(
+        algorithm,
+        runner,
+        types.SimpleNamespace(),
+        [0],
+        [new_key.request_pool_idx],
+    )
+
+    assert backend.region_state_cache.hit_count == 0
+    assert len(recomputes) == 1
+    assert not backend.region_state_cache.contains(old_key)

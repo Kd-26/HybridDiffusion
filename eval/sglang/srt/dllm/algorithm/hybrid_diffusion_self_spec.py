@@ -31,6 +31,7 @@ Config keys (passed via --dllm-algorithm-config YAML):
 """
 
 import copy
+import hashlib
 import importlib.util
 import logging
 import json
@@ -406,6 +407,12 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             getattr(config, "strict_region_state_validation", True)
         )
         self._hybrid_state_keys: Dict[int, RegionStateKey] = {}
+        self._exact_handoff_debug = (
+            os.getenv("SGLANG_HYBRID_EXACT_HANDOFF_DEBUG", "0") == "1"
+        )
+        self._exact_handoff_debug_sync = (
+            os.getenv("SGLANG_HYBRID_EXACT_HANDOFF_DEBUG_SYNC", "0") == "1"
+        )
 
         self._stats = {
             "total_forwards": 0,
@@ -597,6 +604,76 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         )
 
     @staticmethod
+    def _hybrid_location_hash(locations: torch.Tensor) -> str:
+        """Return a compact diagnostic digest without changing tensor ownership."""
+        digest = hashlib.sha256()
+        for location in locations.detach().to(device="cpu", dtype=torch.int64).tolist():
+            digest.update(int(location).to_bytes(8, "little", signed=True))
+        return digest.hexdigest()[:16]
+
+    @staticmethod
+    def _hybrid_key_log_fields(key: RegionStateKey) -> Dict[str, Any]:
+        return {
+            "request_id": key.request_id,
+            "request_pool_idx": key.request_pool_idx,
+            "request_slot_generation": key.request_slot_generation,
+            "boundary": key.boundary,
+            "region_version": key.region_version,
+            "token_hash": key.token_hash,
+            "position_hash": key.position_hash,
+            "attention_contract": key.attention_contract_id,
+        }
+
+    def _hybrid_debug_log(self, event: str, **fields: Any) -> None:
+        if self._exact_handoff_debug or self._exact_handoff_debug_sync:
+            logger.info(
+                "[HybridExactHandoff] %s %s",
+                event,
+                json.dumps(fields, sort_keys=True, default=str),
+            )
+
+    def _hybrid_debug_synchronize(
+        self, stage: str, device: Union[str, torch.device]
+    ) -> None:
+        if not self._exact_handoff_debug_sync:
+            return
+        device = torch.device(device)
+        if device.type != "cuda":
+            return
+        self._hybrid_debug_log("cuda_sync_begin", stage=stage, device=str(device))
+        torch.cuda.synchronize(device)
+        self._hybrid_debug_log("cuda_sync_complete", stage=stage, device=str(device))
+
+    @staticmethod
+    def _canonical_replay_kv_locations(
+        model_runner: ModelRunner,
+        key: RegionStateKey,
+        required_device: torch.device,
+    ) -> torch.Tensor:
+        """Capture replay write locations using ForwardBatch's int64 contract."""
+        locations = canonicalize_kv_prefix_locations(
+            model_runner.req_to_token_pool.req_to_token[
+                key.request_pool_idx, : key.boundary
+            ],
+            key.boundary,
+            pool_size=model_runner.token_to_kv_pool.size,
+        )
+        required_device = torch.device(required_device)
+        if locations.device != required_device:
+            raise RuntimeError(
+                "recovery replay KV locations are on the wrong device: "
+                f"{locations.device} != {required_device}"
+            )
+        if (
+            locations.dtype != torch.int64
+            or locations.ndim != 1
+            or not locations.is_contiguous()
+            or locations.numel() != key.boundary
+        ):
+            raise RuntimeError("recovery replay KV locations are not canonical")
+        return locations
+
+    @staticmethod
     def _hybrid_kv_reference(
         model_runner: ModelRunner, key: RegionStateKey
     ) -> KVPrefixReference:
@@ -634,14 +711,36 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             seq_lens = getattr(forward_batch, "seq_lens_cpu", None)
             if seq_lens is not None and int(seq_lens[bid]) < key.boundary:
                 # Chunked inline prefill has not reached the canonical boundary.
+                self._hybrid_debug_log(
+                    "snapshot_skipped",
+                    reason="sequence_before_boundary",
+                    sequence_length=int(seq_lens[bid]),
+                    **self._hybrid_key_log_fields(key),
+                )
                 continue
             mamba_idx = backend._current_mamba_slot(rpx)
+            kv_prefix = self._hybrid_kv_reference(model_runner, key)
+            self._hybrid_debug_synchronize(
+                "snapshot_kv_reference_constructed", kv_prefix.locations.device
+            )
             backend.snapshot_region_state(
                 state_key=key,
                 mamba_cache_idx=mamba_idx,
-                kv_prefix=self._hybrid_kv_reference(model_runner, key),
+                kv_prefix=kv_prefix,
+            )
+            self._hybrid_debug_synchronize(
+                "snapshot_gdn_state_published", kv_prefix.locations.device
             )
             self._hybrid_state_keys[rpx] = key
+            if self._exact_handoff_debug or self._exact_handoff_debug_sync:
+                self._hybrid_debug_log(
+                    "snapshot_created",
+                    mamba_slot=mamba_idx,
+                    kv_location_hash=self._hybrid_location_hash(
+                        kv_prefix.locations
+                    ),
+                    **self._hybrid_key_log_fields(key),
+                )
 
     def _restore_hybrid_boundaries(
         self,
@@ -659,25 +758,87 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             rpx = int(req_pool_indices_cpu[bid])
             requested = self._hybrid_key_for_bid(forward_batch, bid, rpx)
             current = self._hybrid_state_keys.get(rpx)
-            if current != requested:
-                if current is not None:
-                    backend.region_state_cache.invalidate_key(current)
-                    self._hybrid_state_keys.pop(rpx, None)
-                self._recompute_hybrid_boundary(
-                    model_runner, forward_batch, bid, requested, backend
+            debug_enabled = (
+                self._exact_handoff_debug or self._exact_handoff_debug_sync
+            )
+            current_locations = None
+            if debug_enabled:
+                stored_state = backend.region_state_cache.peek(
+                    current if current is not None else requested
                 )
-                continue
+                current_locations = canonicalize_kv_prefix_locations(
+                    model_runner.req_to_token_pool.req_to_token[
+                        rpx, : requested.boundary
+                    ],
+                    requested.boundary,
+                    pool_size=model_runner.token_to_kv_pool.size,
+                )
+                self._hybrid_debug_log(
+                    "restore_requested",
+                    stored_key=(
+                        self._hybrid_key_log_fields(current)
+                        if current is not None
+                        else None
+                    ),
+                    requested_key=self._hybrid_key_log_fields(requested),
+                    stored_kv_location_hash=(
+                        self._hybrid_location_hash(
+                            stored_state.kv_prefix.locations
+                        )
+                        if stored_state is not None
+                        else None
+                    ),
+                    current_kv_location_hash=self._hybrid_location_hash(
+                        current_locations
+                    ),
+                    current_mamba_slot=backend._current_mamba_slot(rpx),
+                )
+            # The region-state cache is authoritative.  The per-algorithm map is
+            # only an index used for cleanup and must never turn an existing
+            # requested snapshot into an unnecessary recovery replay.
+            if current is not None and current != requested:
+                backend.region_state_cache.invalidate_key(current)
+                self._hybrid_state_keys.pop(rpx, None)
             lookup = backend.restore_region_state(
                 state_key=requested,
                 mamba_cache_idx=backend._current_mamba_slot(rpx),
                 current_slot_generation=requested.request_slot_generation,
             )
-            if not lookup.hit:
-                backend.region_state_cache.invalidate_key(requested)
-                self._hybrid_state_keys.pop(rpx, None)
-                self._recompute_hybrid_boundary(
-                    model_runner, forward_batch, bid, requested, backend
+            if lookup.hit:
+                self._hybrid_state_keys[rpx] = requested
+                assert lookup.state is not None
+                if debug_enabled:
+                    self._hybrid_debug_log(
+                        "restore_hit",
+                        stored_kv_location_hash=self._hybrid_location_hash(
+                            lookup.state.kv_prefix.locations
+                        ),
+                        current_kv_location_hash=self._hybrid_location_hash(
+                            current_locations
+                        ),
+                        current_mamba_slot=backend._current_mamba_slot(rpx),
+                        **self._hybrid_key_log_fields(requested),
+                    )
+                continue
+            if debug_enabled:
+                self._hybrid_debug_log(
+                    "restore_miss",
+                    miss_reason=(
+                        lookup.miss_reason.value
+                        if lookup.miss_reason is not None
+                        else None
+                    ),
+                    current_kv_location_hash=self._hybrid_location_hash(
+                        current_locations
+                    ),
+                    current_mamba_slot=backend._current_mamba_slot(rpx),
+                    **self._hybrid_key_log_fields(requested),
                 )
+            backend.region_state_cache.invalidate_key(requested)
+            self._hybrid_state_keys.pop(rpx, None)
+            self._recompute_hybrid_boundary(
+                model_runner, forward_batch, bid, requested, backend
+            )
 
     def _recompute_hybrid_boundary(
         self,
@@ -705,10 +866,24 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
 
         device = forward_batch.input_ids.device
         mamba_idx = backend._current_mamba_slot(key.request_pool_idx)
+        self._hybrid_debug_log(
+            "recovery_replay_invoked",
+            batch_index=bid,
+            mamba_slot=mamba_idx,
+            **self._hybrid_key_log_fields(key),
+        )
         mamba_cache = backend.req_to_token_pool.mamba_pool.mamba_cache
         for conv_state in mamba_cache.conv:
             conv_state[:, mamba_idx].zero_()
         mamba_cache.temporal[:, mamba_idx].zero_()
+        self._hybrid_debug_synchronize("recovery_mamba_state_zeroed", device)
+
+        # req_to_token uses an int32 page table internally, but all
+        # ForwardBatch KV write locations are int64.  Keep this owned copy
+        # reachable through replay for the entire forward.
+        replay_locations = self._canonical_replay_kv_locations(
+            model_runner, key, device
+        )
 
         replay = copy.copy(forward_batch)
         # DLLM_MIXED has extend semantics but is intentionally non-graphable;
@@ -723,9 +898,8 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         replay.seq_lens_cpu = torch.tensor([key.boundary], dtype=torch.int64)
         replay.orig_seq_lens = replay.seq_lens.to(dtype=torch.int32)
         replay.seq_lens_sum = key.boundary
-        replay.out_cache_loc = model_runner.req_to_token_pool.req_to_token[
-            key.request_pool_idx, : key.boundary
-        ]
+        replay.out_cache_loc = replay_locations
+        replay.out_cache_loc_swa = None
         replay.positions = torch.arange(
             key.boundary, dtype=forward_batch.positions.dtype, device=device
         )
@@ -746,22 +920,80 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         replay.dllm_force_causal = True
         replay.dllm_force_bidir_mask = False
         replay.dllm_bidir_custom_mask = None
-        replay.dllm_gdn_persist_state = None
+        replay.dllm_gdn_persist_state = True
+        replay.dllm_gdn_causal_mode = 1
+        replay.dllm_gdn_num_clean = key.boundary
+        replay.dllm_gdn_block_size = key.boundary
         replay.dllm_gdn_save_for_commit = False
         replay.dllm_gdn_cache_intermediate_for_commit = False
+        replay.dllm_gdn_use_graph_save_buffer = False
+        replay.dllm_return_argmax_only = False
+        replay.dllm_return_topk_probs = False
         replay.rids = [key.request_id]
-        if forward_batch.lora_ids is not None:
+        replay.return_logprob = False
+        replay.input_embeds = None
+        replay.replace_embeds = None
+        replay.replace_positions = None
+        replay.mamba_track_mask = None
+        replay.mamba_track_indices = None
+        replay.mamba_track_seqlens = None
+        replay.dllm_mamba_track_indices_cpu = None
+        replay.dllm_mamba_track_steps_cpu = None
+        replay.dllm_mamba_track_boundaries_cpu = None
+        if getattr(forward_batch, "lora_ids", None) is not None:
             replay.lora_ids = [forward_batch.lora_ids[bid]]
-        if self.conditional_lora and replay.lora_ids is not None:
+        if self.conditional_lora and getattr(replay, "lora_ids", None) is not None:
             replay.lora_segment_ids = [None]
             replay.lora_segment_lens_cpu = [key.boundary]
-            model_runner.lora_manager.prepare_lora_batch(replay)
+        lora_manager = getattr(model_runner, "lora_manager", None)
+        primary_exception = None
+        try:
+            if (
+                lora_manager is not None
+                and getattr(replay, "lora_ids", None) is not None
+            ):
+                lora_manager.prepare_lora_batch(replay)
+            # Initialize full-paged/GDN metadata for the replay shape explicitly;
+            # the normal decode call that follows initializes its own metadata.
+            model_runner.attn_backend.init_forward_metadata(replay)
+            self._hybrid_debug_synchronize(
+                "recovery_attention_metadata_prepared", device
+            )
+            model_runner.forward(
+                replay,
+                skip_attn_backend_init=True,
+                pp_proxy_tensors=None,
+            )
+            self._hybrid_debug_synchronize("recovery_model_forward", device)
+        except BaseException as exc:
+            primary_exception = exc
+            raise
+        finally:
+            if (
+                lora_manager is not None
+                and getattr(forward_batch, "lora_ids", None) is not None
+            ):
+                try:
+                    lora_manager.prepare_lora_batch(forward_batch)
+                except BaseException:
+                    if primary_exception is None:
+                        raise
+                    logger.exception(
+                        "Failed to restore active decode LoRA metadata after "
+                        "a recovery replay failure; preserving the primary exception"
+                    )
 
-        model_runner.forward(replay, pp_proxy_tensors=None)
+        kv_prefix = self._hybrid_kv_reference(model_runner, key)
+        self._hybrid_debug_synchronize(
+            "recovery_kv_reference_constructed", kv_prefix.locations.device
+        )
         backend.snapshot_region_state(
             state_key=key,
             mamba_cache_idx=mamba_idx,
-            kv_prefix=self._hybrid_kv_reference(model_runner, key),
+            kv_prefix=kv_prefix,
+        )
+        self._hybrid_debug_synchronize(
+            "recovery_gdn_snapshot_published", kv_prefix.locations.device
         )
         self._hybrid_state_keys[key.request_pool_idx] = key
 

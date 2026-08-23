@@ -91,6 +91,15 @@ def test_kv_prefix_reference_canonicalizes_int32_locations():
     assert torch.equal(reference.locations, raw.to(torch.int64))
 
 
+def test_canonical_locations_reject_pool_size_as_out_of_bounds():
+    with pytest.raises(ValueError, match="below KV pool size 8"):
+        MODULE.canonicalize_kv_prefix_locations(
+            torch.tensor([0, 7, 8], dtype=torch.int32),
+            3,
+            pool_size=8,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "reason"),
     [
