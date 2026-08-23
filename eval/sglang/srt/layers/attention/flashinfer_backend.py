@@ -24,6 +24,11 @@ from sglang.srt.dllm.config import (
     DllmConfig,
     SelfSpecVariant,
 )
+from sglang.srt.dllm.attention_mask import (
+    build_paged_custom_mask,
+    select_bidir_mask_backend,
+    validate_bidir_mask_backend,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -133,51 +138,13 @@ def _build_dllm_paged_custom_mask(
     mask_types: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fallback bool mask for dLLM paged prefill when native FlashInfer is absent."""
-    device = seq_lens.device
-    block_mask = block_mask.to(device=device, dtype=torch.bool, non_blocking=True)
-    if mask_types is not None:
-        mask_types = mask_types.to(device=device, dtype=torch.int32, non_blocking=True)
-
-    req_shapes = []
-    total_numel = 0
-    for i in range(len(seq_lens)):
-        seq_len = int(seq_lens[i].item())
-        prefix_len = int(prefix_lens[i].item()) if prefix_lens is not None else 0
-        query_len = seq_len - prefix_len
-        if query_len <= 0 or seq_len <= 0:
-            continue
-        mask_type = (
-            int(mask_types[i].item())
-            if mask_types is not None
-            else DLLM_ATTN_MASK_BIDIR_BLOCK
-        )
-        req_shapes.append((seq_len, prefix_len, query_len, mask_type))
-        total_numel += query_len * seq_len
-
-    if total_numel == 0:
-        return torch.empty((0,), dtype=torch.bool, device=device)
-
-    custom_mask = torch.empty((total_numel,), dtype=torch.bool, device=device)
-    offset = 0
-    for seq_len, prefix_len, query_len, mask_type in req_shapes:
-        prefix_cols = max(0, min(prefix_len, seq_len))
-        suffix_cols = seq_len - prefix_cols
-        req_mask = custom_mask[offset : offset + query_len * seq_len].view(
-            query_len, seq_len
-        )
-        req_mask.fill_(False)
-        if prefix_cols > 0:
-            req_mask[:, :prefix_cols] = True
-        if suffix_cols > 0:
-            if mask_type == DLLM_ATTN_MASK_BIDIR_BLOCK:
-                req_mask[:, prefix_cols:] = block_mask[:query_len, :suffix_cols]
-            else:
-                rows = torch.arange(query_len, device=device).unsqueeze(1)
-                cols = torch.arange(suffix_cols, device=device).unsqueeze(0)
-                req_mask[:, prefix_cols:] = cols <= rows
-        offset += query_len * seq_len
-
-    return custom_mask
+    return build_paged_custom_mask(
+        seq_lens,
+        prefix_lens,
+        block_mask,
+        mask_types,
+        bidir_mask_type=DLLM_ATTN_MASK_BIDIR_BLOCK,
+    )
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -637,28 +604,52 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch, "dllm_attn_mask_types", None
             )
             prefix_lens = forward_batch.extend_prefix_lens
-            dllm_use_native_bidir_mask = (
-                dllm_force_bidir_mask
-                and dllm_bidir_custom_mask is not None
-                and self.dllm_native_bidir_mask_available
+            dllm_mask_backend = getattr(
+                forward_batch, "dllm_bidir_mask_backend", "auto"
             )
+            validate_bidir_mask_backend(dllm_mask_backend)
+            dllm_use_native_bidir_mask = False
             dllm_paged_custom_mask = None
-            if (
-                dllm_force_bidir_mask
-                and dllm_bidir_custom_mask is not None
-                and not dllm_use_native_bidir_mask
-            ):
-                if not self.dllm_allow_bidir_custom_mask_fallback:
+            if dllm_force_bidir_mask and dllm_bidir_custom_mask is None:
+                raise RuntimeError(
+                    "dLLM bidirectional attention requires a supplied block mask"
+                )
+            if dllm_force_bidir_mask and dllm_bidir_custom_mask is not None:
+                selected_backend = select_bidir_mask_backend(
+                    dllm_mask_backend,
+                    native_available=self.dllm_native_bidir_mask_available,
+                    configured_block_size=self.dllm_config.block_size,
+                    seq_lens=forward_batch.seq_lens,
+                    prefix_lens=prefix_lens,
+                    block_mask=dllm_bidir_custom_mask,
+                    structured_mask=self._get_dllm_bidir_block_mask(
+                        dllm_bidir_custom_mask.device
+                    ),
+                )
+                dllm_use_native_bidir_mask = selected_backend == "native"
+                if (
+                    selected_backend == "custom"
+                    and not self.dllm_allow_bidir_custom_mask_fallback
+                ):
                     raise RuntimeError(
                         "DLLM bidirectional block attention requires FlashInfer native "
                         "dllm_bidir_block_mask support on the production path. Set "
                         "SGLANG_DLLM_ALLOW_BIDIR_CUSTOM_MASK_FALLBACK=1 only for debug."
                     )
-                dllm_paged_custom_mask = _build_dllm_paged_custom_mask(
-                    forward_batch.seq_lens,
-                    prefix_lens,
-                    dllm_bidir_custom_mask,
-                    dllm_attn_mask_types,
+                if selected_backend == "custom":
+                    dllm_paged_custom_mask = _build_dllm_paged_custom_mask(
+                        forward_batch.seq_lens,
+                        prefix_lens,
+                        dllm_bidir_custom_mask,
+                        dllm_attn_mask_types,
+                    )
+                logger.info(
+                    "dLLM attention_mask_backend=%s",
+                    (
+                        "native_structured"
+                        if dllm_use_native_bidir_mask
+                        else "custom_paged"
+                    ),
                 )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,

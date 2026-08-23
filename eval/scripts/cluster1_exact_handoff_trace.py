@@ -14,6 +14,8 @@ import contextlib
 import dataclasses
 import hashlib
 import json
+import logging
+import os
 import random
 import sys
 from dataclasses import dataclass, replace
@@ -23,6 +25,9 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequenc
 
 SCHEMA_VERSION = 1
 ATTENTION_CONTRACT = "causal_prefix_diffusion_suffix_v1"
+ATTENTION_MASK_BACKEND = "custom_paged"
+EXPORTER_MAX_TOTAL_TOKENS = 4096
+logger = logging.getLogger(__name__)
 NEGATIVE_CHECK_NAMES = (
     "wrong_model_miss",
     "wrong_model_revision_miss",
@@ -246,10 +251,15 @@ class ModelTraceHooks:
                 raise RuntimeError(
                     f"layer {layer_id} returned fewer rows than the active suffix"
                 )
-            active_hidden = hidden[-self._active_length :]
+            torch = _import_torch()
+            hidden_slice = hidden[-self._active_length :].detach().contiguous().clone()
             if residual is not None and tuple(residual.shape) == tuple(hidden.shape):
-                active_hidden = active_hidden + residual[-self._active_length :]
-            active_hidden = active_hidden.detach().clone()
+                residual_slice = (
+                    residual[-self._active_length :].detach().contiguous().clone()
+                )
+                active_hidden = torch.add(hidden_slice, residual_slice)
+            else:
+                active_hidden = hidden_slice
             gdn_index = self._mamba_map.get(layer_id)
             conv = recurrent = None
             if gdn_index is not None:
@@ -390,6 +400,8 @@ def validate_result(result: Mapping[str, Any], case: ManifestCase) -> None:
         raise ValueError("result case_id mismatch")
     if result.get("cache_hit") is not True:
         raise ValueError("cached path did not report a genuine exact cache hit")
+    if result.get("attention_mask_backend") != ATTENTION_MASK_BACKEND:
+        raise ValueError("result is missing attention_mask_backend=custom_paged")
     steps = result.get("steps")
     if not isinstance(steps, list) or len(steps) != case.diffusion_steps:
         raise ValueError("missing diffusion-step traces")
@@ -430,6 +442,7 @@ class Cluster1ModelRuntime:
         self._load_model()
 
     def _load_model(self) -> None:
+        os.environ.setdefault("SGLANG_DLLM_ALLOW_BIDIR_CUSTOM_MASK_FALLBACK", "1")
         eval_root = Path(__file__).resolve().parents[1]
         if str(eval_root) not in sys.path:
             sys.path.insert(0, str(eval_root))
@@ -440,14 +453,7 @@ class Cluster1ModelRuntime:
             eval_root / "configs/hybrid_diffusion_self_spec_b7_g4_exact_handoff.yaml"
         )
         self.server_args = ServerArgs(
-            model_path=self.args.model_dir,
-            dtype=self.args.dtype,
-            tp_size=self.args.tp_size,
-            disable_cuda_graph=True,
-            disable_overlap_schedule=True,
-            max_running_requests=8,
-            dllm_algorithm="HybridDiffusionSelfSpec",
-            dllm_algorithm_config=str(config_path),
+            **self._server_args_kwargs(self.args, config_path)
         )
         _set_envs_and_config(self.server_args)
         port_args = PortArgs.init_new(self.server_args)
@@ -463,6 +469,22 @@ class Cluster1ModelRuntime:
         self.backend.configure_region_state_cache(
             max_entries=128, strict_validation=True
         )
+
+    @staticmethod
+    def _server_args_kwargs(
+        args: argparse.Namespace, config_path: Path
+    ) -> dict[str, Any]:
+        return {
+            "model_path": args.model_dir,
+            "dtype": args.dtype,
+            "tp_size": args.tp_size,
+            "disable_cuda_graph": True,
+            "disable_overlap_schedule": True,
+            "max_running_requests": 1,
+            "max_total_tokens": EXPORTER_MAX_TOTAL_TOKENS,
+            "dllm_algorithm": "HybridDiffusionSelfSpec",
+            "dllm_algorithm_config": str(config_path),
+        }
 
     def _region_backend(self) -> Any:
         backend = getattr(self.model_runner.attn_backend, "linear_attn_backend", None)
@@ -540,10 +562,8 @@ class Cluster1ModelRuntime:
         forward_batch = ForwardBatch.init_new(worker_batch, self.model_runner)
         if bidir:
             active_length = int(req.extend_input_len)
-            torch = _import_torch()
-            forward_batch.dllm_force_bidir_mask = True
-            forward_batch.dllm_bidir_custom_mask = torch.ones(
-                (active_length, active_length), dtype=torch.bool, device=self.device
+            self._configure_active_mask(
+                forward_batch, active_length=active_length, device=self.device
             )
             forward_batch.dllm_gdn_causal_mode = 0
             forward_batch.dllm_gdn_block_size = active_length
@@ -552,6 +572,17 @@ class Cluster1ModelRuntime:
             forward_batch.dllm_gdn_causal_mode = 1
         forward_batch.dllm_gdn_persist_state = True
         return batch, forward_batch
+
+    @staticmethod
+    def _configure_active_mask(
+        forward_batch: Any, *, active_length: int, device: Any
+    ) -> None:
+        torch = _import_torch()
+        forward_batch.dllm_bidir_mask_backend = "custom"
+        forward_batch.dllm_force_bidir_mask = True
+        forward_batch.dllm_bidir_custom_mask = torch.ones(
+            (active_length, active_length), dtype=torch.bool, device=device
+        )
 
     def _forward(self, forward_batch: Any) -> Any:
         output = self.model_runner.forward(forward_batch).logits_output
@@ -797,11 +828,18 @@ class Cluster1ModelRuntime:
 
     def run_case(self, case: ManifestCase) -> dict[str, Any]:
         torch = _import_torch()
+        if case.prefix_length + case.active_length > EXPORTER_MAX_TOTAL_TOKENS:
+            raise ValueError(
+                "case exceeds exporter token budget: "
+                f"{case.prefix_length} + {case.active_length} > "
+                f"{EXPORTER_MAX_TOTAL_TOKENS}"
+            )
         prefix, initial_active = self._tokens(case)
         reference_steps: list[CapturedStep] = []
         cached_steps: list[CapturedStep] = []
         active_inputs: list[list[int]] = []
         active = list(initial_active)
+        case_completed = False
 
         hooks = ModelTraceHooks(self.model_runner)
         try:
@@ -891,6 +929,7 @@ class Cluster1ModelRuntime:
                 "active_length": case.active_length,
                 "diffusion_steps": case.diffusion_steps,
                 "attention_contract_id": case.attention_contract_id,
+                "attention_mask_backend": ATTENTION_MASK_BACKEND,
                 "num_layers": hooks.num_layers,
                 "cache_hit": cache_hit,
                 "steps": compared,
@@ -901,17 +940,38 @@ class Cluster1ModelRuntime:
                 "negative_cache_checks": negative_checks,
             }
             validate_result(result, case)
+            logger.info(
+                "case_id=%s attention_mask_backend=%s",
+                case.case_id,
+                ATTENTION_MASK_BACKEND,
+            )
+            case_completed = True
             return result
         finally:
-            for trace in reference_steps + cached_steps:
-                trace.release()
-            hooks.close()
-            if not hooks.released:
-                raise RuntimeError(
-                    "temporary hooks or retained tensors survived the case"
-                )
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._cleanup_case_resources(
+                reference_steps,
+                cached_steps,
+                hooks,
+                torch,
+                case_completed=case_completed,
+            )
+
+    @staticmethod
+    def _cleanup_case_resources(
+        reference_steps: list[CapturedStep],
+        cached_steps: list[CapturedStep],
+        hooks: ModelTraceHooks,
+        torch: Any,
+        *,
+        case_completed: bool,
+    ) -> None:
+        for trace in reference_steps + cached_steps:
+            trace.release()
+        hooks.close()
+        if not hooks.released:
+            raise RuntimeError("temporary hooks or retained tensors survived the case")
+        if case_completed and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def close(self) -> None:
         try:
@@ -941,6 +1001,11 @@ def export_manifest(
                 validate_result(result, case)
                 destination.write(json.dumps(result, sort_keys=True) + "\n")
                 destination.flush()
+                print(
+                    f"case_id={case.case_id} "
+                    f"attention_mask_backend={ATTENTION_MASK_BACKEND}",
+                    flush=True,
+                )
     finally:
         runtime.close()
 

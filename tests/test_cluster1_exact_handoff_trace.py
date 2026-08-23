@@ -1,4 +1,5 @@
 import argparse
+import ast
 import contextlib
 import importlib.util
 import json
@@ -17,6 +18,12 @@ SPEC = importlib.util.spec_from_file_location("cluster1_exact_handoff_trace", PA
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+MASK_PATH = ROOT / "eval/sglang/srt/dllm/attention_mask.py"
+MASK_SPEC = importlib.util.spec_from_file_location("cluster1_attention_mask", MASK_PATH)
+MASK_MODULE = importlib.util.module_from_spec(MASK_SPEC)
+sys.modules[MASK_SPEC.name] = MASK_MODULE
+MASK_SPEC.loader.exec_module(MASK_MODULE)
 
 
 def make_case(case_id="case-000", steps=2):
@@ -49,6 +56,7 @@ def make_result(case=None):
         "active_length": case.active_length,
         "diffusion_steps": case.diffusion_steps,
         "attention_contract_id": case.attention_contract_id,
+        "attention_mask_backend": MODULE.ATTENTION_MASK_BACKEND,
         "num_layers": 1,
         "cache_hit": True,
         "steps": [
@@ -145,6 +153,32 @@ def make_active_runtime():
     return runtime, observed_offsets, observed_positions
 
 
+def structured_b7_g4_mask():
+    mask = torch.zeros((7, 7), dtype=torch.bool)
+    rows = torch.arange(4).unsqueeze(1)
+    cols = torch.arange(7).unsqueeze(0)
+    mask[:4, :] = cols <= rows
+    mask[4:, :] = True
+    return mask
+
+
+def select_mask_backend(requested, *, active_length, native_available=True):
+    prefix_length = 256
+    return MASK_MODULE.select_bidir_mask_backend(
+        requested,
+        native_available=native_available,
+        configured_block_size=7,
+        seq_lens=torch.tensor([prefix_length + active_length]),
+        prefix_lens=torch.tensor([prefix_length]),
+        block_mask=(
+            structured_b7_g4_mask()
+            if active_length == 7
+            else torch.ones((active_length, active_length), dtype=torch.bool)
+        ),
+        structured_mask=structured_b7_g4_mask(),
+    )
+
+
 def test_cli_parsing_requires_trace_safe_cuda_mode():
     args = MODULE.parse_args(
         [
@@ -181,6 +215,144 @@ def test_cli_parsing_requires_trace_safe_cuda_mode():
                 "1",
             ]
         )
+
+
+def test_forward_batch_mask_backend_defaults_to_auto():
+    source = ast.parse(
+        (ROOT / "eval/sglang/srt/model_executor/forward_batch_info.py").read_text()
+    )
+    forward_batch = next(
+        node
+        for node in source.body
+        if isinstance(node, ast.ClassDef) and node.name == "ForwardBatch"
+    )
+    field = next(
+        node
+        for node in forward_batch.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "dllm_bidir_mask_backend"
+    )
+    assert isinstance(field.value, ast.Constant)
+    assert field.value.value == "auto"
+
+
+def test_invalid_mask_backend_is_rejected():
+    with pytest.raises(ValueError, match="invalid dllm_bidir_mask_backend"):
+        select_mask_backend("surprise", active_length=32)
+
+
+def test_explicit_custom_never_selects_native():
+    assert select_mask_backend("custom", active_length=32) == "custom"
+    assert select_mask_backend("custom", active_length=7) == "custom"
+
+
+def test_explicit_native_rejects_arbitrary_active_length():
+    with pytest.raises(RuntimeError, match="block_size=7"):
+        select_mask_backend("native", active_length=32)
+
+
+def test_auto_selects_custom_for_arbitrary_active_length():
+    assert select_mask_backend("auto", active_length=32) == "custom"
+
+
+def test_native_remains_selectable_for_compatible_structured_request():
+    assert select_mask_backend("native", active_length=7) == "native"
+    assert select_mask_backend("auto", active_length=7) == "native"
+
+
+def test_auto_does_not_ignore_incompatible_seven_token_mask():
+    assert (
+        MASK_MODULE.select_bidir_mask_backend(
+            "auto",
+            native_available=True,
+            configured_block_size=7,
+            seq_lens=torch.tensor([263]),
+            prefix_lens=torch.tensor([256]),
+            block_mask=torch.ones((7, 7), dtype=torch.bool),
+            structured_mask=structured_b7_g4_mask(),
+        )
+        == "custom"
+    )
+
+
+def test_native_rejects_unavailable_backend():
+    with pytest.raises(RuntimeError, match="unavailable"):
+        select_mask_backend("native", active_length=7, native_available=False)
+
+
+def test_paged_custom_mask_has_exact_prefix_and_suffix_layout():
+    prefix_length = 256
+    active_length = 32
+    active_mask = torch.tril(
+        torch.ones((active_length, active_length), dtype=torch.bool)
+    )
+    flattened = MASK_MODULE.build_paged_custom_mask(
+        torch.tensor([prefix_length + active_length]),
+        torch.tensor([prefix_length]),
+        active_mask,
+        torch.tensor([1]),
+        bidir_mask_type=1,
+    )
+
+    assert flattened.numel() == 32 * 288 == 9216
+    logical = flattened.view(active_length, prefix_length + active_length)
+    assert bool(logical[:, :prefix_length].all().item())
+    assert torch.equal(logical[:, prefix_length:], active_mask)
+
+
+@pytest.mark.parametrize(
+    "mask, message",
+    [
+        (torch.ones((32, 32), dtype=torch.float32), "dtype bool"),
+        (torch.ones(32, dtype=torch.bool), "2-D"),
+        (torch.ones((31, 32), dtype=torch.bool), "rows"),
+        (torch.ones((32, 31), dtype=torch.bool), "columns"),
+    ],
+    ids=("non-bool", "rank-one", "undersized-rows", "undersized-columns"),
+)
+def test_invalid_custom_masks_fail_before_planning(mask, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        MASK_MODULE.build_paged_custom_mask(
+            torch.tensor([288]),
+            torch.tensor([256]),
+            mask,
+            torch.tensor([1]),
+            bidir_mask_type=1,
+        )
+
+
+def test_exporter_requests_custom_mask_backend():
+    forward_batch = types.SimpleNamespace()
+    MODULE.Cluster1ModelRuntime._configure_active_mask(
+        forward_batch, active_length=32, device=torch.device("cpu")
+    )
+    assert forward_batch.dllm_bidir_mask_backend == "custom"
+    assert forward_batch.dllm_force_bidir_mask is True
+    assert forward_batch.dllm_bidir_custom_mask.dtype is torch.bool
+    assert tuple(forward_batch.dllm_bidir_custom_mask.shape) == (32, 32)
+
+
+def test_exporter_uses_bounded_server_memory_settings():
+    args = argparse.Namespace(model_dir="/model", dtype="bfloat16", tp_size=1)
+    values = MODULE.Cluster1ModelRuntime._server_args_kwargs(args, Path("config.yaml"))
+    assert values["max_running_requests"] == 1
+    assert values["max_total_tokens"] == 4096
+
+
+def test_exporter_rejects_cases_above_token_budget():
+    runtime = MODULE.Cluster1ModelRuntime.__new__(MODULE.Cluster1ModelRuntime)
+    case = MODULE.ManifestCase(
+        schema_version=1,
+        case_id="too-large",
+        token_seed=1,
+        prefix_length=4090,
+        active_length=32,
+        diffusion_steps=1,
+        attention_contract_id=MODULE.ATTENTION_CONTRACT,
+    )
+    with pytest.raises(ValueError, match="exceeds exporter token budget"):
+        runtime.run_case(case)
 
 
 def test_active_boundary_is_set_before_forward_batch_construction():
@@ -285,6 +457,15 @@ def test_export_emits_exactly_one_record_per_case(tmp_path):
         "case-000",
         "case-001",
     ]
+    assert all(record["attention_mask_backend"] == "custom_paged" for record in records)
+
+
+def test_result_rejects_missing_custom_paged_backend():
+    case = make_case()
+    result = make_result(case)
+    result.pop("attention_mask_backend")
+    with pytest.raises(ValueError, match="attention_mask_backend=custom_paged"):
+        MODULE.validate_result(result, case)
 
 
 def test_rejects_missing_layer_and_step_traces():
@@ -377,6 +558,40 @@ def test_temporary_hooks_and_retained_tensors_are_released():
     assert hooks.released
 
 
+def test_hook_capture_is_contiguous_independent_and_non_mutating():
+    class Layer(torch.nn.Module):
+        def forward(self, hidden, residual):
+            return hidden, residual
+
+    layer = Layer()
+    runner = types.SimpleNamespace(
+        model=types.SimpleNamespace(layers=torch.nn.ModuleList([layer])),
+        req_to_token_pool=types.SimpleNamespace(mamba_map={}),
+    )
+    hooks = MODULE.ModelTraceHooks(runner)
+    hidden = torch.arange(24, dtype=torch.float32).view(3, 8).transpose(0, 1)
+    residual = torch.arange(24, 48, dtype=torch.float32).view(3, 8).transpose(0, 1)
+    hidden_before = hidden.clone()
+    residual_before = residual.clone()
+    expected = hidden[-2:].clone() + residual[-2:].clone()
+
+    with hooks.capture(active_length=2, mamba_cache_idx=1):
+        layer(hidden, residual)
+    trace = hooks.finish_step(1, torch.zeros(2, 5))
+    captured = trace.layers[0].active_hidden
+
+    assert captured.is_contiguous()
+    assert torch.equal(captured, expected)
+    assert torch.equal(hidden, hidden_before)
+    assert torch.equal(residual, residual_before)
+    hidden[-2:].zero_()
+    residual[-2:].zero_()
+    assert torch.equal(captured, expected)
+    assert captured.data_ptr() != hidden.data_ptr()
+    trace.release()
+    hooks.close()
+
+
 def test_tensor_comparison_rejects_missing_or_nonfinite_data():
     with pytest.raises(ValueError, match="shape mismatch"):
         MODULE.tensor_max_abs(torch.zeros(1), torch.zeros(2), "probe")
@@ -438,3 +653,33 @@ def test_close_is_safe_when_process_group_is_not_initialized(monkeypatch):
     runtime.close()
 
     assert events == ["clear"]
+
+
+def test_primary_exception_is_not_replaced_by_empty_cache_failure():
+    events = []
+
+    class Hooks:
+        released = False
+
+        def close(self):
+            self.released = True
+            events.append("hooks")
+
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            empty_cache=lambda: (_ for _ in ()).throw(
+                RuntimeError("secondary empty_cache failure")
+            ),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="primary execution failure"):
+        try:
+            raise RuntimeError("primary execution failure")
+        finally:
+            MODULE.Cluster1ModelRuntime._cleanup_case_resources(
+                [], [], Hooks(), fake_torch, case_completed=False
+            )
+
+    assert events == ["hooks"]
