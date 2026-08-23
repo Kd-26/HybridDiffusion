@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import torch
 
 
-DLLM_BIDIR_MASK_BACKENDS = frozenset(("auto", "native", "custom"))
+DLLM_BIDIR_MASK_BACKENDS = frozenset(("auto", "native", "custom", "full"))
+DLLM_SELECTED_MASK_BACKENDS = frozenset(
+    ("native_structured", "custom_paged", "full_paged")
+)
 
 
 def validate_bidir_mask_backend(value: str) -> str:
@@ -15,6 +18,15 @@ def validate_bidir_mask_backend(value: str) -> str:
         allowed = ", ".join(sorted(DLLM_BIDIR_MASK_BACKENDS))
         raise ValueError(
             f"invalid dllm_bidir_mask_backend={value!r}; expected one of {allowed}"
+        )
+    return value
+
+
+def validate_selected_mask_backend(value: str) -> str:
+    if value not in DLLM_SELECTED_MASK_BACKENDS:
+        allowed = ", ".join(sorted(DLLM_SELECTED_MASK_BACKENDS))
+        raise ValueError(
+            f"invalid dllm_selected_mask_backend={value!r}; expected one of {allowed}"
         )
     return value
 
@@ -79,7 +91,7 @@ def select_bidir_mask_backend(
     block_mask: torch.Tensor,
     structured_mask: torch.Tensor,
 ) -> str:
-    """Select ``native`` or ``custom`` without ignoring an arbitrary mask."""
+    """Select an exact runtime backend without broadening the supplied mask."""
     requested = validate_bidir_mask_backend(requested)
     shapes = validate_bidir_block_mask(seq_lens, prefix_lens, block_mask)
     native_lengths_match = all(
@@ -99,9 +111,20 @@ def select_bidir_mask_backend(
     native_compatible = (
         native_available and native_lengths_match and native_mask_matches
     )
+    full_compatible = all(
+        bool(block_mask[:query_len, : seq_len - prefix_len].all().item())
+        for seq_len, prefix_len, query_len in shapes
+    )
 
     if requested == "custom":
-        return "custom"
+        return "custom_paged"
+    if requested == "full":
+        if not full_compatible:
+            raise ValueError(
+                "full dLLM paged attention requires every active-mask entry "
+                "in block_mask[:query_len, :active_suffix_len] to be True"
+            )
+        return "full_paged"
     if requested == "native":
         if not native_available:
             raise RuntimeError("native dLLM bidirectional mask support is unavailable")
@@ -117,8 +140,95 @@ def select_bidir_mask_backend(
                 "supplied dLLM block mask does not match the configured native "
                 "structured mask"
             )
-        return "native"
-    return "native" if native_compatible else "custom"
+        return "native_structured"
+    if native_compatible:
+        return "native_structured"
+    if full_compatible:
+        return "full_paged"
+    return "custom_paged"
+
+
+def paged_mask_planner_arguments(
+    selected_backend: str,
+    custom_mask: Optional[torch.Tensor],
+) -> tuple[Optional[torch.Tensor], bool, bool]:
+    """Return planner custom-mask, native-mask, and explicit-full settings."""
+    selected_backend = validate_selected_mask_backend(selected_backend)
+    if selected_backend == "custom_paged":
+        if custom_mask is None:
+            raise ValueError("custom_paged requires a materialized custom mask")
+        return custom_mask, False, False
+    if custom_mask is not None:
+        raise ValueError(f"{selected_backend} must not receive a custom mask")
+    if selected_backend == "native_structured":
+        return None, True, False
+    return None, False, True
+
+
+def paged_attention_is_causal(
+    *,
+    force_causal: bool,
+    selected_backend: Optional[str],
+    force_noncausal_full_attention: bool,
+    is_cross_attention: bool,
+) -> bool:
+    """Resolve paged execution causality from selected semantics."""
+    if force_causal:
+        return True
+    if force_noncausal_full_attention:
+        if selected_backend != "full_paged":
+            raise ValueError(
+                "explicit noncausal full attention requires selected backend "
+                "full_paged"
+            )
+        return False
+    if selected_backend is not None:
+        validate_selected_mask_backend(selected_backend)
+        if selected_backend == "full_paged":
+            raise ValueError(
+                "full_paged is missing explicit noncausal full-attention metadata"
+            )
+        return False
+    return not is_cross_attention
+
+
+def invoke_paged_attention_plan(
+    planner: Callable[..., Any],
+    *planner_args: Any,
+    selected_backend: str,
+    custom_mask: Optional[torch.Tensor],
+    **planner_kwargs: Any,
+) -> tuple[Optional[torch.Tensor], bool, bool]:
+    """Invoke a paged planner with arguments fixed by the selected contract."""
+    planned_mask, native_mask, force_full = paged_mask_planner_arguments(
+        selected_backend, custom_mask
+    )
+    planner(
+        *planner_args,
+        custom_mask=planned_mask,
+        dllm_native_bidir_mask=native_mask,
+        **planner_kwargs,
+    )
+    return planned_mask, native_mask, force_full
+
+
+def invoke_paged_attention_forward(
+    forward: Callable[..., Any],
+    *forward_args: Any,
+    force_causal: bool,
+    selected_backend: Optional[str],
+    force_noncausal_full_attention: bool,
+    is_cross_attention: bool,
+    **forward_kwargs: Any,
+) -> Any:
+    """Invoke paged attention with causality fixed by selected semantics."""
+    causal = paged_attention_is_causal(
+        force_causal=force_causal,
+        selected_backend=selected_backend,
+        force_noncausal_full_attention=force_noncausal_full_attention,
+        is_cross_attention=is_cross_attention,
+    )
+    return forward(*forward_args, causal=causal, **forward_kwargs)
 
 
 def build_paged_custom_mask(

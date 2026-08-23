@@ -409,8 +409,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_prefill_only: bool = False
     dllm_attn_mask_types: Optional[torch.Tensor] = None
     dllm_attn_mask_types_cpu: Optional[List[int]] = None
-    # Request-scoped paged-mask contract: auto, native, or custom.
+    # Requested paged-mask contract: auto, native, custom, or full.  Runtime
+    # selection is recorded separately so instrumentation cannot confuse intent
+    # with the backend that actually executed.
     dllm_bidir_mask_backend: str = "auto"
+    dllm_selected_mask_backend: Optional[str] = None
+    dllm_force_noncausal_full_attention: bool = False
     # Behavior-neutral request instrumentation metadata.  These CPU values
     # describe the exact request/token and layer mix represented by this
     # forward so algorithms do not need to infer it from padded tensors.

@@ -15,7 +15,6 @@ import dataclasses
 import hashlib
 import json
 import logging
-import os
 import random
 import sys
 from dataclasses import dataclass, replace
@@ -25,7 +24,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequenc
 
 SCHEMA_VERSION = 1
 ATTENTION_CONTRACT = "causal_prefix_diffusion_suffix_v1"
-ATTENTION_MASK_BACKEND = "custom_paged"
+EXPECTED_ATTENTION_MASK_BACKEND = "full_paged"
 EXPORTER_MAX_TOTAL_TOKENS = 4096
 logger = logging.getLogger(__name__)
 NEGATIVE_CHECK_NAMES = (
@@ -88,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-cuda-graph",
         action="store_true",
         help="Required: trace hooks are intentionally incompatible with CUDA graphs.",
+    )
+    parser.add_argument(
+        "--debug-sync-stages",
+        action="store_true",
+        help="Synchronize at precise CUDA stages to attribute asynchronous faults.",
     )
     return parser
 
@@ -197,6 +201,7 @@ class CapturedStep:
     top1_tokens: Any
     layers: list[CapturedLayer]
     execution_signature: str = ""
+    attention_mask_backend: Optional[str] = None
 
     def release(self) -> None:
         self.active_logits = None
@@ -209,19 +214,45 @@ class CapturedStep:
 class ModelTraceHooks:
     """Temporary opt-in hooks; normal serving never constructs this object."""
 
-    def __init__(self, model_runner: Any):
+    def __init__(self, model_runner: Any, *, debug_sync_stages: bool = False):
         self.model_runner = model_runner
         self._handles: list[Any] = []
         self._capturing = False
         self._active_length = 0
         self._mamba_cache_idx: Optional[int] = None
         self._layers: dict[int, CapturedLayer] = {}
+        self._debug_sync_stages = bool(debug_sync_stages)
+        self._debug_context: dict[str, Any] = {}
         model = self._language_model(model_runner.model)
         self.num_layers = len(model.layers)
         self._mamba_map = getattr(model_runner.req_to_token_pool, "mamba_map", {})
         for layer_id, layer in enumerate(model.layers):
             handle = layer.register_forward_hook(self._make_hook(layer_id))
             self._handles.append(handle)
+        if self._debug_sync_stages:
+            self._handles.append(model.register_forward_hook(self._before_logits_hook))
+
+    def set_debug_context(self, **values: Any) -> None:
+        self._debug_context = dict(values)
+
+    def _sync_debug_stage(self, phase: str, layer_id: Optional[int] = None) -> None:
+        if not self._debug_sync_stages:
+            return
+        try:
+            _import_torch().cuda.synchronize(self.model_runner.device)
+        except Exception as exc:
+            details = dict(self._debug_context)
+            details.update(phase=phase, layer_id=layer_id)
+            rendered = ", ".join(
+                f"{name}={value}" for name, value in sorted(details.items())
+            )
+            raise RuntimeError(
+                f"CUDA stage synchronization failed: {rendered}"
+            ) from exc
+
+    def _before_logits_hook(self, _module: Any, _inputs: Any, _output: Any) -> None:
+        if self._capturing:
+            self._sync_debug_stage("before_logits_processing")
 
     @staticmethod
     def _language_model(model: Any) -> Any:
@@ -282,6 +313,7 @@ class ModelTraceHooks:
                 gdn_conv=conv,
                 gdn_recurrent=recurrent,
             )
+            self._sync_debug_stage("transformer_layer", layer_id)
 
         return hook
 
@@ -334,6 +366,11 @@ def compare_steps(reference: CapturedStep, cached: CapturedStep) -> dict[str, An
         raise ValueError("diffusion step numbers differ")
     if reference.execution_signature != cached.execution_signature:
         raise ValueError("paired executions used different tokens, positions, or masks")
+    if (
+        reference.attention_mask_backend != cached.attention_mask_backend
+        or reference.attention_mask_backend != EXPECTED_ATTENTION_MASK_BACKEND
+    ):
+        raise ValueError("paired executions did not both observe full_paged")
     if len(reference.layers) != len(cached.layers):
         raise ValueError("layer counts differ")
     if not reference.layers:
@@ -400,8 +437,8 @@ def validate_result(result: Mapping[str, Any], case: ManifestCase) -> None:
         raise ValueError("result case_id mismatch")
     if result.get("cache_hit") is not True:
         raise ValueError("cached path did not report a genuine exact cache hit")
-    if result.get("attention_mask_backend") != ATTENTION_MASK_BACKEND:
-        raise ValueError("result is missing attention_mask_backend=custom_paged")
+    if result.get("attention_mask_backend") != EXPECTED_ATTENTION_MASK_BACKEND:
+        raise ValueError("result is missing attention_mask_backend=full_paged")
     steps = result.get("steps")
     if not isinstance(steps, list) or len(steps) != case.diffusion_steps:
         raise ValueError("missing diffusion-step traces")
@@ -439,10 +476,10 @@ class Cluster1ModelRuntime:
         if not _import_torch().cuda.is_available():
             raise RuntimeError("the real paired exporter requires CUDA")
         self.args = args
+        self.debug_sync_stages = bool(getattr(args, "debug_sync_stages", False))
         self._load_model()
 
     def _load_model(self) -> None:
-        os.environ.setdefault("SGLANG_DLLM_ALLOW_BIDIR_CUSTOM_MASK_FALLBACK", "1")
         eval_root = Path(__file__).resolve().parents[1]
         if str(eval_root) not in sys.path:
             sys.path.insert(0, str(eval_root))
@@ -578,14 +615,17 @@ class Cluster1ModelRuntime:
         forward_batch: Any, *, active_length: int, device: Any
     ) -> None:
         torch = _import_torch()
-        forward_batch.dllm_bidir_mask_backend = "custom"
+        forward_batch.dllm_bidir_mask_backend = "full"
         forward_batch.dllm_force_bidir_mask = True
         forward_batch.dllm_bidir_custom_mask = torch.ones(
             (active_length, active_length), dtype=torch.bool, device=device
         )
 
-    def _forward(self, forward_batch: Any) -> Any:
-        output = self.model_runner.forward(forward_batch).logits_output
+    def _forward(self, forward_batch: Any, *, metadata_prepared: bool = False) -> Any:
+        output = self.model_runner.forward(
+            forward_batch, skip_attn_backend_init=metadata_prepared
+        ).logits_output
+        self._debug_sync("after_logits_processing", forward_batch)
         logits = output.full_logits
         if logits is None:
             logits = output.next_token_logits
@@ -593,13 +633,41 @@ class Cluster1ModelRuntime:
             raise RuntimeError("model did not return logits required by the exporter")
         return logits
 
+    def _debug_sync(
+        self, phase: str, forward_batch: Any, *, layer_id: Optional[int] = None
+    ) -> None:
+        if not getattr(self, "debug_sync_stages", False):
+            return
+        try:
+            self._synchronize()
+        except Exception as exc:
+            selected = getattr(forward_batch, "dllm_selected_mask_backend", None)
+            prefix_length = int(forward_batch.extend_prefix_lens[0].item())
+            active_length = int(forward_batch.input_ids.numel())
+            raise RuntimeError(
+                "CUDA stage synchronization failed: "
+                f"phase={phase}, layer_id={layer_id}, "
+                f"selected_attention_backend={selected}, "
+                f"prefix_length={prefix_length}, active_length={active_length}, "
+                f"input_shape={tuple(forward_batch.input_ids.shape)}, "
+                f"input_dtype={forward_batch.input_ids.dtype}, "
+                f"position_shape={tuple(forward_batch.positions.shape)}, "
+                f"position_dtype={forward_batch.positions.dtype}"
+            ) from exc
+
     def _run_prefix(self, req: Any) -> None:
         _batch, forward_batch = self._prepare_extend(req, bidir=False)
         self._forward(forward_batch)
         self._synchronize()
 
     def _run_active(
-        self, req: Any, active_tokens: list[int], hooks: ModelTraceHooks, step: int
+        self,
+        req: Any,
+        active_tokens: list[int],
+        hooks: ModelTraceHooks,
+        step: int,
+        *,
+        expected_prefix_locations: Any,
     ) -> CapturedStep:
         prefix_length = len(req.prefix_indices)
 
@@ -621,12 +689,35 @@ class Cluster1ModelRuntime:
             prefix_length=prefix_length,
             active_length=len(active_tokens),
         )
+        self._validate_active_kv_contract(
+            req,
+            forward_batch,
+            expected_prefix_locations=expected_prefix_locations,
+            prefix_length=prefix_length,
+            active_length=len(active_tokens),
+        )
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        self._debug_sync("attention_metadata_planning", forward_batch)
+        prefill_metadata = self._flashinfer_prefill_metadata()
+        selected_backend = self._validate_full_paged_metadata(
+            forward_batch, prefill_metadata
+        )
         mamba_idx = self.backend._current_mamba_slot(req.req_pool_idx)
         self._synchronize()
+        hooks.set_debug_context(
+            selected_attention_backend=selected_backend,
+            prefix_length=prefix_length,
+            active_length=len(active_tokens),
+            input_shape=tuple(forward_batch.input_ids.shape),
+            input_dtype=forward_batch.input_ids.dtype,
+            position_shape=tuple(forward_batch.positions.shape),
+            position_dtype=forward_batch.positions.dtype,
+        )
         with hooks.capture(active_length=len(active_tokens), mamba_cache_idx=mamba_idx):
-            logits = self._forward(forward_batch)
+            logits = self._forward(forward_batch, metadata_prepared=True)
         self._synchronize()
         trace = hooks.finish_step(step, logits)
+        trace.attention_mask_backend = selected_backend
         trace.execution_signature = hash_tensors(
             (
                 ("input_ids", forward_batch.input_ids),
@@ -635,6 +726,114 @@ class Cluster1ModelRuntime:
             )
         )
         return trace
+
+    def _flashinfer_prefill_metadata(self) -> Any:
+        attention_backend = self.model_runner.attn_backend
+        full_backend = getattr(
+            attention_backend, "full_attn_backend", attention_backend
+        )
+        metadata = getattr(full_backend, "forward_metadata", None)
+        if metadata is None:
+            raise RuntimeError("FlashInfer prefill metadata is missing after planning")
+        return metadata
+
+    def _validate_active_kv_contract(
+        self,
+        req: Any,
+        forward_batch: Any,
+        *,
+        expected_prefix_locations: Any,
+        prefix_length: int,
+        active_length: int,
+    ) -> None:
+        torch = _import_torch()
+        if int(forward_batch.input_ids.numel()) != active_length:
+            raise RuntimeError("active input_ids length does not equal active_length")
+        if int(forward_batch.extend_prefix_lens[0].item()) != prefix_length:
+            raise RuntimeError("extend_prefix_len does not equal prefix_length")
+        if int(forward_batch.seq_lens[0].item()) != prefix_length + active_length:
+            raise RuntimeError("seq_len does not equal prefix_length + active_length")
+
+        expected_prefix = expected_prefix_locations.reshape(-1)
+        if int(expected_prefix.numel()) != prefix_length:
+            raise RuntimeError("committed KVPrefixReference has the wrong length")
+        request_prefix = req.prefix_indices.reshape(-1)
+        if not torch.equal(request_prefix, expected_prefix.to(request_prefix.device)):
+            raise RuntimeError(
+                "request prefix KV locations differ from the committed "
+                "KVPrefixReference"
+            )
+        current_prefix = self.model_runner.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :prefix_length
+        ].reshape(-1)
+        if not torch.equal(current_prefix, expected_prefix.to(current_prefix.device)):
+            raise RuntimeError(
+                "prefix KV locations differ from the committed KVPrefixReference"
+            )
+
+        active_locations = forward_batch.out_cache_loc.reshape(-1)
+        if int(active_locations.numel()) != active_length:
+            raise RuntimeError(
+                "active out_cache_loc does not have active_length entries"
+            )
+        current_active = self.model_runner.req_to_token_pool.req_to_token[
+            req.req_pool_idx, prefix_length : prefix_length + active_length
+        ].reshape(-1)
+        if not torch.equal(current_active, active_locations.to(current_active.device)):
+            raise RuntimeError(
+                "active KV locations are missing from the request page table"
+            )
+        pool_size = int(self.model_runner.token_to_kv_pool.size)
+        all_locations = torch.cat(
+            (
+                expected_prefix.to(device=active_locations.device),
+                active_locations,
+            )
+        ).to(dtype=torch.long)
+        if not bool(((all_locations > 0) & (all_locations <= pool_size)).all().item()):
+            raise RuntimeError(
+                "KV locations contain uninitialized or out-of-range entries"
+            )
+        prefix_long = expected_prefix.to(
+            device=active_locations.device, dtype=torch.long
+        )
+        active_long = active_locations.to(dtype=torch.long)
+        if int(torch.unique(active_long).numel()) != active_length:
+            raise RuntimeError("active out_cache_loc contains duplicate KV locations")
+        if bool(torch.isin(active_long, prefix_long).any().item()):
+            raise RuntimeError("prefix and active KV locations overlap")
+
+    @staticmethod
+    def _validate_full_paged_metadata(forward_batch: Any, prefill_metadata: Any) -> str:
+        selected = getattr(forward_batch, "dllm_selected_mask_backend", None)
+        metadata_selected = getattr(
+            prefill_metadata, "dllm_selected_mask_backend", None
+        )
+        if selected != "full_paged" or metadata_selected != selected:
+            raise RuntimeError(
+                "active forward did not select full_paged runtime metadata"
+            )
+        if getattr(prefill_metadata, "dllm_planned_custom_mask", None) is not None:
+            raise RuntimeError("full_paged unexpectedly planned a custom mask")
+        if bool(getattr(prefill_metadata, "dllm_native_bidir_mask", False)):
+            raise RuntimeError("full_paged unexpectedly enabled native masking")
+        if not bool(
+            getattr(
+                prefill_metadata,
+                "dllm_force_noncausal_full_attention",
+                False,
+            )
+        ):
+            raise RuntimeError("full_paged execution is not explicitly noncausal")
+        if not bool(
+            getattr(
+                forward_batch,
+                "dllm_force_noncausal_full_attention",
+                False,
+            )
+        ):
+            raise RuntimeError("ForwardBatch is missing explicit full attention state")
+        return selected
 
     @staticmethod
     def _validate_active_positions(
@@ -841,7 +1040,10 @@ class Cluster1ModelRuntime:
         active = list(initial_active)
         case_completed = False
 
-        hooks = ModelTraceHooks(self.model_runner)
+        hooks = ModelTraceHooks(
+            self.model_runner,
+            debug_sync_stages=getattr(self, "debug_sync_stages", False),
+        )
         try:
             # Reference: every step starts clean, replays the causal prefix, and
             # then executes the active diffusion suffix.
@@ -858,7 +1060,13 @@ class Cluster1ModelRuntime:
                 )
                 req.prefix_indices = prefix_locations
                 active_inputs.append(list(active))
-                trace = self._run_active(req, active, hooks, step)
+                trace = self._run_active(
+                    req,
+                    active,
+                    hooks,
+                    step,
+                    expected_prefix_locations=prefix_locations,
+                )
                 reference_steps.append(trace)
                 active = trace.top1_tokens.detach().cpu().tolist()
 
@@ -904,7 +1112,13 @@ class Cluster1ModelRuntime:
                 # only step_active is present in forward_batch.input_ids.
                 cached_req.prefix_indices = kv_reference.locations.detach().clone()
                 cached_steps.append(
-                    self._run_active(cached_req, step_active, hooks, step)
+                    self._run_active(
+                        cached_req,
+                        step_active,
+                        hooks,
+                        step,
+                        expected_prefix_locations=kv_reference.locations,
+                    )
                 )
 
             self._synchronize()
@@ -922,6 +1136,15 @@ class Cluster1ModelRuntime:
                 compare_steps(reference, cached)
                 for reference, cached in zip(reference_steps, cached_steps)
             ]
+            observed_backends = {
+                trace.attention_mask_backend for trace in reference_steps + cached_steps
+            }
+            if observed_backends != {EXPECTED_ATTENTION_MASK_BACKEND}:
+                raise RuntimeError(
+                    "active executions did not uniformly observe full_paged: "
+                    f"{sorted(str(value) for value in observed_backends)}"
+                )
+            observed_backend = next(iter(observed_backends))
             result = {
                 "schema_version": SCHEMA_VERSION,
                 "case_id": case.case_id,
@@ -929,7 +1152,7 @@ class Cluster1ModelRuntime:
                 "active_length": case.active_length,
                 "diffusion_steps": case.diffusion_steps,
                 "attention_contract_id": case.attention_contract_id,
-                "attention_mask_backend": ATTENTION_MASK_BACKEND,
+                "attention_mask_backend": observed_backend,
                 "num_layers": hooks.num_layers,
                 "cache_hit": cache_hit,
                 "steps": compared,
@@ -943,7 +1166,7 @@ class Cluster1ModelRuntime:
             logger.info(
                 "case_id=%s attention_mask_backend=%s",
                 case.case_id,
-                ATTENTION_MASK_BACKEND,
+                observed_backend,
             )
             case_completed = True
             return result
@@ -1003,7 +1226,7 @@ def export_manifest(
                 destination.flush()
                 print(
                     f"case_id={case.case_id} "
-                    f"attention_mask_backend={ATTENTION_MASK_BACKEND}",
+                    f"attention_mask_backend={result['attention_mask_backend']}",
                     flush=True,
                 )
     finally:

@@ -26,6 +26,8 @@ from sglang.srt.dllm.config import (
 )
 from sglang.srt.dllm.attention_mask import (
     build_paged_custom_mask,
+    invoke_paged_attention_forward,
+    invoke_paged_attention_plan,
     select_bidir_mask_backend,
     validate_bidir_mask_backend,
 )
@@ -116,6 +118,10 @@ class PrefillMetadata:
     dllm_force_bidir_mask: bool = False
     dllm_bidir_custom_mask: Optional[torch.Tensor] = None
     dllm_attn_mask_types: Optional[torch.Tensor] = None
+    dllm_selected_mask_backend: Optional[str] = None
+    dllm_force_noncausal_full_attention: bool = False
+    dllm_planned_custom_mask: Optional[torch.Tensor] = None
+    dllm_native_bidir_mask: bool = False
 
 
 def _build_dllm_bidir_block_mask(
@@ -608,8 +614,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch, "dllm_bidir_mask_backend", "auto"
             )
             validate_bidir_mask_backend(dllm_mask_backend)
+            selected_backend = None
             dllm_use_native_bidir_mask = False
             dllm_paged_custom_mask = None
+            dllm_force_noncausal_full_attention = False
             if dllm_force_bidir_mask and dllm_bidir_custom_mask is None:
                 raise RuntimeError(
                     "dLLM bidirectional attention requires a supplied block mask"
@@ -626,9 +634,9 @@ class FlashInferAttnBackend(AttentionBackend):
                         dllm_bidir_custom_mask.device
                     ),
                 )
-                dllm_use_native_bidir_mask = selected_backend == "native"
+                dllm_use_native_bidir_mask = selected_backend == "native_structured"
                 if (
-                    selected_backend == "custom"
+                    selected_backend == "custom_paged"
                     and not self.dllm_allow_bidir_custom_mask_fallback
                 ):
                     raise RuntimeError(
@@ -636,36 +644,53 @@ class FlashInferAttnBackend(AttentionBackend):
                         "dllm_bidir_block_mask support on the production path. Set "
                         "SGLANG_DLLM_ALLOW_BIDIR_CUSTOM_MASK_FALLBACK=1 only for debug."
                     )
-                if selected_backend == "custom":
+                if selected_backend == "custom_paged":
                     dllm_paged_custom_mask = _build_dllm_paged_custom_mask(
                         forward_batch.seq_lens,
                         prefix_lens,
                         dllm_bidir_custom_mask,
                         dllm_attn_mask_types,
                     )
-                logger.info(
-                    "dLLM attention_mask_backend=%s",
-                    (
-                        "native_structured"
-                        if dllm_use_native_bidir_mask
-                        else "custom_paged"
-                    ),
+                dllm_force_noncausal_full_attention = selected_backend == "full_paged"
+                forward_batch.dllm_selected_mask_backend = selected_backend
+                forward_batch.dllm_force_noncausal_full_attention = (
+                    dllm_force_noncausal_full_attention
                 )
-            self.indices_updater_prefill.update(
+                logger.info("dLLM attention_mask_backend=%s", selected_backend)
+            planner_args = (
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
-                prefix_lens=prefix_lens,
-                prefill_wrappers=self.prefill_wrappers_paged,
-                use_ragged=False,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=None,
-                fixed_split_size=self.prefill_split_tile_size,
-                custom_mask=dllm_paged_custom_mask,
-                dllm_native_bidir_mask=dllm_use_native_bidir_mask,
-                dllm_attn_mask_types=dllm_attn_mask_types,
             )
+            planner_kwargs = {
+                "prefix_lens": prefix_lens,
+                "prefill_wrappers": self.prefill_wrappers_paged,
+                "use_ragged": False,
+                "encoder_lens": forward_batch.encoder_lens,
+                "spec_info": None,
+                "fixed_split_size": self.prefill_split_tile_size,
+                "dllm_attn_mask_types": dllm_attn_mask_types,
+            }
+            if selected_backend is not None:
+                (
+                    dllm_paged_custom_mask,
+                    dllm_use_native_bidir_mask,
+                    dllm_force_noncausal_full_attention,
+                ) = invoke_paged_attention_plan(
+                    self.indices_updater_prefill.update,
+                    *planner_args,
+                    selected_backend=selected_backend,
+                    custom_mask=dllm_paged_custom_mask,
+                    **planner_kwargs,
+                )
+            else:
+                self.indices_updater_prefill.update(
+                    *planner_args,
+                    custom_mask=None,
+                    dllm_native_bidir_mask=False,
+                    **planner_kwargs,
+                )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
                 False,
@@ -674,6 +699,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 dllm_force_bidir_mask=dllm_force_bidir_mask,
                 dllm_bidir_custom_mask=dllm_bidir_custom_mask,
                 dllm_attn_mask_types=dllm_attn_mask_types,
+                dllm_selected_mask_backend=selected_backend,
+                dllm_force_noncausal_full_attention=(
+                    dllm_force_noncausal_full_attention
+                ),
+                dllm_planned_custom_mask=dllm_paged_custom_mask,
+                dllm_native_bidir_mask=dllm_use_native_bidir_mask,
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -951,6 +982,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 False,
                 dllm_force_bidir_mask=use_dllm_native_bidir_mask,
                 dllm_bidir_custom_mask=dllm_bidir_custom_mask,
+                dllm_selected_mask_backend=(
+                    "native_structured" if use_dllm_native_bidir_mask else None
+                ),
+                dllm_native_bidir_mask=use_dllm_native_bidir_mask,
             )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -1037,6 +1072,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 False,
                 dllm_force_bidir_mask=use_dllm_native_bidir_mask,
                 dllm_bidir_custom_mask=dllm_bidir_custom_mask,
+                dllm_selected_mask_backend=(
+                    "native_structured" if use_dllm_native_bidir_mask else None
+                ),
+                dllm_native_bidir_mask=use_dllm_native_bidir_mask,
             )
         else:
             raise ValueError("Invalid forward mode")
@@ -1074,22 +1113,11 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
-            if self.is_hybrid_diffusion_algorithm:
-                causal = not layer.is_cross_attention
-                if (
-                    self.forward_metadata.dllm_force_bidir_mask
-                    and self.forward_metadata.dllm_bidir_custom_mask is not None
-                ):
-                    causal = False
-            else:
-                causal = (
-                    not layer.is_cross_attention
-                    and layer.attn_type != AttentionType.ENCODER_ONLY
-                )
-            o = prefill_wrapper_paged.forward(
+            paged_args = (
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=causal,
+            )
+            paged_kwargs = dict(
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
                 # - Sliding window could cut across item boundaries, breaking semantic coherence
@@ -1110,6 +1138,26 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            if self.is_hybrid_diffusion_algorithm:
+                o = invoke_paged_attention_forward(
+                    prefill_wrapper_paged.forward,
+                    *paged_args,
+                    force_causal=self.forward_metadata.dllm_force_causal,
+                    selected_backend=(self.forward_metadata.dllm_selected_mask_backend),
+                    force_noncausal_full_attention=(
+                        self.forward_metadata.dllm_force_noncausal_full_attention
+                    ),
+                    is_cross_attention=layer.is_cross_attention,
+                    **paged_kwargs,
+                )
+            else:
+                causal = (
+                    not layer.is_cross_attention
+                    and layer.attn_type != AttentionType.ENCODER_ONLY
+                )
+                o = prefill_wrapper_paged.forward(
+                    *paged_args, causal=causal, **paged_kwargs
+                )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `forward_batch.token_to_kv_pool` for this layer. This enables attention over

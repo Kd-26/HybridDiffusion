@@ -7,6 +7,7 @@ import math
 import sys
 import types
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -56,7 +57,7 @@ def make_result(case=None):
         "active_length": case.active_length,
         "diffusion_steps": case.diffusion_steps,
         "attention_contract_id": case.attention_contract_id,
-        "attention_mask_backend": MODULE.ATTENTION_MASK_BACKEND,
+        "attention_mask_backend": MODULE.EXPECTED_ATTENTION_MASK_BACKEND,
         "num_layers": 1,
         "cache_hit": True,
         "steps": [
@@ -85,6 +86,9 @@ def write_manifest(path, cases):
 
 
 class FakeTraceHooks:
+    def set_debug_context(self, **_values):
+        pass
+
     @contextlib.contextmanager
     def capture(self, *, active_length, mamba_cache_idx):
         del active_length, mamba_cache_idx
@@ -101,7 +105,7 @@ class FakeTraceHooks:
 
 def make_active_request(prefix_length=256):
     req = types.SimpleNamespace(
-        prefix_indices=torch.arange(prefix_length, dtype=torch.int64),
+        prefix_indices=torch.arange(1, prefix_length + 1, dtype=torch.int64),
         origin_input_ids=list(range(prefix_length)),
         dllm_block_offset=0,
         req_pool_idx=3,
@@ -116,12 +120,33 @@ def make_active_request(prefix_length=256):
 
 def make_active_runtime():
     runtime = MODULE.Cluster1ModelRuntime.__new__(MODULE.Cluster1ModelRuntime)
+    runtime.debug_sync_stages = False
     runtime.backend = types.SimpleNamespace(
         _current_mamba_slot=lambda req_pool_idx: req_pool_idx + 10
     )
     runtime._synchronize = lambda: None
-    runtime._forward = lambda forward_batch: torch.zeros(
+    runtime._forward = lambda forward_batch, **_kwargs: torch.zeros(
         forward_batch.input_ids.numel(), 4
+    )
+    req_to_token = torch.zeros((8, 512), dtype=torch.int64)
+    req_to_token[3, :256] = torch.arange(1, 257)
+    prefill_metadata = types.SimpleNamespace()
+
+    def init_forward_metadata(forward_batch):
+        forward_batch.dllm_selected_mask_backend = "full_paged"
+        forward_batch.dllm_force_noncausal_full_attention = True
+        prefill_metadata.dllm_selected_mask_backend = "full_paged"
+        prefill_metadata.dllm_force_noncausal_full_attention = True
+        prefill_metadata.dllm_planned_custom_mask = None
+        prefill_metadata.dllm_native_bidir_mask = False
+
+    runtime.model_runner = types.SimpleNamespace(
+        req_to_token_pool=types.SimpleNamespace(req_to_token=req_to_token),
+        token_to_kv_pool=types.SimpleNamespace(size=1024),
+        attn_backend=types.SimpleNamespace(
+            init_forward_metadata=init_forward_metadata,
+            forward_metadata=prefill_metadata,
+        ),
     )
     observed_offsets = []
     observed_positions = []
@@ -135,6 +160,15 @@ def make_active_runtime():
             dtype=torch.int64,
         )
         observed_positions.append(positions.clone())
+        active_locations = torch.arange(
+            len(req.prefix_indices) + 1,
+            len(req.prefix_indices) + req.extend_input_len + 1,
+            dtype=torch.int64,
+        )
+        self.model_runner.req_to_token_pool.req_to_token[
+            req.req_pool_idx,
+            len(req.prefix_indices) : len(req.prefix_indices) + req.extend_input_len,
+        ] = active_locations
         forward_batch = types.SimpleNamespace(
             input_ids=torch.tensor(
                 req.fill_ids[-req.extend_input_len :], dtype=torch.int64
@@ -142,7 +176,11 @@ def make_active_runtime():
             extend_prefix_lens=torch.tensor(
                 [len(req.prefix_indices)], dtype=torch.int64
             ),
+            seq_lens=torch.tensor(
+                [len(req.prefix_indices) + req.extend_input_len], dtype=torch.int64
+            ),
             positions=positions,
+            out_cache_loc=active_locations,
             dllm_bidir_custom_mask=torch.ones(
                 req.extend_input_len, req.extend_input_len, dtype=torch.bool
             ),
@@ -193,12 +231,14 @@ def test_cli_parsing_requires_trace_safe_cuda_mode():
             "--tp-size",
             "1",
             "--disable-cuda-graph",
+            "--debug-sync-stages",
         ]
     )
     assert args.model_dir == "/model"
     assert args.dtype == "bfloat16"
     assert args.tp_size == 1
     assert args.disable_cuda_graph is True
+    assert args.debug_sync_stages is True
 
     with pytest.raises(ValueError, match="disable-cuda-graph"):
         MODULE.parse_args(
@@ -243,8 +283,8 @@ def test_invalid_mask_backend_is_rejected():
 
 
 def test_explicit_custom_never_selects_native():
-    assert select_mask_backend("custom", active_length=32) == "custom"
-    assert select_mask_backend("custom", active_length=7) == "custom"
+    assert select_mask_backend("custom", active_length=32) == "custom_paged"
+    assert select_mask_backend("custom", active_length=7) == "custom_paged"
 
 
 def test_explicit_native_rejects_arbitrary_active_length():
@@ -252,13 +292,13 @@ def test_explicit_native_rejects_arbitrary_active_length():
         select_mask_backend("native", active_length=32)
 
 
-def test_auto_selects_custom_for_arbitrary_active_length():
-    assert select_mask_backend("auto", active_length=32) == "custom"
+def test_auto_selects_full_for_all_visible_arbitrary_active_length():
+    assert select_mask_backend("auto", active_length=32) == "full_paged"
 
 
 def test_native_remains_selectable_for_compatible_structured_request():
-    assert select_mask_backend("native", active_length=7) == "native"
-    assert select_mask_backend("auto", active_length=7) == "native"
+    assert select_mask_backend("native", active_length=7) == "native_structured"
+    assert select_mask_backend("auto", active_length=7) == "native_structured"
 
 
 def test_auto_does_not_ignore_incompatible_seven_token_mask():
@@ -272,8 +312,202 @@ def test_auto_does_not_ignore_incompatible_seven_token_mask():
             block_mask=torch.ones((7, 7), dtype=torch.bool),
             structured_mask=structured_b7_g4_mask(),
         )
-        == "custom"
+        == "full_paged"
     )
+
+
+def test_explicit_full_requires_every_required_entry_true():
+    assert select_mask_backend("full", active_length=32) == "full_paged"
+    mask = torch.ones((32, 32), dtype=torch.bool)
+    mask[3, 9] = False
+    with pytest.raises(ValueError, match="every active-mask entry"):
+        MASK_MODULE.select_bidir_mask_backend(
+            "full",
+            native_available=False,
+            configured_block_size=7,
+            seq_lens=torch.tensor([288]),
+            prefix_lens=torch.tensor([256]),
+            block_mask=mask,
+            structured_mask=structured_b7_g4_mask(),
+        )
+
+
+def test_auto_uses_custom_paged_for_arbitrary_mask():
+    mask = torch.ones((32, 32), dtype=torch.bool)
+    mask[0, -1] = False
+    selected = MASK_MODULE.select_bidir_mask_backend(
+        "auto",
+        native_available=True,
+        configured_block_size=7,
+        seq_lens=torch.tensor([288]),
+        prefix_lens=torch.tensor([256]),
+        block_mask=mask,
+        structured_mask=structured_b7_g4_mask(),
+    )
+    assert selected == "custom_paged"
+
+
+def test_full_paged_planner_arguments_are_ordinary_non_native_paged_attention():
+    custom_mask, native_mask, force_full = MASK_MODULE.paged_mask_planner_arguments(
+        "full_paged", None
+    )
+    assert custom_mask is None
+    assert native_mask is False
+    assert force_full is True
+
+
+def test_full_paged_invokes_planner_with_no_custom_or_native_mask():
+    planner = Mock()
+    returned = MASK_MODULE.invoke_paged_attention_plan(
+        planner,
+        "req_indices",
+        "seq_lens",
+        selected_backend="full_paged",
+        custom_mask=None,
+        prefix_lens="prefix_lens",
+    )
+    planner.assert_called_once_with(
+        "req_indices",
+        "seq_lens",
+        custom_mask=None,
+        dllm_native_bidir_mask=False,
+        prefix_lens="prefix_lens",
+    )
+    assert returned == (None, False, True)
+
+
+def test_custom_paged_planner_preserves_exact_flattened_mask():
+    flattened = torch.tensor([True, False, True], dtype=torch.bool)
+    custom_mask, native_mask, force_full = MASK_MODULE.paged_mask_planner_arguments(
+        "custom_paged", flattened
+    )
+    assert custom_mask is flattened
+    assert native_mask is False
+    assert force_full is False
+
+    planner = Mock()
+    MASK_MODULE.invoke_paged_attention_plan(
+        planner,
+        "req_indices",
+        selected_backend="custom_paged",
+        custom_mask=flattened,
+    )
+    planner.assert_called_once_with(
+        "req_indices",
+        custom_mask=flattened,
+        dllm_native_bidir_mask=False,
+    )
+
+
+def test_paged_forward_causality_uses_explicit_selected_semantics():
+    assert (
+        MASK_MODULE.paged_attention_is_causal(
+            force_causal=False,
+            selected_backend="full_paged",
+            force_noncausal_full_attention=True,
+            is_cross_attention=False,
+        )
+        is False
+    )
+    assert (
+        MASK_MODULE.paged_attention_is_causal(
+            force_causal=True,
+            selected_backend=None,
+            force_noncausal_full_attention=False,
+            is_cross_attention=False,
+        )
+        is True
+    )
+    with pytest.raises(ValueError, match="missing explicit noncausal"):
+        MASK_MODULE.paged_attention_is_causal(
+            force_causal=False,
+            selected_backend="full_paged",
+            force_noncausal_full_attention=False,
+            is_cross_attention=False,
+        )
+
+
+def test_paged_forward_invocation_passes_exact_causal_flag():
+    forward = Mock(return_value="output")
+    output = MASK_MODULE.invoke_paged_attention_forward(
+        forward,
+        "q",
+        "paged_kv",
+        force_causal=False,
+        selected_backend="full_paged",
+        force_noncausal_full_attention=True,
+        is_cross_attention=False,
+        sm_scale=0.125,
+    )
+    forward.assert_called_once_with("q", "paged_kv", causal=False, sm_scale=0.125)
+    assert output == "output"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA FlashInfer")
+def test_flashinfer_full_and_all_true_custom_paged_are_equivalent():
+    flashinfer = pytest.importorskip("flashinfer")
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    query_length = 4
+    kv_length = 12
+    page_size = 4
+    num_pages = kv_length // page_size
+    num_heads = 2
+    head_dim = 64
+
+    generator = torch.Generator(device=device).manual_seed(7)
+    q = torch.randn(
+        query_length,
+        num_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    k = torch.randn(
+        num_pages,
+        page_size,
+        num_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    v = torch.randn_like(k)
+    qo_indptr = torch.tensor([0, query_length], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    last_page_len = torch.tensor([page_size], dtype=torch.int32, device=device)
+
+    def execute(custom_mask):
+        workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device)
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            last_page_len,
+            num_heads,
+            num_heads,
+            head_dim,
+            page_size,
+            custom_mask=custom_mask,
+            causal=False,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+        )
+        output = wrapper.forward(q, (k, v), causal=False)
+        torch.cuda.synchronize()
+        return output
+
+    full_output = execute(None)
+    try:
+        custom_output = execute(
+            torch.ones(query_length * kv_length, dtype=torch.bool, device=device)
+        )
+    except RuntimeError as exc:
+        pytest.fail(f"custom_paged backend compatibility failure: {exc}")
+    torch.testing.assert_close(full_output, custom_output, rtol=1e-2, atol=1e-2)
 
 
 def test_native_rejects_unavailable_backend():
@@ -322,12 +556,12 @@ def test_invalid_custom_masks_fail_before_planning(mask, message):
         )
 
 
-def test_exporter_requests_custom_mask_backend():
+def test_exporter_requests_full_mask_backend():
     forward_batch = types.SimpleNamespace()
     MODULE.Cluster1ModelRuntime._configure_active_mask(
         forward_batch, active_length=32, device=torch.device("cpu")
     )
-    assert forward_batch.dllm_bidir_mask_backend == "custom"
+    assert forward_batch.dllm_bidir_mask_backend == "full"
     assert forward_batch.dllm_force_bidir_mask is True
     assert forward_batch.dllm_bidir_custom_mask.dtype is torch.bool
     assert tuple(forward_batch.dllm_bidir_custom_mask.shape) == (32, 32)
@@ -359,10 +593,92 @@ def test_active_boundary_is_set_before_forward_batch_construction():
     runtime, observed_offsets, _positions = make_active_runtime()
     req = make_active_request(prefix_length=256)
 
-    runtime._run_active(req, list(range(32)), FakeTraceHooks(), step=1)
+    runtime._run_active(
+        req,
+        list(range(32)),
+        FakeTraceHooks(),
+        step=1,
+        expected_prefix_locations=req.prefix_indices,
+    )
 
     assert observed_offsets == [256]
     assert req.dllm_block_offset == 256
+
+
+def test_active_trace_backend_comes_from_observed_runtime_metadata():
+    runtime, _offsets, _positions = make_active_runtime()
+    req = make_active_request(prefix_length=256)
+    trace = runtime._run_active(
+        req,
+        list(range(32)),
+        FakeTraceHooks(),
+        step=1,
+        expected_prefix_locations=req.prefix_indices,
+    )
+    assert trace.attention_mask_backend == "full_paged"
+    source = PATH.read_text()
+    assert '"attention_mask_backend": observed_backend' in source
+
+
+@pytest.mark.parametrize("selected", (None, "custom_paged"))
+def test_missing_or_corrupt_selected_backend_metadata_is_rejected(selected):
+    forward_batch = types.SimpleNamespace(
+        dllm_selected_mask_backend=selected,
+        dllm_force_noncausal_full_attention=True,
+    )
+    metadata = types.SimpleNamespace(
+        dllm_selected_mask_backend=selected,
+        dllm_force_noncausal_full_attention=True,
+        dllm_planned_custom_mask=None,
+        dllm_native_bidir_mask=False,
+    )
+    with pytest.raises(RuntimeError, match="did not select full_paged"):
+        MODULE.Cluster1ModelRuntime._validate_full_paged_metadata(
+            forward_batch, metadata
+        )
+
+
+def _prepared_active_kv_contract():
+    runtime, _offsets, _positions = make_active_runtime()
+    req = make_active_request(prefix_length=256)
+    req.dllm_block_offset = 256
+    req.fill_ids = list(req.origin_input_ids) + list(range(32))
+    req.set_extend_input_len(32)
+    _batch, forward_batch = runtime._prepare_extend(req, bidir=True)
+    return runtime, req, forward_batch
+
+
+def test_prefix_and_active_kv_location_overlap_is_rejected():
+    runtime, req, forward_batch = _prepared_active_kv_contract()
+    forward_batch.out_cache_loc[0] = req.prefix_indices[0]
+    runtime.model_runner.req_to_token_pool.req_to_token[req.req_pool_idx, 256] = (
+        req.prefix_indices[0]
+    )
+    with pytest.raises(RuntimeError, match="KV locations overlap"):
+        runtime._validate_active_kv_contract(
+            req,
+            forward_batch,
+            expected_prefix_locations=req.prefix_indices,
+            prefix_length=256,
+            active_length=32,
+        )
+
+
+@pytest.mark.parametrize("bad_location", (0, 1025))
+def test_uninitialized_or_out_of_range_kv_locations_are_rejected(bad_location):
+    runtime, req, forward_batch = _prepared_active_kv_contract()
+    forward_batch.out_cache_loc[0] = bad_location
+    runtime.model_runner.req_to_token_pool.req_to_token[req.req_pool_idx, 256] = (
+        bad_location
+    )
+    with pytest.raises(RuntimeError, match="uninitialized or out-of-range"):
+        runtime._validate_active_kv_contract(
+            req,
+            forward_batch,
+            expected_prefix_locations=req.prefix_indices,
+            prefix_length=256,
+            active_length=32,
+        )
 
 
 @pytest.mark.parametrize(
@@ -402,8 +718,20 @@ def test_repeated_diffusion_steps_remain_at_sealed_boundary():
     req = make_active_request(prefix_length=256)
     active_tokens = list(range(32))
 
-    runtime._run_active(req, active_tokens, FakeTraceHooks(), step=1)
-    runtime._run_active(req, active_tokens, FakeTraceHooks(), step=2)
+    runtime._run_active(
+        req,
+        active_tokens,
+        FakeTraceHooks(),
+        step=1,
+        expected_prefix_locations=req.prefix_indices,
+    )
+    runtime._run_active(
+        req,
+        active_tokens,
+        FakeTraceHooks(),
+        step=2,
+        expected_prefix_locations=req.prefix_indices,
+    )
 
     assert observed_offsets == [256, 256]
     assert all(
@@ -419,8 +747,20 @@ def test_reference_and_cached_requests_use_identical_active_positions():
     cached_req = make_active_request(prefix_length=256)
     active_tokens = list(range(32))
 
-    runtime._run_active(reference_req, active_tokens, FakeTraceHooks(), step=1)
-    runtime._run_active(cached_req, active_tokens, FakeTraceHooks(), step=1)
+    runtime._run_active(
+        reference_req,
+        active_tokens,
+        FakeTraceHooks(),
+        step=1,
+        expected_prefix_locations=reference_req.prefix_indices,
+    )
+    runtime._run_active(
+        cached_req,
+        active_tokens,
+        FakeTraceHooks(),
+        step=1,
+        expected_prefix_locations=cached_req.prefix_indices,
+    )
 
     assert observed_offsets == [256, 256]
     assert torch.equal(observed_positions[0], observed_positions[1])
@@ -457,14 +797,14 @@ def test_export_emits_exactly_one_record_per_case(tmp_path):
         "case-000",
         "case-001",
     ]
-    assert all(record["attention_mask_backend"] == "custom_paged" for record in records)
+    assert all(record["attention_mask_backend"] == "full_paged" for record in records)
 
 
-def test_result_rejects_missing_custom_paged_backend():
+def test_result_rejects_missing_full_paged_backend():
     case = make_case()
     result = make_result(case)
     result.pop("attention_mask_backend")
-    with pytest.raises(ValueError, match="attention_mask_backend=custom_paged"):
+    with pytest.raises(ValueError, match="attention_mask_backend=full_paged"):
         MODULE.validate_result(result, case)
 
 
@@ -526,6 +866,7 @@ def make_captured_step(logits):
         active_logits=logits,
         top1_tokens=logits.argmax(dim=-1),
         layers=[layer],
+        attention_mask_backend="full_paged",
     )
 
 
@@ -556,6 +897,55 @@ def test_temporary_hooks_and_retained_tensors_are_released():
     trace.release()
     hooks.close()
     assert hooks.released
+
+
+def test_debug_layer_sync_failure_reports_precise_context(monkeypatch):
+    class Layer(torch.nn.Module):
+        def forward(self, value):
+            return value
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+        def forward(self, value):
+            return self.layers[0](value)
+
+    model = LanguageModel()
+    runner = types.SimpleNamespace(
+        model=model,
+        device=torch.device("cpu"),
+        req_to_token_pool=types.SimpleNamespace(mamba_map={}),
+    )
+    hooks = MODULE.ModelTraceHooks(runner, debug_sync_stages=True)
+    hooks.set_debug_context(
+        selected_attention_backend="full_paged",
+        prefix_length=256,
+        active_length=32,
+        input_shape=(32,),
+        input_dtype=torch.int64,
+        position_shape=(32,),
+        position_dtype=torch.int64,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda _device: (_ for _ in ()).throw(RuntimeError("deferred fault")),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="phase=transformer_layer") as error:
+            with hooks.capture(active_length=32, mamba_cache_idx=1):
+                model.layers[0](torch.zeros(32, 4))
+        message = str(error.value)
+        assert "layer_id=0" in message
+        assert "selected_attention_backend=full_paged" in message
+        assert "prefix_length=256" in message
+        assert "active_length=32" in message
+        assert "input_shape=(32,)" in message
+        assert "position_dtype=torch.int64" in message
+    finally:
+        hooks.close()
 
 
 def test_hook_capture_is_contiguous_independent_and_non_mutating():
