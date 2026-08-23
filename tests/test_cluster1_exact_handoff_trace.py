@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import importlib.util
 import json
 import math
@@ -75,6 +76,75 @@ def write_manifest(path, cases):
             output.write(json.dumps(vars(case)) + "\n")
 
 
+class FakeTraceHooks:
+    @contextlib.contextmanager
+    def capture(self, *, active_length, mamba_cache_idx):
+        del active_length, mamba_cache_idx
+        yield
+
+    def finish_step(self, step, logits):
+        return MODULE.CapturedStep(
+            step=step,
+            active_logits=logits.detach().clone(),
+            top1_tokens=logits.argmax(dim=-1),
+            layers=[],
+        )
+
+
+def make_active_request(prefix_length=256):
+    req = types.SimpleNamespace(
+        prefix_indices=torch.arange(prefix_length, dtype=torch.int64),
+        origin_input_ids=list(range(prefix_length)),
+        dllm_block_offset=0,
+        req_pool_idx=3,
+    )
+
+    def set_extend_input_len(length):
+        req.extend_input_len = length
+
+    req.set_extend_input_len = set_extend_input_len
+    return req
+
+
+def make_active_runtime():
+    runtime = MODULE.Cluster1ModelRuntime.__new__(MODULE.Cluster1ModelRuntime)
+    runtime.backend = types.SimpleNamespace(
+        _current_mamba_slot=lambda req_pool_idx: req_pool_idx + 10
+    )
+    runtime._synchronize = lambda: None
+    runtime._forward = lambda forward_batch: torch.zeros(
+        forward_batch.input_ids.numel(), 4
+    )
+    observed_offsets = []
+    observed_positions = []
+
+    def prepare_extend(self, req, *, bidir):
+        assert bidir is True
+        observed_offsets.append(req.dllm_block_offset)
+        positions = torch.arange(
+            req.dllm_block_offset,
+            req.dllm_block_offset + req.extend_input_len,
+            dtype=torch.int64,
+        )
+        observed_positions.append(positions.clone())
+        forward_batch = types.SimpleNamespace(
+            input_ids=torch.tensor(
+                req.fill_ids[-req.extend_input_len :], dtype=torch.int64
+            ),
+            extend_prefix_lens=torch.tensor(
+                [len(req.prefix_indices)], dtype=torch.int64
+            ),
+            positions=positions,
+            dllm_bidir_custom_mask=torch.ones(
+                req.extend_input_len, req.extend_input_len, dtype=torch.bool
+            ),
+        )
+        return object(), forward_batch
+
+    runtime._prepare_extend = types.MethodType(prepare_extend, runtime)
+    return runtime, observed_offsets, observed_positions
+
+
 def test_cli_parsing_requires_trace_safe_cuda_mode():
     args = MODULE.parse_args(
         [
@@ -111,6 +181,78 @@ def test_cli_parsing_requires_trace_safe_cuda_mode():
                 "1",
             ]
         )
+
+
+def test_active_boundary_is_set_before_forward_batch_construction():
+    runtime, observed_offsets, _positions = make_active_runtime()
+    req = make_active_request(prefix_length=256)
+
+    runtime._run_active(req, list(range(32)), FakeTraceHooks(), step=1)
+
+    assert observed_offsets == [256]
+    assert req.dllm_block_offset == 256
+
+
+@pytest.mark.parametrize(
+    "positions",
+    [
+        torch.arange(0, 32),
+        torch.arange(255, 287),
+        torch.cat((torch.tensor([256]), torch.arange(258, 289))),
+        torch.arange(256, 287),
+    ],
+    ids=(
+        "starts-at-zero",
+        "starts-before-boundary",
+        "non-contiguous-after-correct-first",
+        "incorrect-count",
+    ),
+)
+def test_exact_active_position_vector_rejects_invalid_positions(positions):
+    forward_batch = types.SimpleNamespace(positions=positions)
+    with pytest.raises(RuntimeError, match="active positions mismatch"):
+        MODULE.Cluster1ModelRuntime._validate_active_positions(
+            forward_batch, prefix_length=256, active_length=32
+        )
+
+
+def test_exact_active_position_vector_accepts_boundary_interval():
+    expected = torch.arange(256, 288)
+    forward_batch = types.SimpleNamespace(positions=expected.clone())
+    MODULE.Cluster1ModelRuntime._validate_active_positions(
+        forward_batch, prefix_length=256, active_length=32
+    )
+    assert torch.equal(forward_batch.positions, expected)
+
+
+def test_repeated_diffusion_steps_remain_at_sealed_boundary():
+    runtime, observed_offsets, observed_positions = make_active_runtime()
+    req = make_active_request(prefix_length=256)
+    active_tokens = list(range(32))
+
+    runtime._run_active(req, active_tokens, FakeTraceHooks(), step=1)
+    runtime._run_active(req, active_tokens, FakeTraceHooks(), step=2)
+
+    assert observed_offsets == [256, 256]
+    assert all(
+        torch.equal(positions, torch.arange(256, 288))
+        for positions in observed_positions
+    )
+    assert req.dllm_block_offset != 256 + 32
+
+
+def test_reference_and_cached_requests_use_identical_active_positions():
+    runtime, observed_offsets, observed_positions = make_active_runtime()
+    reference_req = make_active_request(prefix_length=256)
+    cached_req = make_active_request(prefix_length=256)
+    active_tokens = list(range(32))
+
+    runtime._run_active(reference_req, active_tokens, FakeTraceHooks(), step=1)
+    runtime._run_active(cached_req, active_tokens, FakeTraceHooks(), step=1)
+
+    assert observed_offsets == [256, 256]
+    assert torch.equal(observed_positions[0], observed_positions[1])
+    assert torch.equal(observed_positions[0], torch.arange(256, 288))
 
 
 def test_export_emits_exactly_one_record_per_case(tmp_path):
@@ -240,3 +382,59 @@ def test_tensor_comparison_rejects_missing_or_nonfinite_data():
         MODULE.tensor_max_abs(torch.zeros(1), torch.zeros(2), "probe")
     with pytest.raises(ValueError, match="NaN or Inf"):
         MODULE.tensor_max_abs(torch.tensor([math.nan]), torch.zeros(1), "probe")
+
+
+def test_close_clears_cache_and_destroys_initialized_process_group(monkeypatch):
+    events = []
+
+    class FakeDistributed:
+        initialized = True
+
+        @staticmethod
+        def is_available():
+            return True
+
+        @classmethod
+        def is_initialized(cls):
+            return cls.initialized
+
+        @classmethod
+        def destroy_process_group(cls):
+            events.append("destroy")
+            cls.initialized = False
+
+    cache = types.SimpleNamespace(clear=lambda: events.append("clear"))
+    runtime = MODULE.Cluster1ModelRuntime.__new__(MODULE.Cluster1ModelRuntime)
+    runtime.backend = types.SimpleNamespace(region_state_cache=cache)
+    monkeypatch.setattr(
+        MODULE,
+        "_import_torch",
+        lambda: types.SimpleNamespace(distributed=FakeDistributed),
+    )
+
+    runtime.close()
+    runtime.close()
+
+    assert events == ["clear", "destroy", "clear"]
+
+
+def test_close_is_safe_when_process_group_is_not_initialized(monkeypatch):
+    events = []
+    distributed = types.SimpleNamespace(
+        is_available=lambda: True,
+        is_initialized=lambda: False,
+        destroy_process_group=lambda: events.append("destroy"),
+    )
+    runtime = MODULE.Cluster1ModelRuntime.__new__(MODULE.Cluster1ModelRuntime)
+    runtime.backend = types.SimpleNamespace(
+        region_state_cache=types.SimpleNamespace(clear=lambda: events.append("clear"))
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "_import_torch",
+        lambda: types.SimpleNamespace(distributed=distributed),
+    )
+
+    runtime.close()
+
+    assert events == ["clear"]

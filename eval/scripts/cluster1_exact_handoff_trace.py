@@ -571,6 +571,11 @@ class Cluster1ModelRuntime:
         self, req: Any, active_tokens: list[int], hooks: ModelTraceHooks, step: int
     ) -> CapturedStep:
         prefix_length = len(req.prefix_indices)
+
+        # Bidirectional dLLM positions are constructed from dllm_block_offset.
+        # Every denoising step operates at the fixed sealed-prefix boundary.
+        req.dllm_block_offset = prefix_length
+
         req.fill_ids = list(req.origin_input_ids[:prefix_length]) + list(active_tokens)
         req.set_extend_input_len(len(active_tokens))
         _batch, forward_batch = self._prepare_extend(req, bidir=True)
@@ -580,11 +585,11 @@ class Cluster1ModelRuntime:
             )
         if int(forward_batch.extend_prefix_lens[0].item()) != prefix_length:
             raise RuntimeError("active forward lost the exact sealed prefix boundary")
-        if (
-            int(forward_batch.positions.numel()) != len(active_tokens)
-            or int(forward_batch.positions[0].item()) != prefix_length
-        ):
-            raise RuntimeError("active forward positions do not start at the boundary")
+        self._validate_active_positions(
+            forward_batch,
+            prefix_length=prefix_length,
+            active_length=len(active_tokens),
+        )
         mamba_idx = self.backend._current_mamba_slot(req.req_pool_idx)
         self._synchronize()
         with hooks.capture(active_length=len(active_tokens), mamba_cache_idx=mamba_idx):
@@ -599,6 +604,26 @@ class Cluster1ModelRuntime:
             )
         )
         return trace
+
+    @staticmethod
+    def _validate_active_positions(
+        forward_batch: Any, *, prefix_length: int, active_length: int
+    ) -> None:
+        torch = _import_torch()
+        expected_positions = torch.arange(
+            prefix_length,
+            prefix_length + active_length,
+            dtype=forward_batch.positions.dtype,
+            device=forward_batch.positions.device,
+        )
+        if not torch.equal(forward_batch.positions, expected_positions):
+            raise RuntimeError(
+                "active positions mismatch: "
+                f"boundary={prefix_length}, "
+                f"active_length={active_length}, "
+                f"expected_head={expected_positions[:8].tolist()}, "
+                f"observed_head={forward_batch.positions[:8].tolist()}"
+            )
 
     def _tokens(self, case: ManifestCase) -> tuple[list[int], list[int]]:
         torch = _import_torch()
@@ -889,9 +914,15 @@ class Cluster1ModelRuntime:
                 torch.cuda.empty_cache()
 
     def close(self) -> None:
-        cache = getattr(self.backend, "region_state_cache", None)
-        if cache is not None:
-            cache.clear()
+        try:
+            backend = getattr(self, "backend", None)
+            cache = getattr(backend, "region_state_cache", None)
+            if cache is not None:
+                cache.clear()
+        finally:
+            torch = _import_torch()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
 
 
 def export_manifest(
