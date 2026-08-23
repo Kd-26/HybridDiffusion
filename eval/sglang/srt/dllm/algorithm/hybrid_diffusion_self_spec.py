@@ -66,6 +66,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.mem_cache.region_state_cache import (
     KVPrefixReference,
     RegionStateKey,
+    canonicalize_kv_prefix_locations,
 )
 
 logger = logging.getLogger(__name__)
@@ -599,9 +600,13 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
     def _hybrid_kv_reference(
         model_runner: ModelRunner, key: RegionStateKey
     ) -> KVPrefixReference:
-        locations = model_runner.req_to_token_pool.req_to_token[
-            key.request_pool_idx, : key.boundary
-        ].detach().clone()
+        locations = canonicalize_kv_prefix_locations(
+            model_runner.req_to_token_pool.req_to_token[
+                key.request_pool_idx, : key.boundary
+            ],
+            key.boundary,
+            pool_size=model_runner.token_to_kv_pool.size,
+        )
         return KVPrefixReference(
             request_id=key.request_id,
             request_pool_idx=key.request_pool_idx,

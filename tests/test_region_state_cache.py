@@ -72,6 +72,25 @@ def test_exact_hit_clones_mutable_state():
     assert cache.hit_count == 1
 
 
+def test_kv_prefix_reference_canonicalizes_int32_locations():
+    raw = torch.arange(16, dtype=torch.int32)[::2]
+    reference = KVPrefixReference(
+        request_id="request",
+        request_pool_idx=1,
+        request_slot_generation=2,
+        pool_identity=3,
+        locations=raw,
+        valid_length=8,
+    )
+    assert raw.dtype is torch.int32
+    assert not raw.is_contiguous()
+    assert reference.locations.dtype is torch.int64
+    assert reference.locations.is_contiguous()
+    assert reference.locations.ndim == 1
+    assert reference.locations.device == raw.device
+    assert torch.equal(reference.locations, raw.to(torch.int64))
+
+
 @pytest.mark.parametrize(
     ("field", "value", "reason"),
     [

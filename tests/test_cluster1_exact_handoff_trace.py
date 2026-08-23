@@ -1,5 +1,6 @@
 import argparse
 import ast
+import copy
 import contextlib
 import importlib.util
 import json
@@ -25,6 +26,14 @@ MASK_SPEC = importlib.util.spec_from_file_location("cluster1_attention_mask", MA
 MASK_MODULE = importlib.util.module_from_spec(MASK_SPEC)
 sys.modules[MASK_SPEC.name] = MASK_MODULE
 MASK_SPEC.loader.exec_module(MASK_MODULE)
+
+REGION_PATH = ROOT / "eval/sglang/srt/mem_cache/region_state_cache.py"
+REGION_SPEC = importlib.util.spec_from_file_location(
+    "cluster1_trace_region_state_cache", REGION_PATH
+)
+REGION_MODULE = importlib.util.module_from_spec(REGION_SPEC)
+sys.modules[REGION_SPEC.name] = REGION_MODULE
+REGION_SPEC.loader.exec_module(REGION_MODULE)
 
 
 def make_case(case_id="case-000", steps=2):
@@ -121,6 +130,7 @@ def make_active_request(prefix_length=256):
 def make_active_runtime():
     runtime = MODULE.Cluster1ModelRuntime.__new__(MODULE.Cluster1ModelRuntime)
     runtime.debug_sync_stages = False
+    runtime.device = torch.device("cpu")
     runtime.backend = types.SimpleNamespace(
         _current_mamba_slot=lambda req_pool_idx: req_pool_idx + 10
     )
@@ -128,7 +138,7 @@ def make_active_runtime():
     runtime._forward = lambda forward_batch, **_kwargs: torch.zeros(
         forward_batch.input_ids.numel(), 4
     )
-    req_to_token = torch.zeros((8, 512), dtype=torch.int64)
+    req_to_token = torch.zeros((8, 512), dtype=torch.int32)
     req_to_token[3, :256] = torch.arange(1, 257)
     prefill_metadata = types.SimpleNamespace()
 
@@ -143,6 +153,7 @@ def make_active_runtime():
     runtime.model_runner = types.SimpleNamespace(
         req_to_token_pool=types.SimpleNamespace(req_to_token=req_to_token),
         token_to_kv_pool=types.SimpleNamespace(size=1024),
+        server_args=types.SimpleNamespace(page_size=1),
         attn_backend=types.SimpleNamespace(
             init_forward_metadata=init_forward_metadata,
             forward_metadata=prefill_metadata,
@@ -565,6 +576,180 @@ def test_exporter_requests_full_mask_backend():
     assert forward_batch.dllm_force_bidir_mask is True
     assert forward_batch.dllm_bidir_custom_mask.dtype is torch.bool
     assert tuple(forward_batch.dllm_bidir_custom_mask.shape) == (32, 32)
+
+
+def test_int32_live_prefix_mapping_is_captured_as_contiguous_int64():
+    runtime, _offsets, _positions = make_active_runtime()
+    locations = runtime._canonical_prefix_locations(3, 256)
+    assert runtime.model_runner.req_to_token_pool.req_to_token.dtype is torch.int32
+    assert locations.dtype is torch.int64
+    assert locations.is_contiguous()
+    assert locations.ndim == 1
+    assert locations.device == runtime.model_runner.req_to_token_pool.req_to_token.device
+    assert torch.equal(locations, torch.arange(1, 257, dtype=torch.int64))
+
+
+def test_prefix_indices_contract_is_checked_before_prepare_for_extend():
+    runtime, _offsets, _positions = make_active_runtime()
+    req = make_active_request(prefix_length=4)
+    req.prefix_indices = req.prefix_indices.to(dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="before ScheduleBatch.prepare_for_extend"):
+        runtime._validate_req_prefix_indices(req, boundary=4)
+
+    source = ast.parse(PATH.read_text())
+    runtime_class = next(
+        node
+        for node in source.body
+        if isinstance(node, ast.ClassDef) and node.name == "Cluster1ModelRuntime"
+    )
+    prepare = next(
+        node
+        for node in runtime_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_prepare_extend"
+    )
+    calls = {
+        node.func.attr: node.lineno
+        for node in ast.walk(prepare)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert calls["_validate_req_prefix_indices"] < calls["prepare_for_extend"]
+
+
+def test_exporter_kv_reference_locations_are_canonical_int64(monkeypatch):
+    runtime, _offsets, _positions = make_active_runtime()
+    for package in ("sglang", "sglang.srt", "sglang.srt.mem_cache"):
+        module = types.ModuleType(package)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, package, module)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.mem_cache.region_state_cache",
+        REGION_MODULE,
+    )
+    key = types.SimpleNamespace(
+        request_id="request",
+        request_pool_idx=3,
+        request_slot_generation=1,
+        boundary=256,
+    )
+    reference = runtime._kv_reference(key)
+    assert reference.locations.dtype is torch.int64
+    assert reference.locations.is_contiguous()
+    assert reference.locations.ndim == 1
+
+
+def test_reference_and_cached_routes_use_the_canonical_helper():
+    source = ast.parse(PATH.read_text())
+    runtime_class = next(
+        node
+        for node in source.body
+        if isinstance(node, ast.ClassDef) and node.name == "Cluster1ModelRuntime"
+    )
+    run_case = next(
+        node
+        for node in runtime_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_case"
+    )
+    helper_calls = [
+        node
+        for node in ast.walk(run_case)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_canonical_prefix_locations"
+    ]
+    assert len(helper_calls) == 3
+    assert any(
+        any(keyword.arg == "expected_locations" for keyword in call.keywords)
+        for call in helper_calls
+    )
+
+
+def test_production_self_spec_creates_int64_kv_prefix_reference():
+    path = (
+        ROOT
+        / "eval/sglang/srt/dllm/algorithm/hybrid_diffusion_self_spec.py"
+    )
+    source = ast.parse(path.read_text())
+    algorithm = next(
+        node
+        for node in source.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "HybridDiffusionSelfSpec"
+    )
+    function = copy.deepcopy(
+        next(
+            node
+            for node in algorithm.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_hybrid_kv_reference"
+        )
+    )
+    function.decorator_list = []
+    namespace = {
+        "ModelRunner": object,
+        "RegionStateKey": object,
+        "KVPrefixReference": REGION_MODULE.KVPrefixReference,
+        "canonicalize_kv_prefix_locations": (
+            REGION_MODULE.canonicalize_kv_prefix_locations
+        ),
+    }
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+    exec(compile(module, str(path), "exec"), namespace)
+
+    mapping = torch.arange(40, dtype=torch.int32).view(4, 10)
+    model_runner = types.SimpleNamespace(
+        req_to_token_pool=types.SimpleNamespace(req_to_token=mapping),
+        token_to_kv_pool=types.SimpleNamespace(size=128),
+    )
+    key = types.SimpleNamespace(
+        request_id="production",
+        request_pool_idx=2,
+        request_slot_generation=4,
+        boundary=6,
+    )
+    reference = namespace["_hybrid_kv_reference"](model_runner, key)
+    assert reference.locations.dtype is torch.int64
+    assert reference.locations.is_contiguous()
+    assert reference.locations.device == mapping.device
+    assert torch.equal(reference.locations, mapping[2, :6].to(torch.int64))
+
+
+def test_prefix_locations_remain_unchanged_after_active_allocation():
+    runtime, _offsets, _positions = make_active_runtime()
+    req = make_active_request(prefix_length=256)
+    before = runtime.model_runner.req_to_token_pool.req_to_token[
+        req.req_pool_idx, :256
+    ].clone()
+    req.dllm_block_offset = 256
+    req.fill_ids = list(req.origin_input_ids) + list(range(32))
+    req.set_extend_input_len(32)
+    runtime._prepare_extend(req, bidir=True)
+    after = runtime.model_runner.req_to_token_pool.req_to_token[
+        req.req_pool_idx, :256
+    ]
+    assert torch.equal(before, after)
+
+
+def test_corrupted_prefix_location_remains_detectable_with_diagnostics():
+    runtime, req, forward_batch = _prepared_active_kv_contract()
+    expected = req.prefix_indices.clone()
+    runtime.model_runner.req_to_token_pool.req_to_token[req.req_pool_idx, 7] = 999
+    with pytest.raises(RuntimeError, match="first_mismatch_position=7") as error:
+        runtime._validate_active_kv_contract(
+            req,
+            forward_batch,
+            expected_prefix_locations=expected,
+            prefix_length=256,
+            active_length=32,
+        )
+    message = str(error.value)
+    assert "expected(dtype=torch.int64" in message
+    assert "observed(dtype=torch.int32" in message
+    assert "req_pool_idx=3" in message
+    assert "boundary=256" in message
+    assert "active_length=32" in message
+    assert "page_size=1" in message
+    assert "active_kv_locations=" in message
 
 
 def test_exporter_uses_bounded_server_memory_settings():

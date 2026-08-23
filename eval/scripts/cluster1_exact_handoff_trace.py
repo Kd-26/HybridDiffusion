@@ -544,6 +544,7 @@ class Cluster1ModelRuntime:
         self.model_runner.token_to_kv_pool_allocator.clear()
 
     def _make_req(self, rid: str, tokens: list[int]) -> Any:
+        torch = _import_torch()
         from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -556,6 +557,7 @@ class Cluster1ModelRuntime:
             ),
         )
         req.init_diffusion_llm(self.dllm_config)
+        req.prefix_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         req.fill_ids = list(tokens)
         req.logprob_start_len = -1
         req.set_extend_input_len(len(tokens))
@@ -591,6 +593,8 @@ class Cluster1ModelRuntime:
             spec_algorithm=SpeculativeAlgorithm.NONE,
             dllm_config=self.dllm_config,
         )
+        expected_boundary = int(req.dllm_block_offset) if bidir else 0
+        self._validate_req_prefix_indices(req, expected_boundary)
         batch.prepare_for_extend()
         batch._dllm_attn_mask_types_cpu = [
             DLLM_ATTN_MASK_BIDIR_BLOCK if bidir else DLLM_ATTN_MASK_CAUSAL_PREFILL
@@ -620,6 +624,93 @@ class Cluster1ModelRuntime:
         forward_batch.dllm_bidir_custom_mask = torch.ones(
             (active_length, active_length), dtype=torch.bool, device=device
         )
+
+    def _canonical_prefix_locations(
+        self,
+        req_pool_idx: int,
+        boundary: int,
+        *,
+        expected_locations: Optional[Any] = None,
+        active_length: int = 0,
+    ) -> Any:
+        torch = _import_torch()
+        raw_locations = self.model_runner.req_to_token_pool.req_to_token[
+            int(req_pool_idx), : int(boundary)
+        ]
+        if raw_locations.ndim != 1:
+            raise RuntimeError("live prefix KV locations must be one-dimensional")
+        if int(raw_locations.numel()) != int(boundary):
+            raise RuntimeError(
+                "live prefix KV location count does not equal boundary"
+            )
+        # write_cache_indices passes Req.prefix_indices to a Triton int64
+        # pointer, while the live request page table is intentionally int32.
+        locations = raw_locations.detach().to(
+            dtype=torch.int64, copy=True
+        ).contiguous()
+        pool_size = int(self.model_runner.token_to_kv_pool.size)
+        if locations.numel() and not bool(
+            ((locations >= 0) & (locations <= pool_size)).all().item()
+        ):
+            raise RuntimeError(
+                "live prefix KV locations are negative or outside the KV pool"
+            )
+        if locations.device != raw_locations.device:
+            raise RuntimeError("canonical prefix locations changed CUDA device")
+        if expected_locations is not None:
+            if (
+                not torch.is_tensor(expected_locations)
+                or expected_locations.dtype != torch.int64
+                or expected_locations.ndim != 1
+                or not expected_locations.is_contiguous()
+                or int(expected_locations.numel()) != int(boundary)
+            ):
+                raise RuntimeError(
+                    "expected prefix KV locations are not canonical int64"
+                )
+            expected = expected_locations.detach()
+            if expected.device != locations.device or not torch.equal(
+                expected, locations
+            ):
+                self._raise_prefix_location_mismatch(
+                    expected,
+                    raw_locations,
+                    req_pool_idx=req_pool_idx,
+                    boundary=boundary,
+                    active_length=active_length,
+                    active_locations=None,
+                )
+        return locations
+
+    def _validate_req_prefix_indices(self, req: Any, boundary: int) -> None:
+        torch = _import_torch()
+        locations = req.prefix_indices
+        errors = []
+        if not torch.is_tensor(locations):
+            errors.append("not a tensor")
+        else:
+            if locations.dtype != torch.int64:
+                errors.append(f"dtype={locations.dtype}, expected=torch.int64")
+            if locations.ndim != 1:
+                errors.append(f"ndim={locations.ndim}, expected=1")
+            if not locations.is_contiguous():
+                errors.append("tensor is not contiguous")
+            if int(locations.numel()) != int(boundary):
+                errors.append(
+                    f"numel={locations.numel()}, expected boundary={boundary}"
+                )
+            expected_device = (
+                self.model_runner.req_to_token_pool.req_to_token.device
+            )
+            if locations.device != expected_device:
+                errors.append(
+                    f"device={locations.device}, expected={expected_device}"
+                )
+        if errors:
+            raise RuntimeError(
+                "invalid req.prefix_indices before ScheduleBatch.prepare_for_extend; "
+                + "; ".join(errors)
+            )
 
     def _forward(self, forward_batch: Any, *, metadata_prepared: bool = False) -> Any:
         output = self.model_runner.forward(
@@ -754,32 +845,59 @@ class Cluster1ModelRuntime:
         if int(forward_batch.seq_lens[0].item()) != prefix_length + active_length:
             raise RuntimeError("seq_len does not equal prefix_length + active_length")
 
-        expected_prefix = expected_prefix_locations.reshape(-1)
-        if int(expected_prefix.numel()) != prefix_length:
-            raise RuntimeError("committed KVPrefixReference has the wrong length")
-        request_prefix = req.prefix_indices.reshape(-1)
-        if not torch.equal(request_prefix, expected_prefix.to(request_prefix.device)):
+        expected_prefix = expected_prefix_locations
+        if (
+            not torch.is_tensor(expected_prefix)
+            or expected_prefix.dtype != torch.int64
+            or expected_prefix.ndim != 1
+            or not expected_prefix.is_contiguous()
+            or int(expected_prefix.numel()) != prefix_length
+        ):
             raise RuntimeError(
-                "request prefix KV locations differ from the committed "
-                "KVPrefixReference"
+                "committed KVPrefixReference locations are not canonical int64"
             )
-        current_prefix = self.model_runner.req_to_token_pool.req_to_token[
+        active_locations = forward_batch.out_cache_loc.reshape(-1)
+        request_prefix = req.prefix_indices
+        if request_prefix.device != expected_prefix.device or not torch.equal(
+            request_prefix, expected_prefix
+        ):
+            self._raise_prefix_location_mismatch(
+                expected_prefix,
+                request_prefix,
+                req_pool_idx=req.req_pool_idx,
+                boundary=prefix_length,
+                active_length=active_length,
+                active_locations=active_locations,
+            )
+        current_prefix_raw = self.model_runner.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_length
-        ].reshape(-1)
-        if not torch.equal(current_prefix, expected_prefix.to(current_prefix.device)):
-            raise RuntimeError(
-                "prefix KV locations differ from the committed KVPrefixReference"
+        ]
+        current_prefix = current_prefix_raw.to(
+            dtype=torch.int64, copy=True
+        ).contiguous()
+        if current_prefix.device != expected_prefix.device or not torch.equal(
+            current_prefix, expected_prefix
+        ):
+            self._raise_prefix_location_mismatch(
+                expected_prefix,
+                current_prefix_raw,
+                req_pool_idx=req.req_pool_idx,
+                boundary=prefix_length,
+                active_length=active_length,
+                active_locations=active_locations,
             )
 
-        active_locations = forward_batch.out_cache_loc.reshape(-1)
         if int(active_locations.numel()) != active_length:
             raise RuntimeError(
                 "active out_cache_loc does not have active_length entries"
             )
         current_active = self.model_runner.req_to_token_pool.req_to_token[
             req.req_pool_idx, prefix_length : prefix_length + active_length
-        ].reshape(-1)
-        if not torch.equal(current_active, active_locations.to(current_active.device)):
+        ].to(dtype=torch.int64, copy=True).contiguous()
+        active_long = active_locations.to(dtype=torch.int64, copy=True).contiguous()
+        if current_active.device != active_long.device or not torch.equal(
+            current_active, active_long
+        ):
             raise RuntimeError(
                 "active KV locations are missing from the request page table"
             )
@@ -787,7 +905,7 @@ class Cluster1ModelRuntime:
         all_locations = torch.cat(
             (
                 expected_prefix.to(device=active_locations.device),
-                active_locations,
+                active_long,
             )
         ).to(dtype=torch.long)
         if not bool(((all_locations > 0) & (all_locations <= pool_size)).all().item()):
@@ -797,11 +915,58 @@ class Cluster1ModelRuntime:
         prefix_long = expected_prefix.to(
             device=active_locations.device, dtype=torch.long
         )
-        active_long = active_locations.to(dtype=torch.long)
         if int(torch.unique(active_long).numel()) != active_length:
             raise RuntimeError("active out_cache_loc contains duplicate KV locations")
         if bool(torch.isin(active_long, prefix_long).any().item()):
             raise RuntimeError("prefix and active KV locations overlap")
+
+    def _raise_prefix_location_mismatch(
+        self,
+        expected: Any,
+        observed: Any,
+        *,
+        req_pool_idx: int,
+        boundary: int,
+        active_length: int,
+        active_locations: Optional[Any],
+    ) -> None:
+        torch = _import_torch()
+        expected_flat = expected.detach().to(dtype=torch.int64).reshape(-1)
+        observed_flat = observed.detach().to(dtype=torch.int64).reshape(-1)
+        shared_length = min(expected_flat.numel(), observed_flat.numel())
+        mismatch = torch.nonzero(
+            expected_flat[:shared_length] != observed_flat[:shared_length]
+        ).reshape(-1)
+        first_mismatch = (
+            int(mismatch[0].item())
+            if mismatch.numel()
+            else int(shared_length)
+        )
+        window_start = max(0, first_mismatch - 3)
+        window_end = min(
+            max(expected_flat.numel(), observed_flat.numel()), first_mismatch + 4
+        )
+        page_size = int(
+            getattr(getattr(self.model_runner, "server_args", None), "page_size", -1)
+        )
+        active_values = (
+            "unallocated"
+            if active_locations is None
+            else active_locations.detach().to(dtype=torch.int64).reshape(-1).tolist()
+        )
+        raise RuntimeError(
+            "prefix KV locations differ from the committed KVPrefixReference: "
+            f"expected(dtype={expected.dtype}, device={expected.device}, "
+            f"shape={tuple(expected.shape)}), "
+            f"observed(dtype={observed.dtype}, device={observed.device}, "
+            f"shape={tuple(observed.shape)}), "
+            f"first_mismatch_position={first_mismatch}, "
+            f"expected_window={expected_flat[window_start:window_end].tolist()}, "
+            f"observed_window={observed_flat[window_start:window_end].tolist()}, "
+            f"req_pool_idx={req_pool_idx}, boundary={boundary}, "
+            f"active_length={active_length}, page_size={page_size}, "
+            f"active_kv_locations={active_values}"
+        )
 
     @staticmethod
     def _validate_full_paged_metadata(forward_batch: Any, prefill_metadata: Any) -> str:
@@ -906,9 +1071,9 @@ class Cluster1ModelRuntime:
             request_pool_idx=key.request_pool_idx,
             request_slot_generation=key.request_slot_generation,
             pool_identity=id(pool),
-            locations=pool.req_to_token[key.request_pool_idx, : key.boundary]
-            .detach()
-            .clone(),
+            locations=self._canonical_prefix_locations(
+                key.request_pool_idx, key.boundary
+            ),
             valid_length=key.boundary,
         )
 
@@ -1051,12 +1216,8 @@ class Cluster1ModelRuntime:
                 self._clear_pools()
                 req = self._make_req(f"{case.case_id}:reference:{step}", prefix)
                 self._run_prefix(req)
-                prefix_locations = (
-                    self.model_runner.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : len(prefix)
-                    ]
-                    .detach()
-                    .clone()
+                prefix_locations = self._canonical_prefix_locations(
+                    req.req_pool_idx, len(prefix)
                 )
                 req.prefix_indices = prefix_locations
                 active_inputs.append(list(active))
@@ -1094,7 +1255,12 @@ class Cluster1ModelRuntime:
             negative_checks = self._negative_checks(key)
             restore_deterministic, stale_count = self._gdn_restore_tests(key, mamba_idx)
 
-            cached_req.prefix_indices = kv_reference.locations.detach().clone()
+            cached_req.prefix_indices = self._canonical_prefix_locations(
+                cached_req.req_pool_idx,
+                key.boundary,
+                expected_locations=kv_reference.locations,
+                active_length=case.active_length,
+            )
             cache_hit = True
             for step, step_active in enumerate(active_inputs, 1):
                 lookup = self.backend.restore_region_state(
@@ -1110,7 +1276,12 @@ class Cluster1ModelRuntime:
                     )
                 # prefix_indices fixes extend_prefix_len at the sealed boundary;
                 # only step_active is present in forward_batch.input_ids.
-                cached_req.prefix_indices = kv_reference.locations.detach().clone()
+                cached_req.prefix_indices = self._canonical_prefix_locations(
+                    cached_req.req_pool_idx,
+                    key.boundary,
+                    expected_locations=kv_reference.locations,
+                    active_length=case.active_length,
+                )
                 cached_steps.append(
                     self._run_active(
                         cached_req,

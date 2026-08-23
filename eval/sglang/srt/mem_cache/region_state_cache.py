@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional, Tuple
 
+import torch
+
 
 class RegionStateMissReason(str, Enum):
     NOT_FOUND = "not_found"
@@ -64,6 +66,43 @@ class KVPrefixReference:
     locations: Any
     valid_length: int
     retained_by_request: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "locations",
+            canonicalize_kv_prefix_locations(self.locations, self.valid_length),
+        )
+
+
+def canonicalize_kv_prefix_locations(
+    locations: Any,
+    valid_length: int,
+    *,
+    pool_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Copy physical KV locations into the canonical int64 descriptor format."""
+    if not torch.is_tensor(locations):
+        raise TypeError("KV prefix locations must be a tensor")
+    if locations.ndim != 1:
+        raise ValueError("KV prefix locations must be one-dimensional")
+    if int(locations.numel()) != int(valid_length):
+        raise ValueError(
+            "KV prefix location count must equal valid_length: "
+            f"{locations.numel()} != {valid_length}"
+        )
+    canonical = locations.detach().to(dtype=torch.int64, copy=True).contiguous()
+    if canonical.numel() and not bool((canonical >= 0).all().item()):
+        raise ValueError("KV prefix locations must be non-negative")
+    if (
+        pool_size is not None
+        and canonical.numel()
+        and not bool((canonical <= int(pool_size)).all().item())
+    ):
+        raise ValueError(
+            f"KV prefix locations exceed KV pool size {int(pool_size)}"
+        )
+    return canonical
 
 
 @dataclass(frozen=True)

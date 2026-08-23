@@ -1094,11 +1094,13 @@ class GDNDllmBackend:
             return False
         current = self.req_to_token_pool.req_to_token[
             reference.request_pool_idx, : reference.valid_length
-        ]
+        ].to(dtype=torch.int64, copy=True).contiguous()
         expected = reference.locations
         return (
             tuple(current.shape) == tuple(expected.shape)
             and current.device == expected.device
+            and expected.dtype == torch.int64
+            and expected.is_contiguous()
             and torch.equal(current, expected)
         )
 

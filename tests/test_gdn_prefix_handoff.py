@@ -95,7 +95,7 @@ for name, old_module in previous_modules.items():
 
 class FakeReqPool:
     def __init__(self):
-        self.req_to_token = torch.arange(256, dtype=torch.int64).view(4, 64)
+        self.req_to_token = torch.arange(256, dtype=torch.int32).view(4, 64)
         self.req_index_to_mamba_index_mapping = torch.tensor([0, 2, 0, 0])
         cache = types.SimpleNamespace(
             conv=[torch.randn(2, 4, 3, 2)],
