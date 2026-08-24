@@ -65,6 +65,19 @@ cached path is the optimized production baseline; the experiment only compares
 shape, state preservation, active logits, layer hidden states, GDN state, and
 top-1 output.
 
+For the prefix-zero reduction there is no stable KV or GDN state to commit or
+restore. Both sides therefore execute the entire sequence as active rows. Every
+diffusion-step reevaluation clears the controlled-test pools and creates fresh
+requests, allowing the real `ScheduleBatch` to allocate request slots while
+preventing recurrent GDN state from leaking across steps. The canonical empty
+`torch.int64` prefix-location tensor is validated in place; no synthetic request
+slot or cache state is created.
+
+The artifact accepts only a loaded TP=1 Qwen3.5-2B architecture fingerprint
+(`hidden_size=2048`, 24 layers, `intermediate_size=6144`) and emits
+`model_scale: "2B"`. Unknown, ambiguous, and differently sized checkpoints fail
+closed rather than receiving a guessed model-scale label.
+
 Every case emits one bounded JSONL record. Position evidence contains count,
 first/last values, an eight-value preview, and a SHA-256 digest rather than a
 large tensor. Stable K/V and GDN state are hashed before and after cached
@@ -83,7 +96,7 @@ from complete tensors.
 
 ## A30 commands
 
-Run from the repository root with a local Qwen3.5-4B HybridDiffusion model.
+Run from the repository root with a local Qwen3.5-2B HybridDiffusion model.
 Do not add `--enable-deterministic-inference`.
 
 One-case debugging may use blocking launches and stage synchronization:

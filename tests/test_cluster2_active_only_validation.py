@@ -3,6 +3,8 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -37,7 +39,7 @@ def make_record(case=None):
         "case_id": case.case_id,
         "profile": case.profile,
         "revision": "revision",
-        "model_scale": "qwen3_5-4b",
+        "model_scale": "2B",
         "dtype": "bfloat16",
         "tp_size": 1,
         "batch_size": case.batch_size,
@@ -48,6 +50,7 @@ def make_record(case=None):
         "expected_active_tokens": expected,
         "stable_query_tokens": 0,
         "attention_query_rows_per_layer": [expected, expected],
+        "attention_row_observation_point": MODULE.ATTENTION_ROW_OBSERVATION_POINT,
         "total_kv_tokens_per_request": [case.total_tokens_per_request]
         * case.batch_size,
         "mlp_rows_per_layer": [expected] * 4,
@@ -215,6 +218,191 @@ def test_tp_size_other_than_one_is_rejected():
                 "2",
             ]
         )
+
+
+def make_prefix_runtime(canonical_locations=None):
+    runtime = MODULE.Cluster2ValidationRuntime.__new__(MODULE.Cluster2ValidationRuntime)
+    canonical = Mock(
+        return_value=(
+            canonical_locations
+            if canonical_locations is not None
+            else torch.tensor([11, 12], dtype=torch.int64)
+        )
+    )
+    runtime.runtime = SimpleNamespace(_canonical_prefix_locations=canonical)
+    runtime.model_runner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros((4, 16), dtype=torch.int32)
+        )
+    )
+    return runtime, canonical
+
+
+def test_zero_prefix_reference_preserves_canonical_empty_without_lookup():
+    runtime, canonical = make_prefix_runtime()
+    empty = torch.empty((0,), dtype=torch.int64)
+    req = SimpleNamespace(req_pool_idx=None, prefix_indices=empty)
+
+    runtime._prepare_prefix_indices([req], 0)
+
+    canonical.assert_not_called()
+    assert req.prefix_indices is empty
+    assert req.prefix_indices.dtype == torch.int64
+    assert req.prefix_indices.ndim == 1
+    assert req.prefix_indices.is_contiguous()
+    assert (
+        req.prefix_indices.device
+        == runtime.model_runner.req_to_token_pool.req_to_token.device
+    )
+    assert req.prefix_indices.numel() == 0
+    assert req.req_pool_idx is None
+
+
+@pytest.mark.parametrize(
+    "bad_prefix",
+    [
+        torch.empty((0,), dtype=torch.int32),
+        torch.empty((1, 0), dtype=torch.int64),
+        torch.tensor([1], dtype=torch.int64),
+    ],
+)
+def test_zero_prefix_rejects_noncanonical_empty_tensors(bad_prefix):
+    runtime, canonical = make_prefix_runtime()
+    req = SimpleNamespace(req_pool_idx=None, prefix_indices=bad_prefix)
+    with pytest.raises(RuntimeError, match="invalid zero-prefix req.prefix_indices"):
+        runtime._prepare_prefix_indices([req], 0)
+    canonical.assert_not_called()
+    assert req.req_pool_idx is None
+
+
+def test_positive_prefix_requires_real_request_pool_slot():
+    runtime, canonical = make_prefix_runtime()
+    req = SimpleNamespace(
+        req_pool_idx=None, prefix_indices=torch.empty((0,), dtype=torch.int64)
+    )
+    with pytest.raises(RuntimeError, match="no allocated req_pool_idx"):
+        runtime._prepare_prefix_indices([req], 2)
+    canonical.assert_not_called()
+    assert req.req_pool_idx is None
+
+
+def test_positive_prefix_reads_canonical_locations_from_real_slot():
+    locations = torch.tensor([21, 22], dtype=torch.int64)
+    runtime, canonical = make_prefix_runtime(locations)
+    req = SimpleNamespace(
+        req_pool_idx=3, prefix_indices=torch.empty((0,), dtype=torch.int64)
+    )
+    runtime._prepare_prefix_indices([req], 2)
+    canonical.assert_called_once_with(3, 2)
+    assert req.prefix_indices is locations
+    assert req.req_pool_idx == 3
+
+
+def make_entirely_active_trace(state_value):
+    value = torch.tensor([[float(state_value)]])
+    return {
+        "logits": value.clone(),
+        "top1": torch.tensor([0]),
+        "hidden": {0: value.clone()},
+        "gdn_states": {0: (value.clone(),)},
+        "rows": {"attention": [1], "mlp": [1], "gdn": [1]},
+        "positions": torch.tensor([0]),
+        "scheduled_rows": 1,
+        "kv_lengths": [1],
+    }
+
+
+def test_zero_prefix_candidate_uses_fresh_requests_without_state_or_restore():
+    runtime, canonical = make_prefix_runtime()
+    state = {"gdn": 99, "next_slot": 0}
+    clear_calls = []
+    created_requests = []
+
+    def clear_pools():
+        clear_calls.append(True)
+        state["gdn"] = 0
+
+    def make_reqs(_case, path, _prefixes):
+        req = SimpleNamespace(
+            rid=path,
+            req_pool_idx=None,
+            prefix_indices=torch.empty((0,), dtype=torch.int64),
+        )
+        created_requests.append(req)
+        return [req]
+
+    def run_active(reqs, values, _hooks):
+        assert reqs[0].req_pool_idx is None
+        state["next_slot"] += 1
+        reqs[0].req_pool_idx = state["next_slot"]
+        state["gdn"] += int(values[0][0])
+        return make_entirely_active_trace(state["gdn"]), None, None
+
+    runtime.runtime._clear_pools = Mock(side_effect=clear_pools)
+    runtime._make_reqs = Mock(side_effect=make_reqs)
+    runtime._run_active_batch = Mock(side_effect=run_active)
+    runtime._seal_prefixes = Mock(side_effect=AssertionError("must not seal"))
+    runtime._restore = Mock(side_effect=AssertionError("must not restore"))
+    references = [make_entirely_active_trace(1), make_entirely_active_trace(1)]
+    case = make_case(prefix=0, active=1, steps=2, batch=1)
+
+    traces, comparisons, *stable_hashes = runtime._run_candidate_steps(
+        case,
+        prefixes=[[]],
+        active_inputs=[[[1]], [[1]]],
+        references=references,
+        hooks=object(),
+    )
+
+    assert len(clear_calls) == case.diffusion_steps
+    assert len(created_requests) == case.diffusion_steps
+    assert created_requests[0] is not created_requests[1]
+    assert [trace["gdn_states"][0][0].item() for trace in traces] == [1.0, 1.0]
+    assert comparisons == [(0.0, 0.0, 0.0, True)] * case.diffusion_steps
+    assert stable_hashes == [None, None, None, None]
+    canonical.assert_not_called()
+    runtime._seal_prefixes.assert_not_called()
+    runtime._restore.assert_not_called()
+
+
+def qwen35_runner(hidden_size=2048, layers=24, intermediate_size=6144, identity=True):
+    text_config = SimpleNamespace(
+        model_type="qwen3_5_text" if identity else "unknown",
+        hidden_size=hidden_size,
+        num_hidden_layers=layers,
+        intermediate_size=intermediate_size,
+    )
+    hf_config = SimpleNamespace(
+        model_type="qwen3_5" if identity else "unknown",
+        architectures=["Qwen3_5DLLMForConditionalGeneration"] if identity else [],
+    )
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=text_config,
+            hf_config=hf_config,
+        )
+    )
+
+
+def test_qwen35_2b_checkpoint_scale_is_recorded_as_2b():
+    assert MODULE.infer_model_scale(qwen35_runner()) == "2B"
+    case = make_case()
+    record = make_record(case)
+    assert record["model_scale"] == "2B"
+    assert MODULE.validate_case_record(record, case) == []
+
+
+@pytest.mark.parametrize(
+    "runner",
+    [
+        qwen35_runner(hidden_size=2560, layers=32, intermediate_size=9216),
+        qwen35_runner(identity=False),
+        SimpleNamespace(model_config=SimpleNamespace(hf_text_config=None)),
+    ],
+)
+def test_unsupported_or_ambiguous_checkpoint_scale_fails_closed(runner):
+    with pytest.raises(RuntimeError, match="checkpoint scale|hf_text_config"):
+        MODULE.infer_model_scale(runner)
 
 
 class RealisticAttentionLayer(torch.nn.Module):

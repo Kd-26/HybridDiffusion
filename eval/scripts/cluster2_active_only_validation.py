@@ -32,6 +32,11 @@ RUNTIME_BASE_REVISION = "1e21bdec792a665419b290bf89f75c14c730dc94"
 NUMERICAL_TOLERANCE = 1e-2
 DEFAULT_SEED = 20260825
 ATTENTION_ROW_OBSERVATION_POINT = "qkv_projection_input"
+QWEN35_2B_FINGERPRINT = {
+    "hidden_size": 2048,
+    "num_hidden_layers": 24,
+    "intermediate_size": 6144,
+}
 ROOT = Path(__file__).resolve().parents[2]
 CLUSTER1_PATH = Path(__file__).with_name("cluster1_exact_handoff_trace.py")
 
@@ -318,6 +323,7 @@ def validate_case_record(record: Mapping[str, Any], case: ValidationCase) -> lis
         "expected_active_tokens": expected_active,
         "dtype": "bfloat16",
         "tp_size": 1,
+        "model_scale": "2B",
     }
     for field, expected in identity.items():
         if record.get(field) != expected:
@@ -792,6 +798,39 @@ def _position_evidence(values: Sequence[int]) -> dict[str, Any]:
     }
 
 
+def infer_model_scale(model_runner: Any) -> str:
+    """Identify the supported TP=1 checkpoint from loaded model metadata."""
+    model_config = getattr(model_runner, "model_config", None)
+    text_config = getattr(model_config, "hf_text_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if text_config is None:
+        raise RuntimeError("cannot identify model scale: hf_text_config is missing")
+
+    identifiers = [
+        getattr(text_config, "model_type", None),
+        type(text_config).__name__,
+        getattr(hf_config, "model_type", None),
+        type(hf_config).__name__ if hf_config is not None else None,
+        *(getattr(hf_config, "architectures", None) or []),
+    ]
+    normalized_identity = " ".join(
+        str(value).lower() for value in identifiers if value is not None
+    ).replace("-", "_")
+    observed = {
+        name: getattr(text_config, name, None) for name in QWEN35_2B_FINGERPRINT
+    }
+    qwen35_identity = (
+        "qwen3_5" in normalized_identity or "qwen35" in normalized_identity
+    )
+    if qwen35_identity and observed == QWEN35_2B_FINGERPRINT:
+        return "2B"
+    raise RuntimeError(
+        "unsupported or ambiguous checkpoint scale; expected Qwen3.5-2B "
+        f"metadata={QWEN35_2B_FINGERPRINT}, observed={observed}, "
+        f"identity={normalized_identity!r}"
+    )
+
+
 class Cluster2ValidationRuntime:
     """Controlled replay versus the existing batched production tensor layout."""
 
@@ -825,8 +864,7 @@ class Cluster2ValidationRuntime:
         self.model_runner = self.runtime.model_runner
         self.device = self.runtime.device
         self.revision = _git_revision()
-        config = self.model_runner.model_config.hf_text_config
-        self.model_scale = str(getattr(config, "model_type", "qwen3_5")) + "-4b"
+        self.model_scale = infer_model_scale(self.model_runner)
 
     def _tokens(self, case: ValidationCase) -> tuple[list[list[int]], list[list[int]]]:
         torch = __import__("torch")
@@ -907,6 +945,50 @@ class Cluster2ValidationRuntime:
         _, forward_batch = self._prepare_batch(reqs, bidir=False)
         self.runtime._forward(forward_batch)
         self.runtime._synchronize()
+
+    def _prepare_prefix_indices(self, reqs: Sequence[Any], boundary: int) -> None:
+        """Preserve canonical empties or capture real allocated prefix locations."""
+        torch = __import__("torch")
+        boundary = int(boundary)
+        if boundary < 0:
+            raise RuntimeError("prefix boundary must be non-negative")
+        expected_device = self.model_runner.req_to_token_pool.req_to_token.device
+        for request_index, req in enumerate(reqs):
+            if boundary == 0:
+                locations = getattr(req, "prefix_indices", None)
+                errors = []
+                if not torch.is_tensor(locations):
+                    errors.append("not a tensor")
+                else:
+                    if locations.dtype != torch.int64:
+                        errors.append(f"dtype={locations.dtype}, expected=torch.int64")
+                    if locations.ndim != 1:
+                        errors.append(f"ndim={locations.ndim}, expected=1")
+                    if not locations.is_contiguous():
+                        errors.append("tensor is not contiguous")
+                    if int(locations.numel()) != 0:
+                        errors.append(f"numel={locations.numel()}, expected=0")
+                    if locations.device != expected_device:
+                        errors.append(
+                            f"device={locations.device}, expected={expected_device}"
+                        )
+                if errors:
+                    raise RuntimeError(
+                        "invalid zero-prefix req.prefix_indices for request "
+                        f"{request_index}: " + "; ".join(errors)
+                    )
+                # Keep the canonical empty from _make_req(). Do not assign a
+                # synthetic request slot before the real ScheduleBatch runs.
+                continue
+
+            if getattr(req, "req_pool_idx", None) is None:
+                raise RuntimeError(
+                    "positive-prefix validator request has no allocated "
+                    f"req_pool_idx before boundary={boundary} lookup"
+                )
+            req.prefix_indices = self.runtime._canonical_prefix_locations(
+                req.req_pool_idx, boundary
+            )
 
     def _run_active_batch(
         self,
@@ -1018,6 +1100,59 @@ class Cluster2ValidationRuntime:
                 raise RuntimeError(f"exact prefix restore missed: {result.miss_reason}")
         self.runtime._synchronize()
 
+    def _run_candidate_steps(
+        self,
+        case: ValidationCase,
+        prefixes: Sequence[Sequence[int]],
+        active_inputs: Sequence[Sequence[Sequence[int]]],
+        references: Sequence[Mapping[str, Any]],
+        hooks: ScopedRowHooks,
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[tuple[float, float, float, bool]],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+    ]:
+        comparisons = []
+        candidate_traces = []
+        if case.prefix_length == 0:
+            # No stable state exists to seal or restore. Every entirely-active
+            # reevaluation gets cleared pools and fresh requests so GDN state
+            # from the previous diffusion step cannot persist.
+            for step, values in enumerate(active_inputs):
+                self.runtime._clear_pools()
+                candidate_reqs = self._make_reqs(
+                    case, f"zero-prefix-candidate:{step}", prefixes
+                )
+                self._prepare_prefix_indices(candidate_reqs, 0)
+                trace, _, _ = self._run_active_batch(candidate_reqs, values, hooks)
+                candidate_traces.append(trace)
+                comparisons.append(self._compare_traces(references[step], trace))
+            return candidate_traces, comparisons, None, None, None, None
+
+        self.runtime._clear_pools()
+        cached_reqs = self._make_reqs(case, "cached", prefixes)
+        self._run_prefix_batch(cached_reqs)
+        self._prepare_prefix_indices(cached_reqs, case.prefix_length)
+        keys, _ = self._seal_prefixes(case, cached_reqs, prefixes)
+        stable_kv_before, stable_gdn_before = self._stable_hashes(keys)
+        for step, values in enumerate(active_inputs):
+            self._restore(keys, cached_reqs)
+            trace, _, _ = self._run_active_batch(cached_reqs, values, hooks)
+            candidate_traces.append(trace)
+            comparisons.append(self._compare_traces(references[step], trace))
+        stable_kv_after, stable_gdn_after = self._stable_hashes(keys)
+        return (
+            candidate_traces,
+            comparisons,
+            stable_kv_before,
+            stable_kv_after,
+            stable_gdn_before,
+            stable_gdn_after,
+        )
+
     @staticmethod
     def _compare_traces(
         reference: Mapping[str, Any], cached: Mapping[str, Any]
@@ -1087,10 +1222,7 @@ class Cluster2ValidationRuntime:
                 self.runtime._clear_pools()
                 reqs = self._make_reqs(case, f"reference:{step}", prefixes)
                 self._run_prefix_batch(reqs)
-                for req in reqs:
-                    req.prefix_indices = self.runtime._canonical_prefix_locations(
-                        req.req_pool_idx, case.prefix_length
-                    )
+                self._prepare_prefix_indices(reqs, case.prefix_length)
                 active_inputs.append([list(values) for values in active])
                 trace, _, _ = self._run_active_batch(reqs, active, hooks)
                 references.append(trace)
@@ -1098,20 +1230,16 @@ class Cluster2ValidationRuntime:
                     trace["top1"].reshape(case.batch_size, case.active_length).tolist()
                 )
 
-            self.runtime._clear_pools()
-            cached_reqs = self._make_reqs(case, "cached", prefixes)
-            self._run_prefix_batch(cached_reqs)
-            keys, _ = self._seal_prefixes(case, cached_reqs, prefixes)
-            stable_kv_before, stable_gdn_before = self._stable_hashes(keys)
-            comparisons = []
-            cached_traces = []
-            for step, values in enumerate(active_inputs):
-                if keys:
-                    self._restore(keys, cached_reqs)
-                trace, _, _ = self._run_active_batch(cached_reqs, values, hooks)
-                cached_traces.append(trace)
-                comparisons.append(self._compare_traces(references[step], trace))
-            stable_kv_after, stable_gdn_after = self._stable_hashes(keys)
+            (
+                cached_traces,
+                comparisons,
+                stable_kv_before,
+                stable_kv_after,
+                stable_gdn_before,
+                stable_gdn_after,
+            ) = self._run_candidate_steps(
+                case, prefixes, active_inputs, references, hooks
+            )
             cuda_finished.record()
             self.runtime._synchronize()
             cuda_elapsed_ms = float(cuda_started.elapsed_time(cuda_finished))
@@ -1162,8 +1290,6 @@ class Cluster2ValidationRuntime:
         unavailable = {}
         if case.prefix_length == 0:
             stable_kv_unchanged = stable_gdn_unchanged = None
-            stable_kv_before = stable_kv_after = None
-            stable_gdn_before = stable_gdn_after = None
             unavailable = {
                 "stable_kv_unchanged": "no stable prefix exists for prefix length zero",
                 "stable_gdn_unchanged": "no stable prefix state exists for prefix length zero",
