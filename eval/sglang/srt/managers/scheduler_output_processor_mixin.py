@@ -547,7 +547,11 @@ class SchedulerOutputProcessorMixin:
             else:
                 req.dllm_kv_valid_len = None
 
-            adv = advance_override.pop(req_pool_idx, None)
+            adv = self._hybrid_result_committed_advance(
+                result,
+                req_pool_idx,
+                advance_override.pop(req_pool_idx, None),
+            )
             if adv is not None:
                 req.dllm_next_advance = adv
             track_boundary = mamba_track_commit_info.pop(req_pool_idx, None)
@@ -585,7 +589,9 @@ class SchedulerOutputProcessorMixin:
                     break
             if dllm_algo is not None:
                 dllm_algo.record_consumed_tokens(req_pool_idx, consumed_tokens)
-            self._advance_hybrid_boundary(req, consumed_token_ids)
+            self._publish_hybrid_result_commit(
+                req, result, consumed_token_ids
+            )
             finished = req.finished()
             if finished:
                 if dllm_algo is not None:

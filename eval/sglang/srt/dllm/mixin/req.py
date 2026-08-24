@@ -67,7 +67,12 @@ class ReqDllmMixin:
             )
 
         if self.dllm_config is not None:
-            if len(self.origin_input_ids) < self.dllm_config.block_size:
+            # Exact handoff needs one causal prefix forward to seal KV and GDN
+            # state before any suffix decode can request a restore.  Short
+            # prompts therefore cannot use the legacy decode-direct shortcut.
+            if self.hybrid_execution_spec is not None:
+                self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+            elif len(self.origin_input_ids) < self.dllm_config.block_size:
                 self.dllm_phase = DllmReqPhase.INCOMING_DECODE
             else:
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL

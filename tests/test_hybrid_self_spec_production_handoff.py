@@ -1,6 +1,7 @@
 import ast
 import copy
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -8,6 +9,7 @@ import typing
 from pathlib import Path
 
 import torch
+import pytest
 
 
 ROOT = Path(__file__).parents[1]
@@ -46,7 +48,7 @@ def _algorithm_method(name):
     namespace = {
         "Any": typing.Any,
         "Dict": typing.Dict,
-        "ForwardBatch": object,
+        "ForwardBatch": types.SimpleNamespace,
         "ForwardMode": types.SimpleNamespace(DLLM_MIXED="dllm_mixed"),
         "List": typing.List,
         "ModelRunner": object,
@@ -57,6 +59,7 @@ def _algorithm_method(name):
         "copy": copy,
         "hash_token_ids": EXECUTION_SPEC.hash_token_ids,
         "logger": logging.getLogger(__name__),
+        "json": json,
         "torch": torch,
     }
     module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
@@ -68,6 +71,7 @@ CANONICAL_REPLAY_LOCATIONS = _algorithm_method("_canonical_replay_kv_locations")
 SNAPSHOT_BOUNDARIES = _algorithm_method("_snapshot_hybrid_boundaries")
 RESTORE_BOUNDARIES = _algorithm_method("_restore_hybrid_boundaries")
 RECOMPUTE_BOUNDARY = _algorithm_method("_recompute_hybrid_boundary")
+VALIDATE_RECOVERY_BATCH = _algorithm_method("_validate_recovery_forward_batch")
 
 
 def _make_key(*, generation=11, boundary=4):
@@ -173,6 +177,7 @@ def _algorithm(backend, key):
     algorithm._hybrid_debug_log = lambda *_args, **_kwargs: None
     algorithm._hybrid_debug_synchronize = lambda *_args, **_kwargs: None
     algorithm._canonical_replay_kv_locations = CANONICAL_REPLAY_LOCATIONS
+    algorithm._validate_recovery_forward_batch = VALIDATE_RECOVERY_BATCH
     return algorithm
 
 
@@ -190,10 +195,11 @@ def test_recovery_locations_canonicalize_int32_page_table():
     assert locations.device == pool.req_to_token.device
 
 
-def test_prefill_snapshot_then_first_decode_is_a_real_restore_hit():
+@pytest.mark.parametrize("prompt_length", range(1, 7))
+def test_prefill_snapshot_then_first_decode_is_a_real_restore_hit(prompt_length):
     pool = _ReqPool()
     backend = _LifecycleBackend(pool)
-    key = _make_key()
+    key = _make_key(boundary=prompt_length)
     runner = types.SimpleNamespace(
         req_to_token_pool=pool,
         token_to_kv_pool=types.SimpleNamespace(size=8),
@@ -291,6 +297,20 @@ def test_forced_miss_recovery_uses_safe_indices_and_next_restore_hits():
     assert lookup.hit
 
 
+def test_recovery_validation_rejects_corrupted_location_before_forward():
+    pool = _ReqPool()
+    backend = _LifecycleBackend(pool)
+    key = _make_key()
+    runner = _Runner(pool)
+    algorithm = _algorithm(backend, key)
+    RECOMPUTE_BOUNDARY(algorithm, runner, _decode_batch(key), 0, key, backend)
+    replay = runner.forwarded[0]
+    replay.out_cache_loc[0] = runner.token_to_kv_pool.size
+
+    with pytest.raises(RuntimeError, match="KV location out of range"):
+        VALIDATE_RECOVERY_BATCH(replay, runner, key, mamba_idx=1)
+
+
 def test_request_slot_reuse_cannot_restore_stale_state():
     pool = _ReqPool()
     backend = _LifecycleBackend(pool)
@@ -307,17 +327,13 @@ def test_request_slot_reuse_cannot_restore_stale_state():
     )
     algorithm = _algorithm(backend, new_key)
     algorithm._hybrid_state_keys[old_key.request_pool_idx] = old_key
-    recomputes = []
-    algorithm._recompute_hybrid_boundary = lambda *args: recomputes.append(args)
-
-    RESTORE_BOUNDARIES(
-        algorithm,
-        runner,
-        types.SimpleNamespace(),
-        [0],
-        [new_key.request_pool_idx],
-    )
-
+    with pytest.raises(RuntimeError, match="committed key differs"):
+        RESTORE_BOUNDARIES(
+            algorithm,
+            runner,
+            types.SimpleNamespace(),
+            [0],
+            [new_key.request_pool_idx],
+        )
     assert backend.region_state_cache.hit_count == 0
-    assert len(recomputes) == 1
-    assert not backend.region_state_cache.contains(old_key)
+    assert backend.region_state_cache.contains(old_key)

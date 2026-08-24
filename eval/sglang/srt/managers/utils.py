@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
+from sglang.srt.dllm.region.execution_spec import HybridBoundaryCommit
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import RoutedExpertsOutput
@@ -31,6 +32,7 @@ class GenerationBatchResult:
     accept_length_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
     mamba_track_commit_info: Optional[dict] = None
+    hybrid_boundary_commits: Optional[dict[int, HybridBoundaryCommit]] = None
 
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None

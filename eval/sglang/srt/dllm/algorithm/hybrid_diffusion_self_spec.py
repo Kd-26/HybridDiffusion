@@ -30,7 +30,6 @@ Config keys (passed via --dllm-algorithm-config YAML):
       top-k/top-p p/q. This is an experimental faster approximation.
 """
 
-import copy
 import hashlib
 import importlib.util
 import logging
@@ -60,7 +59,11 @@ from sglang.srt.dllm.config import (
     DllmConfig,
     SelfSpecVariant,
 )
-from sglang.srt.dllm.region.execution_spec import hash_positions, hash_token_ids
+from sglang.srt.dllm.region.execution_spec import (
+    HybridBoundaryCommit,
+    hash_positions,
+    hash_token_ids,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -407,6 +410,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             getattr(config, "strict_region_state_validation", True)
         )
         self._hybrid_state_keys: Dict[int, RegionStateKey] = {}
+        self._hybrid_boundary_commits: Dict[int, HybridBoundaryCommit] = {}
         self._exact_handoff_debug = (
             os.getenv("SGLANG_HYBRID_EXACT_HANDOFF_DEBUG", "0") == "1"
         )
@@ -504,6 +508,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         self._spec_draft_probs.pop(req_pool_idx, None)
         self._force_next_token.pop(req_pool_idx, None)
         self._mamba_track_commit_info.pop(req_pool_idx, None)
+        self._hybrid_boundary_commits.pop(req_pool_idx, None)
         key = self._hybrid_state_keys.pop(req_pool_idx, None)
         backend = getattr(self, "_configured_region_backend", None)
         if key is not None and backend is not None:
@@ -621,6 +626,10 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             "region_version": key.region_version,
             "token_hash": key.token_hash,
             "position_hash": key.position_hash,
+            "model_identity": key.model_identity,
+            "model_revision": key.model_revision,
+            "adapter_identity": key.adapter_identity,
+            "adapter_revision": key.adapter_revision,
             "attention_contract": key.attention_contract_id,
         }
 
@@ -672,6 +681,82 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         ):
             raise RuntimeError("recovery replay KV locations are not canonical")
         return locations
+
+    @staticmethod
+    def _validate_recovery_forward_batch(
+        replay: ForwardBatch,
+        model_runner: ModelRunner,
+        key: RegionStateKey,
+        mamba_idx: int,
+    ) -> None:
+        """Fail before CUDA launch if a recovery causal-prefill is inconsistent."""
+        locations = replay.out_cache_loc
+        pool_size = int(model_runner.token_to_kv_pool.size)
+        checks = (
+            (replay.batch_size == 1, "recovery batch_size must be one"),
+            (replay.input_ids.numel() == key.boundary, "input length mismatch"),
+            (replay.positions.numel() == key.boundary, "position length mismatch"),
+            (replay.req_pool_indices.numel() == 1, "request index mismatch"),
+            (replay.seq_lens.numel() == 1, "sequence metadata mismatch"),
+            (int(replay.seq_lens[0].item()) == key.boundary, "sequence length mismatch"),
+            (replay.seq_lens_sum == key.boundary, "sequence sum mismatch"),
+            (replay.extend_num_tokens == key.boundary, "extend token mismatch"),
+            (
+                replay.extend_seq_lens.numel() == 1
+                and int(replay.extend_seq_lens[0].item()) == key.boundary,
+                "GPU extend length mismatch",
+            ),
+            (
+                replay.extend_prefix_lens.numel() == 1
+                and int(replay.extend_prefix_lens[0].item()) == 0,
+                "GPU extend prefix mismatch",
+            ),
+            (replay.extend_seq_lens_cpu == [key.boundary], "CPU extend mismatch"),
+            (replay.extend_prefix_lens_cpu == [0], "replay prefix must be zero"),
+            (
+                replay.dllm_request_token_counts == [key.boundary],
+                "dLLM token-count mismatch",
+            ),
+            (
+                replay.dllm_attn_mask_types_cpu
+                == [DLLM_ATTN_MASK_CAUSAL_PREFILL],
+                "recovery mask must describe one causal prefill",
+            ),
+            (
+                replay.dllm_attn_mask_types.numel() == 1
+                and int(replay.dllm_attn_mask_types[0].item())
+                == DLLM_ATTN_MASK_CAUSAL_PREFILL,
+                "GPU recovery mask mismatch",
+            ),
+            (locations.dtype == torch.int64, "KV locations must be int64"),
+            (locations.ndim == 1, "KV locations must be one-dimensional"),
+            (locations.is_contiguous(), "KV locations must be contiguous"),
+            (locations.numel() == key.boundary, "KV location count mismatch"),
+        )
+        for condition, message in checks:
+            if not condition:
+                raise RuntimeError(f"invalid recovery ForwardBatch: {message}")
+        if locations.numel() and not bool(
+            ((locations >= 0) & (locations < pool_size)).all().item()
+        ):
+            raise RuntimeError("invalid recovery ForwardBatch: KV location out of range")
+        request_pool_size = int(model_runner.req_to_token_pool.req_to_token.shape[0])
+        request_pool_idx = int(replay.req_pool_indices[0].item())
+        if request_pool_idx != key.request_pool_idx or not (
+            0 <= request_pool_idx < request_pool_size
+        ):
+            raise RuntimeError("invalid recovery ForwardBatch: request slot out of range")
+        mamba_cache = model_runner.req_to_token_pool.mamba_pool.mamba_cache
+        mamba_pool_size = int(mamba_cache.temporal.shape[1])
+        if not 0 <= int(mamba_idx) < mamba_pool_size:
+            raise RuntimeError("invalid recovery ForwardBatch: Mamba slot out of range")
+        mapped_mamba_idx = int(
+            model_runner.req_to_token_pool.req_index_to_mamba_index_mapping[
+                request_pool_idx
+            ].item()
+        )
+        if mapped_mamba_idx != int(mamba_idx):
+            raise RuntimeError("invalid recovery ForwardBatch: Mamba mapping mismatch")
 
     @staticmethod
     def _hybrid_kv_reference(
@@ -793,12 +878,21 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                     ),
                     current_mamba_slot=backend._current_mamba_slot(rpx),
                 )
-            # The region-state cache is authoritative.  The per-algorithm map is
-            # only an index used for cleanup and must never turn an existing
-            # requested snapshot into an unnecessary recovery replay.
+            # A differing indexed key is lifecycle divergence, not a cache
+            # miss. Preserve the committed snapshot for diagnosis and fail
+            # before any recovery kernel can obscure the model/scheduler bug.
             if current is not None and current != requested:
-                backend.region_state_cache.invalidate_key(current)
-                self._hybrid_state_keys.pop(rpx, None)
+                stored_fields = self._hybrid_key_log_fields(current)
+                requested_fields = self._hybrid_key_log_fields(requested)
+                logger.error(
+                    "Exact-prefix lifecycle divergence before restore: "
+                    "stored=%s requested=%s",
+                    json.dumps(stored_fields, sort_keys=True),
+                    json.dumps(requested_fields, sort_keys=True),
+                )
+                raise RuntimeError(
+                    "exact-prefix committed key differs from scheduler-requested key"
+                )
             lookup = backend.restore_region_state(
                 state_key=requested,
                 mamba_cache_idx=backend._current_mamba_slot(rpx),
@@ -885,33 +979,70 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             model_runner, key, device
         )
 
-        replay = copy.copy(forward_batch)
-        # DLLM_MIXED has extend semantics but is intentionally non-graphable;
-        # a variable-length recovery replay must never enter a captured block graph.
-        replay.forward_mode = ForwardMode.DLLM_MIXED
-        replay.batch_size = 1
-        replay.input_ids = torch.tensor(stable_tokens, dtype=torch.int64, device=device)
-        replay.req_pool_indices = forward_batch.req_pool_indices[bid : bid + 1]
-        replay.seq_lens = torch.tensor(
+        replay_input_ids = torch.tensor(
+            stable_tokens, dtype=torch.int64, device=device
+        )
+        replay_req_pool_indices = (
+            forward_batch.req_pool_indices[bid : bid + 1]
+            .detach()
+            .clone()
+            .contiguous()
+        )
+        replay_seq_lens = torch.tensor(
             [key.boundary], dtype=forward_batch.seq_lens.dtype, device=device
         )
-        replay.seq_lens_cpu = torch.tensor([key.boundary], dtype=torch.int64)
-        replay.orig_seq_lens = replay.seq_lens.to(dtype=torch.int32)
-        replay.seq_lens_sum = key.boundary
-        replay.out_cache_loc = replay_locations
-        replay.out_cache_loc_swa = None
-        replay.positions = torch.arange(
-            key.boundary, dtype=forward_batch.positions.dtype, device=device
+        replay_positions = torch.arange(
+            key.boundary,
+            dtype=(
+                forward_batch.positions.dtype
+                if forward_batch.positions is not None
+                else torch.int64
+            ),
+            device=device,
         )
-        replay.extend_num_tokens = key.boundary
-        replay.extend_seq_lens = torch.tensor(
+        replay_extend_seq_lens = torch.tensor(
             [key.boundary], dtype=torch.int32, device=device
         )
-        replay.extend_prefix_lens = torch.zeros(1, dtype=torch.int32, device=device)
-        replay.extend_start_loc = torch.zeros(1, dtype=torch.int32, device=device)
-        replay.extend_seq_lens_cpu = [key.boundary]
-        replay.extend_prefix_lens_cpu = [0]
-        replay.extend_logprob_start_lens_cpu = None
+        replay_extend_prefix_lens = torch.zeros(
+            1, dtype=torch.int32, device=device
+        )
+        replay_extend_start_loc = torch.zeros(
+            1, dtype=torch.int32, device=device
+        )
+        replay_lora_ids = (
+            [forward_batch.lora_ids[bid]]
+            if getattr(forward_batch, "lora_ids", None) is not None
+            else None
+        )
+        # Construct a new dataclass so active-decode tensors, graph buffers,
+        # attention metadata and mutable per-request lists cannot leak into the
+        # recovery causal-prefill.
+        replay = ForwardBatch(
+            forward_mode=ForwardMode.DLLM_MIXED,
+            batch_size=1,
+            input_ids=replay_input_ids,
+            req_pool_indices=replay_req_pool_indices,
+            seq_lens=replay_seq_lens,
+            out_cache_loc=replay_locations,
+            seq_lens_sum=key.boundary,
+            orig_seq_lens=replay_seq_lens.to(dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([key.boundary], dtype=torch.int64),
+            positions=replay_positions,
+            extend_num_tokens=key.boundary,
+            extend_seq_lens=replay_extend_seq_lens,
+            extend_prefix_lens=replay_extend_prefix_lens,
+            extend_start_loc=replay_extend_start_loc,
+            extend_prefix_lens_cpu=[0],
+            extend_seq_lens_cpu=[key.boundary],
+            lora_ids=replay_lora_ids,
+            req_to_token_pool=model_runner.req_to_token_pool,
+            token_to_kv_pool=model_runner.token_to_kv_pool,
+            attn_backend=model_runner.attn_backend,
+            capture_hidden_mode=getattr(
+                forward_batch, "capture_hidden_mode", None
+            ),
+            global_forward_mode=ForwardMode.DLLM_MIXED,
+        )
         replay.dllm_request_token_counts = [key.boundary]
         replay.dllm_attn_mask_types_cpu = [DLLM_ATTN_MASK_CAUSAL_PREFILL]
         replay.dllm_attn_mask_types = torch.tensor(
@@ -940,11 +1071,12 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         replay.dllm_mamba_track_indices_cpu = None
         replay.dllm_mamba_track_steps_cpu = None
         replay.dllm_mamba_track_boundaries_cpu = None
-        if getattr(forward_batch, "lora_ids", None) is not None:
-            replay.lora_ids = [forward_batch.lora_ids[bid]]
         if self.conditional_lora and getattr(replay, "lora_ids", None) is not None:
             replay.lora_segment_ids = [None]
             replay.lora_segment_lens_cpu = [key.boundary]
+        self._validate_recovery_forward_batch(
+            replay, model_runner, key, mamba_idx
+        )
         lora_manager = getattr(model_runner, "lora_manager", None)
         primary_exception = None
         try:
@@ -1004,7 +1136,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         req_pool_indices_cpu: List[int],
         decode_bids: List[int],
         advances: List[int],
-        accepted_tokens: List[List[int]],
+        committed_tokens: List[List[int]],
     ) -> None:
         if not self.exact_prefix_handoff or not decode_bids:
             return
@@ -1021,12 +1153,24 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             if stable_tokens_by_request is None:
                 raise RuntimeError("accepted-state commit is missing stable token IDs")
             stable_tokens = list(stable_tokens_by_request[bid])
+            if (
+                len(stable_tokens) != old_key.boundary
+                or hash_token_ids(stable_tokens) != old_key.token_hash
+            ):
+                raise RuntimeError(
+                    "accepted-state commit origin does not match the sealed prefix"
+                )
+            committed_token_ids = tuple(committed_tokens[bid][:advance])
+            if len(committed_token_ids) != advance:
+                raise RuntimeError(
+                    "accepted-state commit does not contain committed_advance tokens"
+                )
             new_key = replace(
                 old_key,
                 region_version=old_key.region_version + 1,
                 boundary=new_boundary,
                 token_hash=hash_token_ids(
-                    stable_tokens + accepted_tokens[bid][:advance]
+                    stable_tokens + list(committed_token_ids)
                 ),
                 position_hash=hash_positions(0, new_boundary),
             )
@@ -1037,6 +1181,27 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             )
             backend.region_state_cache.invalidate_key(old_key)
             self._hybrid_state_keys[rpx] = new_key
+            self._hybrid_boundary_commits[rpx] = HybridBoundaryCommit(
+                request_id=new_key.request_id,
+                request_pool_idx=rpx,
+                request_slot_generation=new_key.request_slot_generation,
+                region_id=new_key.region_id,
+                previous_boundary=old_key.boundary,
+                previous_region_version=old_key.region_version,
+                previous_token_hash=old_key.token_hash,
+                previous_position_hash=old_key.position_hash,
+                committed_advance=advance,
+                committed_token_ids=committed_token_ids,
+                new_boundary=new_key.boundary,
+                new_region_version=new_key.region_version,
+                token_hash=new_key.token_hash,
+                position_hash=new_key.position_hash,
+                model_identity=new_key.model_identity,
+                model_revision=new_key.model_revision,
+                adapter_identity=new_key.adapter_identity,
+                adapter_revision=new_key.adapter_revision,
+                attention_contract_id=new_key.attention_contract_id,
+            )
 
     def _get_gdn_layer(self, model_runner, layer_id):
         """Get the RadixLinearAttention layer for a GDN layer_id.
@@ -1151,6 +1316,9 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         forward_batch: ForwardBatch,
         overlap_fn=None,
     ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
+        # Result-scoped handoff publications must never leak into a later
+        # scheduler result when the algorithm object is reused.
+        self._hybrid_boundary_commits.clear()
         if self._timing_enabled:
             _t_run_start = time.perf_counter()
         batch_size = forward_batch.batch_size
@@ -2071,6 +2239,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
 
         # ── Step 4: Assemble outputs ──────────────────────────────
         next_token_ids_list = []
+        committed_token_ids_by_bid = [[] for _ in range(batch_size)]
         output_token_modes = [[] for _ in range(batch_size)]
         kv_offset = 0
         trace_records: List[Dict[str, Any]] = []
@@ -2131,6 +2300,9 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 else:
                     out_pre = list(specs[:si])
                 output_tokens = out_pre + [ct]
+                committed_token_ids_by_bid[bid] = [t0_tokens[bid]] + list(
+                    specs[:si]
+                )
                 output_token_modes[bid] = [False] * len(out_pre) + [True]
                 dllm_tokens = [t0_tokens[bid]] + out_pre + [ct]
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
@@ -2180,6 +2352,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 else:
                     out_specs = list(specs)
                 output_tokens = out_specs + [clean_token]
+                committed_token_ids_by_bid[bid] = [t0_tokens[bid]] + list(specs)
                 output_token_modes[bid] = [False] * len(out_specs) + [True]
                 dllm_tokens = [t0_tokens[bid]] + out_specs + [clean_token]
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
@@ -2229,6 +2402,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                     output_tokens = [clean_token]
                 else:
                     output_tokens = [t0, clean_token]
+                committed_token_ids_by_bid[bid] = [t0]
                 output_token_modes[bid] = [True] * len(output_tokens)
                 dllm_tokens = [t0, clean_token] + new_spec_tokens
                 dllm_tokens += [self.mask_id] * (blk - len(dllm_tokens))
@@ -2422,7 +2596,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
             req_pool_indices_cpu,
             decode_bids,
             advances,
-            next_token_ids_list,
+            committed_token_ids_by_bid,
         )
         if self._timing_enabled:
             _t_phase4_gdn_commit = time.perf_counter()

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.region.execution_spec import (
+    HybridBoundaryCommit,
     hash_positions,
     hash_token_ids,
 )
@@ -71,7 +72,7 @@ class SchedulerDllmMixin:
 
     @staticmethod
     def _advance_hybrid_boundary(req: Req, accepted_tokens: List[int]) -> None:
-        """Publish a new scheduler spec only for tokens actually consumed."""
+        """Legacy non-exact path; exact handoff uses model commit metadata."""
         spec = getattr(req, "hybrid_execution_spec", None)
         if spec is None or not accepted_tokens:
             return
@@ -101,6 +102,175 @@ class SchedulerDllmMixin:
         req.hybrid_cache_hit = True
         req.hybrid_restore_required = True
         req.hybrid_commit_required = False
+
+    @staticmethod
+    def _apply_hybrid_boundary_commit(
+        req: Req,
+        commit: Optional[HybridBoundaryCommit],
+        consumed_token_ids: List[int],
+    ) -> None:
+        """Publish exactly the stable-prefix state committed by the model."""
+        spec = getattr(req, "hybrid_execution_spec", None)
+        if spec is None:
+            return
+        if commit is None:
+            if consumed_token_ids:
+                raise RuntimeError(
+                    "exact prefix handoff emitted tokens without model commit metadata"
+                )
+            return
+
+        current = {
+            "request_id": str(req.rid),
+            "request_pool_idx": int(req.req_pool_idx),
+            "request_slot_generation": int(req.hybrid_request_slot_generation),
+            "region_id": spec.region_ids[0],
+            "boundary": spec.ar_boundary,
+            "region_version": spec.region_versions[0],
+            "token_hash": req.hybrid_token_hash,
+            "position_hash": req.hybrid_position_hash,
+            "model_identity": req.hybrid_model_identity,
+            "model_revision": req.hybrid_model_revision,
+            "adapter_identity": str(getattr(req, "lora_id", "") or ""),
+            "adapter_revision": req.hybrid_adapter_revision,
+            "attention_contract_id": spec.attention_contract_id,
+        }
+        expected = {
+            "request_id": commit.request_id,
+            "request_pool_idx": commit.request_pool_idx,
+            "request_slot_generation": commit.request_slot_generation,
+            "region_id": commit.region_id,
+            "boundary": commit.previous_boundary,
+            "region_version": commit.previous_region_version,
+            "token_hash": commit.previous_token_hash,
+            "position_hash": commit.previous_position_hash,
+            "model_identity": commit.model_identity,
+            "model_revision": commit.model_revision,
+            "adapter_identity": commit.adapter_identity,
+            "adapter_revision": commit.adapter_revision,
+            "attention_contract_id": commit.attention_contract_id,
+        }
+        if current != expected:
+            logger.error(
+                "Exact-prefix scheduler/model origin mismatch: current=%s expected=%s",
+                current,
+                expected,
+            )
+            raise RuntimeError(
+                "exact-prefix scheduler state does not match model commit origin"
+            )
+
+        committed_ids = list(commit.committed_token_ids)
+        request_stream = list(req.origin_input_ids) + list(req.output_ids)
+        observed_committed_ids = request_stream[
+            commit.previous_boundary : commit.new_boundary
+        ]
+        if observed_committed_ids != committed_ids:
+            if req.finished() and len(request_stream) < commit.new_boundary:
+                # The request terminates before the model's whole committed span
+                # is externally consumed. Cleanup invalidates that model state;
+                # never publish un-emitted tokens as a stable scheduler prefix.
+                req.hybrid_restore_required = False
+                req.hybrid_commit_required = False
+                return
+            raise RuntimeError(
+                "request stream does not match model committed token IDs: "
+                f"observed={observed_committed_ids} committed={committed_ids}"
+            )
+
+        new_spec = spec.advance_boundary(
+            commit.new_boundary,
+            sequence_length=commit.new_boundary + req.dllm_config.block_size,
+        )
+        if new_spec.region_versions[0] != commit.new_region_version:
+            raise RuntimeError("model and scheduler region versions diverged")
+        req.hybrid_execution_spec = new_spec
+        req.hybrid_token_hash = commit.token_hash
+        req.hybrid_position_hash = commit.position_hash
+        req.hybrid_region_state_key = (
+            commit.request_id,
+            commit.region_id,
+            commit.new_region_version,
+            commit.new_boundary,
+            commit.token_hash,
+            commit.position_hash,
+            commit.model_identity,
+            commit.model_revision,
+            commit.adapter_identity,
+            commit.adapter_revision,
+            commit.attention_contract_id,
+        )
+        req.hybrid_prefix_sealed = True
+        req.hybrid_cache_hit = True
+        req.hybrid_restore_required = True
+        req.hybrid_commit_required = False
+        published = {
+            "request_id": str(req.rid),
+            "request_pool_idx": int(req.req_pool_idx),
+            "request_slot_generation": int(req.hybrid_request_slot_generation),
+            "region_id": new_spec.region_ids[0],
+            "boundary": new_spec.ar_boundary,
+            "region_version": new_spec.region_versions[0],
+            "token_hash": req.hybrid_token_hash,
+            "position_hash": req.hybrid_position_hash,
+            "model_identity": req.hybrid_model_identity,
+            "model_revision": req.hybrid_model_revision,
+            "adapter_identity": str(getattr(req, "lora_id", "") or ""),
+            "adapter_revision": req.hybrid_adapter_revision,
+            "attention_contract_id": new_spec.attention_contract_id,
+        }
+        committed = {
+            "request_id": commit.request_id,
+            "request_pool_idx": commit.request_pool_idx,
+            "request_slot_generation": commit.request_slot_generation,
+            "region_id": commit.region_id,
+            "boundary": commit.new_boundary,
+            "region_version": commit.new_region_version,
+            "token_hash": commit.token_hash,
+            "position_hash": commit.position_hash,
+            "model_identity": commit.model_identity,
+            "model_revision": commit.model_revision,
+            "adapter_identity": commit.adapter_identity,
+            "adapter_revision": commit.adapter_revision,
+            "attention_contract_id": commit.attention_contract_id,
+        }
+        if published != committed:
+            logger.error(
+                "Exact-prefix scheduler/model publication mismatch: "
+                "published=%s committed=%s",
+                published,
+                committed,
+            )
+            raise RuntimeError(
+                "scheduler-published key differs from model-committed key"
+            )
+
+    def _publish_hybrid_result_commit(
+        self: Scheduler,
+        req: Req,
+        result: GenerationBatchResult,
+        consumed_token_ids: List[int],
+    ) -> None:
+        if getattr(req, "hybrid_execution_spec", None) is None:
+            self._advance_hybrid_boundary(req, consumed_token_ids)
+            return
+        commits = getattr(result, "hybrid_boundary_commits", None) or {}
+        self._apply_hybrid_boundary_commit(
+            req,
+            commits.get(int(req.req_pool_idx)),
+            consumed_token_ids,
+        )
+
+    @staticmethod
+    def _hybrid_result_committed_advance(
+        result: GenerationBatchResult,
+        req_pool_idx: int,
+        fallback: Optional[int],
+    ) -> Optional[int]:
+        commit = (getattr(result, "hybrid_boundary_commits", None) or {}).get(
+            int(req_pool_idx)
+        )
+        return commit.committed_advance if commit is not None else fallback
 
     def _finalize_dllm_request_metrics(
         self: Scheduler, req: Req, dllm_algo, req_pool_idx: int
@@ -269,7 +439,9 @@ class SchedulerDllmMixin:
             else:
                 req.dllm_kv_valid_len = None
 
-            adv = advance_override.get(req_pool_idx)
+            adv = self._hybrid_result_committed_advance(
+                result, req_pool_idx, advance_override.get(req_pool_idx)
+            )
             if adv is not None:
                 req.dllm_next_advance = adv
             track_boundary = mamba_track_commit_info.get(req_pool_idx)
@@ -302,7 +474,9 @@ class SchedulerDllmMixin:
                     break
             if dllm_algo is not None:
                 dllm_algo.record_consumed_tokens(req_pool_idx, consumed_tokens)
-            self._advance_hybrid_boundary(req, consumed_token_ids)
+            self._publish_hybrid_result_commit(
+                req, result, consumed_token_ids
+            )
             if req.finished():
                 if dllm_algo is not None:
                     dllm_algo.cleanup_request(req_pool_idx)
@@ -404,7 +578,11 @@ class SchedulerDllmMixin:
                 else:
                     req.dllm_kv_valid_len = None
 
-                adv = advance_override.get(req.req_pool_idx)
+                adv = self._hybrid_result_committed_advance(
+                    result,
+                    req.req_pool_idx,
+                    advance_override.get(req.req_pool_idx),
+                )
                 if adv is not None:
                     req.dllm_next_advance = adv
                 track_boundary = mamba_track_commit_info.get(req.req_pool_idx)
@@ -443,7 +621,9 @@ class SchedulerDllmMixin:
                     dllm_algo.record_consumed_tokens(
                         req.req_pool_idx, consumed_tokens
                     )
-                self._advance_hybrid_boundary(req, consumed_token_ids)
+                self._publish_hybrid_result_commit(
+                    req, result, consumed_token_ids
+                )
                 if req.finished():
                     if dllm_algo is not None:
                         dllm_algo.cleanup_request(req.req_pool_idx)

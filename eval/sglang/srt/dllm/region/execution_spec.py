@@ -11,6 +11,61 @@ from typing import Any, Mapping, Tuple
 HYBRID_ATTENTION_CONTRACT_V1 = "causal_prefix_diffusion_suffix_v1"
 
 
+@dataclass(frozen=True)
+class HybridBoundaryCommit:
+    """Immutable model-produced publication of one stable-prefix advance."""
+
+    request_id: str
+    request_pool_idx: int
+    request_slot_generation: int
+    region_id: str
+    previous_boundary: int
+    previous_region_version: int
+    previous_token_hash: str
+    previous_position_hash: str
+    committed_advance: int
+    committed_token_ids: Tuple[int, ...]
+    new_boundary: int
+    new_region_version: int
+    token_hash: str
+    position_hash: str
+    model_identity: str
+    model_revision: str
+    adapter_identity: str
+    adapter_revision: str
+    attention_contract_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "committed_token_ids",
+            tuple(int(token_id) for token_id in self.committed_token_ids),
+        )
+        if not self.request_id or not self.region_id:
+            raise ValueError("hybrid boundary commit identity must be nonempty")
+        if self.request_pool_idx < 0 or self.request_slot_generation < 0:
+            raise ValueError("hybrid boundary commit slot identity is invalid")
+        if self.previous_boundary < 0 or self.previous_region_version < 0:
+            raise ValueError("hybrid boundary commit origin is invalid")
+        if self.committed_advance <= 0:
+            raise ValueError("hybrid boundary commit must advance at least one token")
+        if len(self.committed_token_ids) != self.committed_advance:
+            raise ValueError("committed token count must equal committed_advance")
+        if self.new_boundary != self.previous_boundary + self.committed_advance:
+            raise ValueError("hybrid boundary commit has inconsistent boundary")
+        if self.new_region_version != self.previous_region_version + 1:
+            raise ValueError("hybrid boundary commit has inconsistent version")
+        if (
+            not self.previous_token_hash
+            or not self.previous_position_hash
+            or not self.token_hash
+            or not self.position_hash
+        ):
+            raise ValueError("hybrid boundary commit hashes must be nonempty")
+        if self.attention_contract_id != HYBRID_ATTENTION_CONTRACT_V1:
+            raise ValueError("hybrid boundary commit attention contract is invalid")
+
+
 def hash_token_ids(token_ids) -> str:
     digest = hashlib.sha256()
     for token_id in token_ids:

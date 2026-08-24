@@ -486,6 +486,9 @@ class TpModelWorker(BaseTpWorker):
             mamba_track_commit_info=dict(
                 getattr(self.dllm_algorithm, "_mamba_track_commit_info", {})
             ),
+            hybrid_boundary_commits=dict(
+                getattr(self.dllm_algorithm, "_hybrid_boundary_commits", {})
+            ),
         )
 
     def forward_batch_generation(
