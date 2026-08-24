@@ -405,6 +405,37 @@ def test_unsupported_or_ambiguous_checkpoint_scale_fails_closed(runner):
         MODULE.infer_model_scale(runner)
 
 
+def test_trace_tensor_snapshot_is_detached_contiguous_cpu_copy():
+    source = torch.arange(12.0, requires_grad=True).reshape(3, 4).transpose(0, 1)
+    snapshot = MODULE._trace_tensor_to_cpu(source)
+
+    assert snapshot.device.type == "cpu"
+    assert snapshot.is_contiguous()
+    assert snapshot.requires_grad is False
+    assert snapshot.data_ptr() != source.data_ptr()
+    expected = snapshot.clone()
+    with torch.no_grad():
+        source.add_(100)
+    assert torch.equal(snapshot, expected)
+
+
+def test_chunked_max_abs_preserves_fp32_definition(monkeypatch):
+    monkeypatch.setattr(MODULE, "MAX_COMPARE_CHUNK_ELEMENTS", 2)
+    left = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0], dtype=torch.bfloat16)
+    right = torch.tensor([0.0, 1.5, 2.0, -5.0, 4.0], dtype=torch.bfloat16)
+
+    assert MODULE._max_abs(left, right) == 8.0
+
+
+def test_chunked_max_abs_rejects_nonfinite_value_in_later_chunk(monkeypatch):
+    monkeypatch.setattr(MODULE, "MAX_COMPARE_CHUNK_ELEMENTS", 2)
+    left = torch.tensor([0.0, 1.0, 2.0, float("nan")])
+    right = torch.zeros(4)
+
+    with pytest.raises(RuntimeError, match="NaN or Inf"):
+        MODULE._max_abs(left, right)
+
+
 class RealisticAttentionLayer(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -475,6 +506,24 @@ def test_real_qwen_attention_method_uses_qkv_projection_rows():
         assert snapshot["rows"]["mlp"] == [13]
         assert snapshot["rows"]["gdn"] == []
     assert hooks.released
+    assert_no_registered_hooks(layer)
+
+
+def test_hook_snapshot_offloads_evidence_and_releases_source_references():
+    layer = RealisticAttentionLayer()
+    source_hidden = torch.arange(6.0).reshape(2, 3)
+    source_gdn = torch.arange(4.0)
+    with MODULE.ScopedRowHooks(fake_runner(layer)) as hooks:
+        hooks.hidden = {0: source_hidden}
+        hooks.gdn_states = {0: (source_gdn,)}
+        snapshot = hooks.snapshot()
+
+        assert snapshot["hidden"][0].device.type == "cpu"
+        assert snapshot["gdn_states"][0][0].device.type == "cpu"
+        assert snapshot["hidden"][0].data_ptr() != source_hidden.data_ptr()
+        assert snapshot["gdn_states"][0][0].data_ptr() != source_gdn.data_ptr()
+        assert hooks.hidden == {}
+        assert hooks.gdn_states == {}
     assert_no_registered_hooks(layer)
 
 

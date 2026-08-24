@@ -50,6 +50,14 @@ test/model layers remain compatible only when `self_attention` is itself an
 actual `torch.nn.Module`. The hooks are removed on both successful and
 exceptional exits.
 
+After each synchronized forward, full logits and per-layer hidden/GDN evidence
+are copied into independent contiguous CPU tensors and the hook-owned CUDA
+references are released. Numerical comparison converts bounded tensor chunks
+to FP32, so full-vocabulary logits do not create several full-size CUDA
+temporaries. This changes only validation evidence storage: model execution,
+cache allocation, BF16 computation, hashes, top-1 checks, and numerical
+thresholds remain unchanged.
+
 For each case, the validator performs two executions with identical weights,
 tokens, positions, masks, dtype, and diffusion inputs:
 

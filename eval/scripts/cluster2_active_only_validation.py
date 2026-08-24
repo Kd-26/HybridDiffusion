@@ -30,6 +30,7 @@ SCHEMA_VERSION = 1
 ARTIFACT_TYPE = "cluster2_active_only_validation"
 RUNTIME_BASE_REVISION = "1e21bdec792a665419b290bf89f75c14c730dc94"
 NUMERICAL_TOLERANCE = 1e-2
+MAX_COMPARE_CHUNK_ELEMENTS = 1 << 20
 DEFAULT_SEED = 20260825
 ATTENTION_ROW_OBSERVATION_POINT = "qkv_projection_input"
 QWEN35_2B_FINGERPRINT = {
@@ -599,6 +600,14 @@ def _tensor_rows(inputs: tuple[Any, ...], kwargs: Mapping[str, Any]) -> int:
     raise RuntimeError("row hook did not receive a hidden-state tensor")
 
 
+def _trace_tensor_to_cpu(value: Any) -> Any:
+    """Copy validator evidence off CUDA without retaining its source storage."""
+    torch = __import__("torch")
+    if not torch.is_tensor(value):
+        raise TypeError("trace evidence must be a torch tensor")
+    return value.detach().to(device="cpu", copy=True).contiguous()
+
+
 class ScopedRowHooks:
     """Test-local model hooks that are removed on every exit path."""
 
@@ -726,11 +735,21 @@ class ScopedRowHooks:
             self.capturing = False
 
     def snapshot(self) -> dict[str, Any]:
-        return {
+        snapshot = {
             "rows": {name: list(values) for name, values in self.rows.items()},
-            "hidden": {key: value for key, value in self.hidden.items()},
-            "gdn_states": {key: value for key, value in self.gdn_states.items()},
+            "hidden": {
+                key: _trace_tensor_to_cpu(value) for key, value in self.hidden.items()
+            },
+            "gdn_states": {
+                key: tuple(_trace_tensor_to_cpu(value) for value in values)
+                for key, values in self.gdn_states.items()
+            },
         }
+        # Do not let the hook object retain CUDA evidence between paired
+        # forwards. The returned snapshot owns independent CPU copies.
+        self.hidden.clear()
+        self.gdn_states.clear()
+        return snapshot
 
     def close(self) -> None:
         self.capturing = False
@@ -780,11 +799,33 @@ def _max_abs(left: Any, right: Any) -> float:
         raise RuntimeError(
             f"paired tensor shape mismatch: {left.shape} != {right.shape}"
         )
-    if not bool(torch.isfinite(left.float()).all().item()) or not bool(
-        torch.isfinite(right.float()).all().item()
-    ):
-        raise RuntimeError("paired tensor contains NaN or Inf")
-    return float((left.float() - right.float()).abs().max().item())
+    if left.device != right.device:
+        raise RuntimeError(
+            f"paired tensor device mismatch: {left.device} != {right.device}"
+        )
+    if int(left.numel()) == 0:
+        raise RuntimeError("paired tensor is empty")
+
+    left_flat = left.reshape(-1)
+    right_flat = right.reshape(-1)
+    maximum = 0.0
+    # Full-vocabulary logits can be hundreds of MiB. Converting both complete
+    # tensors to FP32 at once creates several equally large temporaries. Work
+    # in bounded chunks while preserving the exact maximum-absolute-error
+    # definition and finite-value validation.
+    for start in range(0, int(left_flat.numel()), MAX_COMPARE_CHUNK_ELEMENTS):
+        stop = min(start + MAX_COMPARE_CHUNK_ELEMENTS, int(left_flat.numel()))
+        left_chunk = left_flat[start:stop].float()
+        right_chunk = right_flat[start:stop].float()
+        if not bool(torch.isfinite(left_chunk).all().item()) or not bool(
+            torch.isfinite(right_chunk).all().item()
+        ):
+            raise RuntimeError("paired tensor contains NaN or Inf")
+        maximum = max(
+            maximum,
+            float((left_chunk - right_chunk).abs().max().item()),
+        )
+    return maximum
 
 
 def _position_evidence(values: Sequence[int]) -> dict[str, Any]:
@@ -1022,10 +1063,11 @@ class Cluster2ValidationRuntime:
             logits = self.runtime._forward(forward_batch, metadata_prepared=True)
         self.runtime._synchronize()
         trace = hooks.snapshot()
+        top1 = logits.argmax(dim=-1)
         trace.update(
-            logits=logits.detach().clone(),
-            top1=logits.argmax(dim=-1).detach().clone(),
-            positions=forward_batch.positions.detach().clone(),
+            logits=_trace_tensor_to_cpu(logits),
+            top1=_trace_tensor_to_cpu(top1),
+            positions=_trace_tensor_to_cpu(forward_batch.positions),
             scheduled_rows=int(forward_batch.input_ids.numel()),
             kv_lengths=[int(value) for value in forward_batch.seq_lens.tolist()],
         )
