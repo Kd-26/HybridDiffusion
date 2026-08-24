@@ -42,7 +42,13 @@ count is expected and is not stable-prefix recomputation.
 for `one1`, `smoke16`, and `paper100`. It loads one native-BF16, TP=1 runtime
 and installs temporary observation hooks only around proof collection. The
 hooks observe attention, MLP, GDN, and transformer row counts and clone bounded
-active outputs. They are removed on both successful and exceptional exits.
+active outputs. `attention_query_rows_per_layer` is observed at
+`qkv_projection_input`: every input hidden row to a full-attention layer's real
+`qkv_proj` module produces exactly one corresponding query row. Qwen3.5's
+bound `self_attention` helper method is not treated as a hookable module. Older
+test/model layers remain compatible only when `self_attention` is itself an
+actual `torch.nn.Module`. The hooks are removed on both successful and
+exceptional exits.
 
 For each case, the validator performs two executions with identical weights,
 tokens, positions, masks, dtype, and diffusion inputs:

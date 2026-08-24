@@ -217,44 +217,132 @@ def test_tp_size_other_than_one_is_rejected():
         )
 
 
-class FakeLayer(torch.nn.Module):
+class RealisticAttentionLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.qkv_proj = torch.nn.Identity()
+        self.mlp = torch.nn.Identity()
+
+    def self_attention(self, hidden_states):
+        return hidden_states
+
+
+class LegacyAttentionLayer(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.self_attention = torch.nn.Identity()
         self.mlp = torch.nn.Identity()
 
 
-class FakeModel(torch.nn.Module):
+class FakeGDNLayer(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.layers = torch.nn.ModuleList([FakeLayer()])
+        self.linear_attn = torch.nn.Identity()
+        self.mlp = torch.nn.Identity()
 
 
-def fake_runner():
+class UnclassifiedLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mlp = torch.nn.Identity()
+
+
+class FakeModel(torch.nn.Module):
+    def __init__(self, layer):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([layer])
+
+
+def fake_runner(layer=None):
+    layer = layer or LegacyAttentionLayer()
     return type(
         "Runner",
         (),
         {
-            "model": FakeModel(),
+            "model": FakeModel(layer),
             "req_to_token_pool": type("Pool", (), {"mamba_map": {}})(),
         },
     )()
 
 
+def assert_no_registered_hooks(layer):
+    assert not layer._forward_hooks
+    for name in ("qkv_proj", "self_attention", "linear_attn", "mlp"):
+        module = getattr(layer, name, None)
+        if isinstance(module, torch.nn.Module):
+            assert not module._forward_pre_hooks
+
+
+def test_real_qwen_attention_method_uses_qkv_projection_rows():
+    layer = RealisticAttentionLayer()
+    assert callable(layer.self_attention)
+    assert not isinstance(layer.self_attention, torch.nn.Module)
+    inputs = torch.zeros((13, 8))
+    with MODULE.ScopedRowHooks(fake_runner(layer)) as hooks:
+        with hooks.capture([]):
+            layer.qkv_proj(inputs)
+            layer.mlp(inputs)
+        snapshot = hooks.snapshot()
+        assert snapshot["rows"]["attention"] == [13]
+        assert snapshot["rows"]["mlp"] == [13]
+        assert snapshot["rows"]["gdn"] == []
+    assert hooks.released
+    assert_no_registered_hooks(layer)
+
+
+def test_gdn_layer_records_linear_attention_rows():
+    layer = FakeGDNLayer()
+    inputs = torch.zeros((17, 8))
+    with MODULE.ScopedRowHooks(fake_runner(layer)) as hooks:
+        with hooks.capture([]):
+            layer.linear_attn(inputs)
+            layer.mlp(inputs)
+        snapshot = hooks.snapshot()
+        assert snapshot["rows"]["gdn"] == [17]
+        assert snapshot["rows"]["mlp"] == [17]
+        assert snapshot["rows"]["attention"] == []
+    assert_no_registered_hooks(layer)
+
+
+def test_legacy_module_self_attention_remains_supported():
+    layer = LegacyAttentionLayer()
+    inputs = torch.zeros((5, 8))
+    with MODULE.ScopedRowHooks(fake_runner(layer)) as hooks:
+        with hooks.capture([]):
+            layer.self_attention(inputs)
+        assert hooks.snapshot()["rows"]["attention"] == [5]
+    assert_no_registered_hooks(layer)
+
+
+def test_unclassified_layer_fails_closed_and_removes_partial_hooks():
+    layer = UnclassifiedLayer()
+    with pytest.raises(
+        RuntimeError, match="layer 0 has no hookable full-attention projection"
+    ):
+        MODULE.ScopedRowHooks(fake_runner(layer))
+    assert_no_registered_hooks(layer)
+
+
 def test_scoped_hooks_removed_after_success():
-    hooks = MODULE.ScopedRowHooks(fake_runner())
+    layer = LegacyAttentionLayer()
+    hooks = MODULE.ScopedRowHooks(fake_runner(layer))
     assert hooks.handles
     with hooks:
         pass
     assert hooks.released
+    assert_no_registered_hooks(layer)
 
 
 def test_scoped_hooks_removed_after_exception():
-    hooks = MODULE.ScopedRowHooks(fake_runner())
+    layer = LegacyAttentionLayer()
+    hooks = MODULE.ScopedRowHooks(fake_runner(layer))
     with pytest.raises(RuntimeError, match="primary"):
         with hooks:
-            raise RuntimeError("primary")
+            with hooks.capture([]):
+                layer.self_attention(torch.zeros((3, 8)))
+                raise RuntimeError("primary")
     assert hooks.released
+    assert_no_registered_hooks(layer)
 
 
 def _git(cwd, *args):

@@ -31,6 +31,7 @@ ARTIFACT_TYPE = "cluster2_active_only_validation"
 RUNTIME_BASE_REVISION = "1e21bdec792a665419b290bf89f75c14c730dc94"
 NUMERICAL_TOLERANCE = 1e-2
 DEFAULT_SEED = 20260825
+ATTENTION_ROW_OBSERVATION_POINT = "qkv_projection_input"
 ROOT = Path(__file__).resolve().parents[2]
 CLUSTER1_PATH = Path(__file__).with_name("cluster1_exact_handoff_trace.py")
 
@@ -607,28 +608,53 @@ class ScopedRowHooks:
         model = self.cluster1.ModelTraceHooks._language_model(model_runner.model)
         self.num_layers = len(model.layers)
         self.mamba_map = getattr(model_runner.req_to_token_pool, "mamba_map", {})
+        torch = __import__("torch")
+        nn = torch.nn
         try:
             for layer_id, layer in enumerate(model.layers):
+                if not isinstance(layer, nn.Module):
+                    raise RuntimeError(
+                        f"layer {layer_id} is not a hookable torch.nn.Module"
+                    )
                 self.handles.append(
                     layer.register_forward_hook(self._layer_output_hook(layer_id))
                 )
+
+                mlp_module = getattr(layer, "mlp", None)
+                if not isinstance(mlp_module, nn.Module):
+                    raise RuntimeError(f"layer {layer_id} has no hookable MLP module")
                 self.handles.append(
-                    layer.mlp.register_forward_pre_hook(
+                    mlp_module.register_forward_pre_hook(
                         self._row_hook("mlp"), with_kwargs=True
                     )
                 )
-                if hasattr(layer, "self_attention"):
+
+                gdn_module = getattr(layer, "linear_attn", None)
+                if isinstance(gdn_module, nn.Module):
                     self.handles.append(
-                        layer.self_attention.register_forward_pre_hook(
-                            self._row_hook("attention"), with_kwargs=True
-                        )
-                    )
-                if hasattr(layer, "linear_attn"):
-                    self.handles.append(
-                        layer.linear_attn.register_forward_pre_hook(
+                        gdn_module.register_forward_pre_hook(
                             self._row_hook("gdn"), with_kwargs=True
                         )
                     )
+                    continue
+
+                # Qwen3.5 self_attention is a bound helper method, not an
+                # nn.Module. qkv_proj is the real projection module and its
+                # input has one row for every generated attention query row.
+                attention_module = getattr(layer, "qkv_proj", None)
+                if not isinstance(attention_module, nn.Module):
+                    legacy_attention = getattr(layer, "self_attention", None)
+                    if isinstance(legacy_attention, nn.Module):
+                        attention_module = legacy_attention
+                if not isinstance(attention_module, nn.Module):
+                    raise RuntimeError(
+                        f"layer {layer_id} has no hookable full-attention projection"
+                    )
+                self.handles.append(
+                    attention_module.register_forward_pre_hook(
+                        self._row_hook("attention"), with_kwargs=True
+                    )
+                )
         except BaseException:
             self.close()
             raise
@@ -1161,6 +1187,7 @@ class Cluster2ValidationRuntime:
             "expected_active_tokens": case.expected_active_tokens,
             "stable_query_tokens": stable_query_tokens,
             "attention_query_rows_per_layer": attention_rows,
+            "attention_row_observation_point": ATTENTION_ROW_OBSERVATION_POINT,
             "total_kv_tokens_per_request": kv_lengths,
             "mlp_rows_per_layer": mlp_rows,
             "gdn_rows_per_layer": gdn_rows,
