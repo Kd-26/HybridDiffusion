@@ -489,6 +489,13 @@ class TpModelWorker(BaseTpWorker):
             hybrid_boundary_commits=dict(
                 getattr(self.dllm_algorithm, "_hybrid_boundary_commits", {})
             ),
+            hybrid_snapshot_publications=dict(
+                getattr(
+                    self.dllm_algorithm,
+                    "_hybrid_snapshot_publications",
+                    {},
+                )
+            ),
         )
 
     def forward_batch_generation(

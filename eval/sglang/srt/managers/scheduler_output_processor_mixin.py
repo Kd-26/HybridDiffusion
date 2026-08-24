@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -450,21 +449,7 @@ class SchedulerOutputProcessorMixin:
         )
 
         if not result.next_token_ids:
-            for req in batch.reqs:
-                self.tree_cache.cache_unfinished_req(req)
-                if req.is_dllm() and req.is_dllm_prefill():
-                    origin_len = len(req.origin_input_ids)
-                    cached_len = (
-                        len(req.prefix_indices) if req.prefix_indices is not None else 0
-                    )
-                    if cached_len >= origin_len:
-                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
-                        req.dllm_next_advance = origin_len
-                        req._inline_prefill = False
-                        if req.hybrid_execution_spec is not None:
-                            req.hybrid_prefix_sealed = True
-                            req.hybrid_cache_hit = True
-                            req.hybrid_restore_required = True
+            self._process_empty_dllm_prefill_result(batch, result)
 
         kv_gpu_parts = []
         kv_cpu_parts = []
@@ -508,13 +493,7 @@ class SchedulerOutputProcessorMixin:
                         len(req.prefix_indices) if req.prefix_indices is not None else 0
                     )
                     if cached_len >= origin_len:
-                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
-                        req.dllm_next_advance = origin_len
-                        req._inline_prefill = False
-                        if req.hybrid_execution_spec is not None:
-                                req.hybrid_prefix_sealed = True
-                                req.hybrid_cache_hit = True
-                                req.hybrid_restore_required = True
+                        self._complete_dllm_prefill(req, result)
                 continue
 
             self.num_generated_tokens += len(next_token_ids)

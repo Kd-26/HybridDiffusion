@@ -16,6 +16,7 @@ ROOT = Path(__file__).parents[1]
 ALGORITHM_PATH = ROOT / "eval/sglang/srt/dllm/algorithm/hybrid_diffusion_self_spec.py"
 CACHE_PATH = ROOT / "eval/sglang/srt/mem_cache/region_state_cache.py"
 EXECUTION_SPEC_PATH = ROOT / "eval/sglang/srt/dllm/region/execution_spec.py"
+SCHEDULER_PATH = ROOT / "eval/sglang/srt/dllm/mixin/scheduler.py"
 
 
 def _load_module(name, path):
@@ -67,17 +68,59 @@ def _algorithm_method(name):
     return namespace[name]
 
 
+def _class_method(path, class_name, method_name, namespace):
+    source = ast.parse(path.read_text())
+    class_node = next(
+        node
+        for node in source.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    function = copy.deepcopy(
+        next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == method_name
+        )
+    )
+    function.decorator_list = []
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[method_name]
+
+
 CANONICAL_REPLAY_LOCATIONS = _algorithm_method("_canonical_replay_kv_locations")
 SNAPSHOT_BOUNDARIES = _algorithm_method("_snapshot_hybrid_boundaries")
 RESTORE_BOUNDARIES = _algorithm_method("_restore_hybrid_boundaries")
 RECOMPUTE_BOUNDARY = _algorithm_method("_recompute_hybrid_boundary")
 VALIDATE_RECOVERY_BATCH = _algorithm_method("_validate_recovery_forward_batch")
+COMPLETE_PREFILL = _class_method(
+    SCHEDULER_PATH,
+    "SchedulerDllmMixin",
+    "_complete_dllm_prefill",
+    {
+        "DllmReqPhase": types.SimpleNamespace(STAGING_DECODE="staging_decode"),
+        "GenerationBatchResult": object,
+        "Req": object,
+        "logger": logging.getLogger(__name__),
+    },
+)
+PROCESS_EMPTY_PREFILL = _class_method(
+    SCHEDULER_PATH,
+    "SchedulerDllmMixin",
+    "_process_empty_dllm_prefill_result",
+    {
+        "GenerationBatchResult": object,
+        "Req": object,
+        "ScheduleBatch": object,
+        "Scheduler": object,
+    },
+)
 
 
-def _make_key(*, generation=11, boundary=4):
+def _make_key(*, generation=11, boundary=4, request_id="request-a"):
     tokens = list(range(boundary))
     return CACHE.RegionStateKey(
-        request_id="request-a",
+        request_id=request_id,
         request_pool_idx=1,
         request_slot_generation=generation,
         region_id="causal_prefix",
@@ -169,6 +212,7 @@ def _algorithm(backend, key):
         _exact_handoff_debug=False,
         _exact_handoff_debug_sync=False,
         _hybrid_state_keys={},
+        _hybrid_snapshot_publications={},
     )
     algorithm._get_gdn_dllm_backend = lambda _runner: backend
     algorithm._hybrid_key_for_bid = lambda _batch, _bid, _rpx: key
@@ -179,6 +223,68 @@ def _algorithm(backend, key):
     algorithm._canonical_replay_kv_locations = CANONICAL_REPLAY_LOCATIONS
     algorithm._validate_recovery_forward_batch = VALIDATE_RECOVERY_BATCH
     return algorithm
+
+
+def _restore_batch(key, *, restore_required=True, sealed=True):
+    return types.SimpleNamespace(
+        batch_size=1,
+        seq_lens_cpu=torch.tensor([key.boundary]),
+        hybrid_restore_gdn_state=[restore_required],
+        hybrid_prefix_sealed_cpu=[sealed],
+    )
+
+
+def _scheduler_req(key):
+    spec = EXECUTION_SPEC.HybridExecutionSpec.prefix_diffusion(
+        ar_boundary=key.boundary,
+        sequence_length=key.boundary + 7,
+        diffusion_steps=1,
+        prefix_version=key.region_version,
+        suffix_version=key.region_version,
+    )
+    req = types.SimpleNamespace(
+        rid=key.request_id,
+        req_pool_idx=key.request_pool_idx,
+        origin_input_ids=list(range(key.boundary)),
+        hybrid_execution_spec=spec,
+        hybrid_request_slot_generation=key.request_slot_generation,
+        hybrid_token_hash=key.token_hash,
+        hybrid_position_hash=key.position_hash,
+        hybrid_model_identity=key.model_identity,
+        hybrid_model_revision=key.model_revision,
+        hybrid_adapter_revision=key.adapter_revision,
+        hybrid_prefix_sealed=False,
+        hybrid_cache_hit=False,
+        hybrid_restore_required=False,
+        hybrid_commit_required=False,
+        lora_id=None,
+        _inline_prefill=False,
+        dllm_phase="incoming_prefill",
+    )
+    req.is_dllm = lambda: True
+    req.is_dllm_prefill = lambda: req.dllm_phase in {
+        "incoming_prefill",
+        "staging_prefill",
+    }
+    return req
+
+
+def _process_first_forward(req, publication):
+    tree_cache = types.SimpleNamespace(
+        cache_unfinished_req=lambda value: setattr(
+            value, "prefix_indices", list(range(len(value.origin_input_ids)))
+        )
+    )
+    scheduler = types.SimpleNamespace(tree_cache=tree_cache)
+    scheduler._complete_dllm_prefill = types.MethodType(
+        lambda _self, value, result: COMPLETE_PREFILL(value, result),
+        scheduler,
+    )
+    result = types.SimpleNamespace(
+        next_token_ids=[],
+        hybrid_snapshot_publications={req.req_pool_idx: publication},
+    )
+    PROCESS_EMPTY_PREFILL(scheduler, types.SimpleNamespace(reqs=[req]), result)
 
 
 def test_recovery_locations_canonicalize_int32_page_table():
@@ -205,16 +311,111 @@ def test_prefill_snapshot_then_first_decode_is_a_real_restore_hit(prompt_length)
         token_to_kv_pool=types.SimpleNamespace(size=8),
     )
     algorithm = _algorithm(backend, key)
-    batch = types.SimpleNamespace(seq_lens_cpu=torch.tensor([key.boundary]))
+    batch = _restore_batch(key)
 
     SNAPSHOT_BOUNDARIES(algorithm, runner, batch, [0], [key.request_pool_idx])
+    req = _scheduler_req(key)
+    _process_first_forward(
+        req, algorithm._hybrid_snapshot_publications[key.request_pool_idx]
+    )
     recomputes = []
     algorithm._recompute_hybrid_boundary = lambda *args: recomputes.append(args)
     RESTORE_BOUNDARIES(algorithm, runner, batch, [0], [key.request_pool_idx])
 
+    assert req.hybrid_prefix_sealed is True
+    assert req.dllm_phase == "staging_decode"
+    assert req.hybrid_restore_required is True
     assert backend.restore_calls == 1
     assert backend.region_state_cache.hit_count == 1
     assert recomputes == []
+
+
+def test_health_check_snapshot_publication_precedes_first_restore():
+    pool = _ReqPool()
+    backend = _LifecycleBackend(pool)
+    key = _make_key(boundary=1, request_id="HEALTH_CHECK_regression")
+    runner = types.SimpleNamespace(
+        req_to_token_pool=pool,
+        token_to_kv_pool=types.SimpleNamespace(size=8),
+    )
+    algorithm = _algorithm(backend, key)
+    batch = _restore_batch(key)
+    SNAPSHOT_BOUNDARIES(algorithm, runner, batch, [0], [key.request_pool_idx])
+    req = _scheduler_req(key)
+    _process_first_forward(
+        req, algorithm._hybrid_snapshot_publications[key.request_pool_idx]
+    )
+    recomputes = []
+    algorithm._recompute_hybrid_boundary = lambda *args: recomputes.append(args)
+
+    RESTORE_BOUNDARIES(algorithm, runner, batch, [0], [key.request_pool_idx])
+
+    assert backend.region_state_cache.hit_count == 1
+    assert recomputes == []
+
+
+def test_restore_before_snapshot_is_a_lifecycle_error_not_recovery():
+    pool = _ReqPool()
+    backend = _LifecycleBackend(pool)
+    key = _make_key(boundary=1)
+    runner = types.SimpleNamespace(
+        req_to_token_pool=pool,
+        token_to_kv_pool=types.SimpleNamespace(size=8),
+    )
+    algorithm = _algorithm(backend, key)
+    recomputes = []
+    algorithm._recompute_hybrid_boundary = lambda *args: recomputes.append(args)
+
+    with pytest.raises(RuntimeError, match="before prefix snapshot publication"):
+        RESTORE_BOUNDARIES(
+            algorithm,
+            runner,
+            _restore_batch(key, restore_required=False, sealed=False),
+            [0],
+            [key.request_pool_idx],
+        )
+
+    assert backend.restore_calls == 0
+    assert recomputes == []
+
+
+def test_sealed_restore_without_matching_snapshot_is_a_lifecycle_error():
+    pool = _ReqPool()
+    backend = _LifecycleBackend(pool)
+    key = _make_key(boundary=1)
+    runner = types.SimpleNamespace(
+        req_to_token_pool=pool,
+        token_to_kv_pool=types.SimpleNamespace(size=8),
+    )
+    algorithm = _algorithm(backend, key)
+    recomputes = []
+    algorithm._recompute_hybrid_boundary = lambda *args: recomputes.append(args)
+
+    with pytest.raises(RuntimeError, match="no matching committed snapshot"):
+        RESTORE_BOUNDARIES(
+            algorithm,
+            runner,
+            _restore_batch(key),
+            [0],
+            [key.request_pool_idx],
+        )
+
+    assert backend.restore_calls == 0
+    assert recomputes == []
+
+
+def test_scheduler_refuses_to_seal_without_model_snapshot_publication():
+    key = _make_key(boundary=1)
+    req = _scheduler_req(key)
+
+    with pytest.raises(RuntimeError, match="without snapshot publication"):
+        COMPLETE_PREFILL(
+            req,
+            types.SimpleNamespace(hybrid_snapshot_publications={}),
+        )
+
+    assert req.hybrid_prefix_sealed is False
+    assert req.dllm_phase == "incoming_prefill"
 
 
 def test_region_cache_hit_does_not_depend_on_local_key_index():
@@ -226,7 +427,7 @@ def test_region_cache_hit_does_not_depend_on_local_key_index():
         token_to_kv_pool=types.SimpleNamespace(size=8),
     )
     algorithm = _algorithm(backend, key)
-    batch = types.SimpleNamespace(seq_lens_cpu=torch.tensor([key.boundary]))
+    batch = _restore_batch(key)
     SNAPSHOT_BOUNDARIES(algorithm, runner, batch, [0], [key.request_pool_idx])
     algorithm._hybrid_state_keys.clear()
     recomputes = []
@@ -331,7 +532,7 @@ def test_request_slot_reuse_cannot_restore_stale_state():
         RESTORE_BOUNDARIES(
             algorithm,
             runner,
-            types.SimpleNamespace(),
+            _restore_batch(new_key),
             [0],
             [new_key.request_pool_idx],
         )

@@ -87,6 +87,18 @@ class ReqDllmMixin:
         ]
 
     def determine_dllm_phase(self: Req):
+        # An exact-handoff request cannot decode until its original causal
+        # prefix has been materialized and published by the model.  In
+        # particular, the diffusion MASK block appended to ``dllm_ids`` must
+        # not override the initial prefill phase for short prompts.
+        if (
+            self.hybrid_execution_spec is not None
+            and not self.hybrid_prefix_sealed
+        ):
+            if not self.is_dllm_prefill():
+                self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+            return
+
         prefix_length = len(self.prefix_indices)
         min_required_length = prefix_length + self.dllm_config.block_size
 
@@ -118,7 +130,16 @@ class ReqDllmMixin:
             self.dllm_block_offset += advance
             self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
 
-        self.fill_ids = self.dllm_ids
+        if (
+            self.hybrid_execution_spec is not None
+            and not self.hybrid_prefix_sealed
+        ):
+            # The first exact-handoff forward is a causal seal of the original
+            # prompt only. Keep speculative MASKs in dllm_ids for the later
+            # decode round, but never schedule them in this prefill.
+            self.fill_ids = list(self.origin_input_ids)
+        else:
+            self.fill_ids = self.dllm_ids
 
     def _update_block_offset_for_dllm(self: Req):
         """Compat shim for schedule_batch.py chunked-prefill path.

@@ -18,6 +18,7 @@ CACHE_PATH = ROOT / "eval/sglang/srt/mem_cache/region_state_cache.py"
 ALGORITHM_PATH = ROOT / "eval/sglang/srt/dllm/algorithm/hybrid_diffusion_self_spec.py"
 SCHEDULER_PATH = ROOT / "eval/sglang/srt/dllm/mixin/scheduler.py"
 REQ_PATH = ROOT / "eval/sglang/srt/dllm/mixin/req.py"
+SCHEDULE_BATCH_PATH = ROOT / "eval/sglang/srt/managers/schedule_batch.py"
 
 
 def _load_module(name, path):
@@ -73,6 +74,42 @@ INIT_DLLM_REQUEST = _class_method(
     },
 )
 
+IS_DLLM = _class_method(
+    REQ_PATH,
+    "ReqDllmMixin",
+    "is_dllm",
+    {"Req": object},
+)
+IS_DLLM_PREFILL = _class_method(
+    REQ_PATH,
+    "ReqDllmMixin",
+    "is_dllm_prefill",
+    {"DllmReqPhase": _Phase, "Req": object},
+)
+INIT_FILL_IDS = _class_method(
+    REQ_PATH,
+    "ReqDllmMixin",
+    "_init_fill_ids_for_dllm",
+    {"Req": object},
+)
+DETERMINE_PHASE = _class_method(
+    REQ_PATH,
+    "ReqDllmMixin",
+    "determine_dllm_phase",
+    {"DllmReqPhase": _Phase, "Req": object},
+)
+INIT_NEXT_ROUND = _class_method(
+    SCHEDULE_BATCH_PATH,
+    "Req",
+    "init_next_round_input",
+    {
+        "BasePrefixCache": object,
+        "Optional": typing.Optional,
+        "Req": object,
+        "logger": logging.getLogger(__name__),
+    },
+)
+
 APPLY_COMMIT = _class_method(
     SCHEDULER_PATH,
     "SchedulerDllmMixin",
@@ -113,21 +150,78 @@ def _config(*, exact=True, block_size=7):
     )
 
 
+def _complete_request_initialization(prompt_length, *, exact=True, health=False):
+    req = types.SimpleNamespace(
+        rid=("HEALTH_CHECK_regression" if health else "request-a"),
+        origin_input_ids=list(range(prompt_length)),
+        output_ids=[],
+        prefix_indices=[],
+        session=None,
+        return_logprob=False,
+        logprob_start_len=-1,
+        positional_embed_overrides=None,
+        is_retracted=False,
+        multimodal_inputs=None,
+    )
+    req.is_dllm = types.MethodType(IS_DLLM, req)
+    req.is_dllm_prefill = types.MethodType(IS_DLLM_PREFILL, req)
+    req._init_fill_ids_for_dllm = types.MethodType(INIT_FILL_IDS, req)
+    req.determine_dllm_phase = types.MethodType(DETERMINE_PHASE, req)
+    req.set_extend_input_len = lambda value: setattr(req, "extend_input_len", value)
+    INIT_DLLM_REQUEST(req, _config(exact=exact))
+    INIT_NEXT_ROUND(req)
+    return req
+
+
 @pytest.mark.parametrize("prompt_length", range(1, 7))
 def test_short_exact_prompts_require_initial_causal_prefill(prompt_length):
-    req = types.SimpleNamespace(origin_input_ids=list(range(prompt_length)))
-    INIT_DLLM_REQUEST(req, _config())
+    req = _complete_request_initialization(prompt_length)
     assert req.dllm_phase is _Phase.INCOMING_PREFILL
     assert req.hybrid_execution_spec.ar_boundary == prompt_length
     assert req.hybrid_prefix_sealed is False
     assert req.hybrid_restore_required is False
+    assert req.fill_ids == req.origin_input_ids
+    assert req.extend_input_len == prompt_length
+    assert req.dllm_ids == req.origin_input_ids + [999] * 7
+
+
+@pytest.mark.parametrize("prompt_length", [1, 2, 3, 4, 5, 6, 7, 8, 64])
+def test_first_exact_handoff_forward_is_prompt_only_causal_prefill(prompt_length):
+    req = _complete_request_initialization(prompt_length)
+
+    assert req.is_dllm_prefill()
+    assert req.fill_ids == list(range(prompt_length))
+    assert req.extend_input_len == prompt_length
+    assert req.hybrid_restore_required is False
+
+
+def test_health_check_complete_initialization_cannot_enter_decode():
+    req = _complete_request_initialization(1, health=True)
+
+    assert req.rid.startswith("HEALTH_CHECK")
+    assert req.dllm_phase is _Phase.INCOMING_PREFILL
+    assert req.fill_ids == [0]
+    assert req.hybrid_prefix_sealed is False
+    assert req.hybrid_restore_required is False
+
+
+def test_sealed_exact_handoff_returns_to_normal_mask_phase_selection():
+    req = _complete_request_initialization(6)
+    req.hybrid_prefix_sealed = True
+    req.prefix_indices = list(range(6))
+    req.dllm_next_advance = 6
+
+    INIT_NEXT_ROUND(req)
+
+    assert req.dllm_phase is _Phase.STAGING_DECODE
+    assert req.fill_ids is req.dllm_ids
 
 
 def test_short_non_exact_prompt_keeps_decode_direct_behavior():
-    req = types.SimpleNamespace(origin_input_ids=list(range(6)))
-    INIT_DLLM_REQUEST(req, _config(exact=False))
-    assert req.dllm_phase is _Phase.INCOMING_DECODE
+    req = _complete_request_initialization(6, exact=False)
+    assert req.dllm_phase is _Phase.STAGING_DECODE
     assert req.hybrid_execution_spec is None
+    assert req.fill_ids == list(range(6)) + [999] * 7
 
 
 def _key(boundary=4, version=0, token_ids=None):
@@ -296,12 +390,22 @@ def test_commit_transport_is_result_scoped_in_tp_worker():
         and node.target.id == "hybrid_boundary_commits"
         for node in result_class.body
     )
+    assert any(
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "hybrid_snapshot_publications"
+        for node in result_class.body
+    )
 
     worker_source = ast.parse(
         (ROOT / "eval/sglang/srt/managers/tp_worker.py").read_text()
     )
     assert any(
         isinstance(node, ast.keyword) and node.arg == "hybrid_boundary_commits"
+        for node in ast.walk(worker_source)
+    )
+    assert any(
+        isinstance(node, ast.keyword) and node.arg == "hybrid_snapshot_publications"
         for node in ast.walk(worker_source)
     )
 
@@ -328,6 +432,12 @@ def test_every_dllm_result_path_consumes_result_scoped_commit():
             and node.func.attr == "_publish_hybrid_result_commit"
             for node in ast.walk(method)
         )
+        assert any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_process_empty_dllm_prefill_result"
+            for node in ast.walk(method)
+        )
 
     output_source = ast.parse(
         (
@@ -350,5 +460,11 @@ def test_every_dllm_result_path_consumes_result_scoped_commit():
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "_publish_hybrid_result_commit"
+        for node in ast.walk(output_method)
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_process_empty_dllm_prefill_result"
         for node in ast.walk(output_method)
     )

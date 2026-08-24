@@ -17,6 +17,7 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.mem_cache.region_state_cache import RegionStateKey
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
@@ -33,6 +34,7 @@ class GenerationBatchResult:
     can_run_cuda_graph: bool = False
     mamba_track_commit_info: Optional[dict] = None
     hybrid_boundary_commits: Optional[dict[int, HybridBoundaryCommit]] = None
+    hybrid_snapshot_publications: Optional[dict[int, RegionStateKey]] = None
 
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None

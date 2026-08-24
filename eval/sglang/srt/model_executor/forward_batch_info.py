@@ -427,6 +427,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     hybrid_attention_contract_ids_cpu: Optional[List[str]] = None
     hybrid_region_versions_cpu: Optional[List[int]] = None
     hybrid_restore_gdn_state: Optional[List[bool]] = None
+    hybrid_prefix_sealed_cpu: Optional[List[bool]] = None
     hybrid_commit_gdn_state: Optional[List[bool]] = None
     hybrid_request_slot_generations_cpu: Optional[List[int]] = None
     hybrid_token_hashes_cpu: Optional[List[str]] = None
@@ -562,6 +563,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 "hybrid_attention_contract_ids_cpu",
                 "hybrid_region_versions_cpu",
                 "hybrid_restore_gdn_state",
+                "hybrid_prefix_sealed_cpu",
                 "hybrid_commit_gdn_state",
                 "hybrid_request_slot_generations_cpu",
                 "hybrid_token_hashes_cpu",

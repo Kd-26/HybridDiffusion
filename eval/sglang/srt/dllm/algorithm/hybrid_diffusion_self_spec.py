@@ -411,6 +411,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         )
         self._hybrid_state_keys: Dict[int, RegionStateKey] = {}
         self._hybrid_boundary_commits: Dict[int, HybridBoundaryCommit] = {}
+        self._hybrid_snapshot_publications: Dict[int, RegionStateKey] = {}
         self._exact_handoff_debug = (
             os.getenv("SGLANG_HYBRID_EXACT_HANDOFF_DEBUG", "0") == "1"
         )
@@ -509,6 +510,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         self._force_next_token.pop(req_pool_idx, None)
         self._mamba_track_commit_info.pop(req_pool_idx, None)
         self._hybrid_boundary_commits.pop(req_pool_idx, None)
+        self._hybrid_snapshot_publications.pop(req_pool_idx, None)
         key = self._hybrid_state_keys.pop(req_pool_idx, None)
         backend = getattr(self, "_configured_region_backend", None)
         if key is not None and backend is not None:
@@ -817,6 +819,10 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
                 "snapshot_gdn_state_published", kv_prefix.locations.device
             )
             self._hybrid_state_keys[rpx] = key
+            # Publish only after both KV and GDN state are durably registered.
+            # The scheduler consumes this result-scoped proof before it marks
+            # an exact prefix sealed or requests its first restore.
+            self._hybrid_snapshot_publications[rpx] = key
             if self._exact_handoff_debug or self._exact_handoff_debug_sync:
                 self._hybrid_debug_log(
                     "snapshot_created",
@@ -839,10 +845,48 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         backend = self._get_gdn_dllm_backend(model_runner)
         if backend is None:
             raise RuntimeError("exact_prefix_handoff requires the dLLM GDN backend")
+        restore_flags = getattr(forward_batch, "hybrid_restore_gdn_state", None)
+        sealed_flags = getattr(forward_batch, "hybrid_prefix_sealed_cpu", None)
+        if (
+            restore_flags is None
+            or sealed_flags is None
+            or len(restore_flags) != forward_batch.batch_size
+            or len(sealed_flags) != forward_batch.batch_size
+        ):
+            raise RuntimeError(
+                "exact-prefix restoration is missing lifecycle metadata"
+            )
         for bid in bids:
             rpx = int(req_pool_indices_cpu[bid])
             requested = self._hybrid_key_for_bid(forward_batch, bid, rpx)
             current = self._hybrid_state_keys.get(rpx)
+            if not restore_flags[bid] or not sealed_flags[bid]:
+                logger.error(
+                    "Exact-prefix restore requested before initial snapshot: "
+                    "restore_required=%s prefix_sealed=%s requested=%s",
+                    restore_flags[bid],
+                    sealed_flags[bid],
+                    json.dumps(
+                        self._hybrid_key_log_fields(requested), sort_keys=True
+                    ),
+                )
+                raise RuntimeError(
+                    "exact-prefix decode reached restore before prefix snapshot publication"
+                )
+            if (
+                current is None
+                and backend.region_state_cache.peek(requested) is None
+            ):
+                logger.error(
+                    "Exact-prefix restore has no matching committed snapshot: "
+                    "requested=%s",
+                    json.dumps(
+                        self._hybrid_key_log_fields(requested), sort_keys=True
+                    ),
+                )
+                raise RuntimeError(
+                    "exact-prefix restore has no matching committed snapshot"
+                )
             debug_enabled = (
                 self._exact_handoff_debug or self._exact_handoff_debug_sync
             )
@@ -1319,6 +1363,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         # Result-scoped handoff publications must never leak into a later
         # scheduler result when the algorithm object is reused.
         self._hybrid_boundary_commits.clear()
+        self._hybrid_snapshot_publications.clear()
         if self._timing_enabled:
             _t_run_start = time.perf_counter()
         batch_size = forward_batch.batch_size

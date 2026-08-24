@@ -2962,6 +2962,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 bool(getattr(req, "hybrid_restore_required", False))
                 for req in self.reqs
             ],
+            hybrid_prefix_sealed_cpu=[
+                bool(getattr(req, "hybrid_prefix_sealed", False))
+                for req in self.reqs
+            ],
             hybrid_commit_gdn_state=[
                 bool(getattr(req, "hybrid_commit_required", False))
                 for req in self.reqs
@@ -3212,6 +3216,7 @@ class ModelWorkerBatch:
     hybrid_attention_contract_ids_cpu: Optional[List[str]] = None
     hybrid_region_versions_cpu: Optional[List[int]] = None
     hybrid_restore_gdn_state: Optional[List[bool]] = None
+    hybrid_prefix_sealed_cpu: Optional[List[bool]] = None
     hybrid_commit_gdn_state: Optional[List[bool]] = None
     hybrid_request_slot_generations_cpu: Optional[List[int]] = None
     hybrid_token_hashes_cpu: Optional[List[str]] = None

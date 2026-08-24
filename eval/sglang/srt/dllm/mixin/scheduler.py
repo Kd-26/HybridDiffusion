@@ -71,6 +71,77 @@ class SchedulerDllmMixin:
         req.hybrid_commit_required = not req.is_dllm_prefill()
 
     @staticmethod
+    def _complete_dllm_prefill(
+        req: Req, result: GenerationBatchResult
+    ) -> None:
+        """Transition to decode only after an exact model snapshot is published."""
+        spec = getattr(req, "hybrid_execution_spec", None)
+        if spec is not None:
+            publications = (
+                getattr(result, "hybrid_snapshot_publications", None) or {}
+            )
+            publication = publications.get(int(req.req_pool_idx))
+            if publication is None:
+                raise RuntimeError(
+                    "exact-prefix prefill completed without snapshot publication"
+                )
+            expected = {
+                "request_id": str(req.rid),
+                "request_pool_idx": int(req.req_pool_idx),
+                "request_slot_generation": int(
+                    req.hybrid_request_slot_generation
+                ),
+                "region_id": spec.region_ids[0],
+                "region_version": spec.region_versions[0],
+                "boundary": spec.ar_boundary,
+                "token_hash": req.hybrid_token_hash,
+                "position_hash": req.hybrid_position_hash,
+                "model_identity": req.hybrid_model_identity,
+                "model_revision": req.hybrid_model_revision,
+                "adapter_identity": str(getattr(req, "lora_id", "") or ""),
+                "adapter_revision": req.hybrid_adapter_revision,
+                "attention_contract_id": spec.attention_contract_id,
+            }
+            observed = {
+                field: getattr(publication, field) for field in expected
+            }
+            if observed != expected:
+                logger.error(
+                    "Exact-prefix initial snapshot mismatch: expected=%s observed=%s",
+                    expected,
+                    observed,
+                )
+                raise RuntimeError(
+                    "exact-prefix initial snapshot differs from scheduler state"
+                )
+
+        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+        req.dllm_next_advance = len(req.origin_input_ids)
+        req._inline_prefill = False
+        if spec is not None:
+            req.hybrid_prefix_sealed = True
+            req.hybrid_cache_hit = True
+            req.hybrid_restore_required = True
+            req.hybrid_commit_required = False
+
+    def _process_empty_dllm_prefill_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        """Cache a pure-prefill result and publish its verified handoff seal."""
+        for req in batch.reqs:
+            if not req.is_dllm() or not req.is_dllm_prefill():
+                continue
+            self.tree_cache.cache_unfinished_req(req)
+            origin_len = len(req.origin_input_ids)
+            cached_len = (
+                len(req.prefix_indices) if req.prefix_indices is not None else 0
+            )
+            if cached_len >= origin_len:
+                self._complete_dllm_prefill(req, result)
+
+    @staticmethod
     def _advance_hybrid_boundary(req: Req, accepted_tokens: List[int]) -> None:
         """Legacy non-exact path; exact handoff uses model commit metadata."""
         spec = getattr(req, "hybrid_execution_spec", None)
@@ -386,6 +457,9 @@ class SchedulerDllmMixin:
             getattr(dllm_algo, "_dllm_write_override", {}) if dllm_algo else {}
         )
 
+        if not result.next_token_ids:
+            self._process_empty_dllm_prefill_result(batch, result)
+
         kv_gpu_parts = []
         for idx in range(batch.batch_size()):
             if not result.next_token_ids:
@@ -419,13 +493,7 @@ class SchedulerDllmMixin:
                         else 0
                     )
                     if cached_len >= origin_len:
-                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
-                        req.dllm_next_advance = origin_len
-                        req._inline_prefill = False
-                        if req.hybrid_execution_spec is not None:
-                            req.hybrid_prefix_sealed = True
-                            req.hybrid_cache_hit = True
-                            req.hybrid_restore_required = True
+                        self._complete_dllm_prefill(req, result)
                 continue
 
             self.num_generated_tokens += len(next_token_ids)
@@ -498,6 +566,9 @@ class SchedulerDllmMixin:
 
         decode_mode = getattr(batch, "_dllm_decode_mode", False)
 
+        if not result.next_token_ids:
+            self._process_empty_dllm_prefill_result(batch, result)
+
         if result.next_token_ids:
             self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -557,13 +628,7 @@ class SchedulerDllmMixin:
                             else 0
                         )
                         if cached_len >= origin_len:
-                            req.dllm_phase = DllmReqPhase.STAGING_DECODE
-                            req.dllm_next_advance = origin_len
-                            req._inline_prefill = False
-                            if req.hybrid_execution_spec is not None:
-                                req.hybrid_prefix_sealed = True
-                                req.hybrid_cache_hit = True
-                                req.hybrid_restore_required = True
+                            self._complete_dllm_prefill(req, result)
                     continue
 
                 self.num_generated_tokens += new_tokens
