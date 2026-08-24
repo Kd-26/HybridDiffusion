@@ -412,6 +412,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         self._hybrid_state_keys: Dict[int, RegionStateKey] = {}
         self._hybrid_boundary_commits: Dict[int, HybridBoundaryCommit] = {}
         self._hybrid_snapshot_publications: Dict[int, RegionStateKey] = {}
+        self._region_dag_snapshot_publications: Dict[int, Dict[int, Any]] = {}
         self._exact_handoff_debug = (
             os.getenv("SGLANG_HYBRID_EXACT_HANDOFF_DEBUG", "0") == "1"
         )
@@ -511,6 +512,7 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         self._mamba_track_commit_info.pop(req_pool_idx, None)
         self._hybrid_boundary_commits.pop(req_pool_idx, None)
         self._hybrid_snapshot_publications.pop(req_pool_idx, None)
+        self._region_dag_snapshot_publications.pop(req_pool_idx, None)
         key = self._hybrid_state_keys.pop(req_pool_idx, None)
         backend = getattr(self, "_configured_region_backend", None)
         if key is not None and backend is not None:
@@ -1364,6 +1366,56 @@ class HybridDiffusionSelfSpec(DllmAlgorithm):
         # scheduler result when the algorithm object is reused.
         self._hybrid_boundary_commits.clear()
         self._hybrid_snapshot_publications.clear()
+        self._region_dag_snapshot_publications.clear()
+        if getattr(forward_batch, "region_dag_execution_specs_cpu", None) is not None:
+            # Region-DAG is an isolated controlled serving route.  It uses the
+            # same loaded model but none of the legacy block self-spec state,
+            # trimming, prefix sealing, or recovery machinery.
+            forward_batch.dllm_force_causal = False
+            forward_batch.dllm_force_bidir_mask = False
+            forward_batch.dllm_gdn_persist_state = True
+            forward_batch.dllm_gdn_causal_mode = 1
+            forward_batch.dllm_gdn_num_clean = 0
+            forward_batch.dllm_gdn_save_for_commit = False
+            forward_batch.dllm_gdn_cache_intermediate_for_commit = False
+            forward_batch.dllm_gdn_block_size = 0
+            out = self._forward_with_metrics(
+                model_runner,
+                forward_batch,
+                modes=["region_dag"] * forward_batch.batch_size,
+                diffusion_steps=[True] * forward_batch.batch_size,
+                gdn_restores=list(
+                    forward_batch.region_dag_restore_required_cpu or []
+                ),
+                recomputed=[True] * forward_batch.batch_size,
+            )
+            gdn_backend = self._get_gdn_dllm_backend(model_runner)
+            if gdn_backend is None:
+                raise RuntimeError(
+                    "Region-DAG execution requires the production dLLM GDN backend"
+                )
+            frontier_keys = forward_batch.region_dag_frontier_keys_cpu
+            gdn_backend.validate_region_dag_frontiers(frontier_keys)
+            req_pool_indices = getattr(forward_batch, "dllm_rpx_cpu", None)
+            if req_pool_indices is None:
+                req_pool_indices = [
+                    int(value)
+                    for value in forward_batch.req_pool_indices.detach()
+                    .to(device="cpu")
+                    .tolist()
+                ]
+            if len(req_pool_indices) != len(frontier_keys):
+                raise RuntimeError(
+                    "Region-DAG snapshot publications are misbatched"
+                )
+            self._region_dag_snapshot_publications = {
+                int(req_pool_idx): dict(keys)
+                for req_pool_idx, keys in zip(req_pool_indices, frontier_keys)
+            }
+            self._stats["total_forwards"] += 1
+            self._stats["prefill_forwards"] += 1
+            self._flush_forward_timings()
+            return out.logits_output, [], out.can_run_graph
         if self._timing_enabled:
             _t_run_start = time.perf_counter()
         batch_size = forward_batch.batch_size

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import os
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -56,6 +57,18 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+class RegionDAGLayerSnapshot:
+    """One layer's exact convolution/recurrent state before a text position."""
+
+    __slots__ = ("frontier_key", "layer_id", "conv_state", "recurrent_state")
+
+    def __init__(self, frontier_key, layer_id, conv_state, recurrent_state):
+        self.frontier_key = frontier_key
+        self.layer_id = int(layer_id)
+        self.conv_state = conv_state
+        self.recurrent_state = recurrent_state
+
+
 class GDNDllmBackend:
     """dLLM-aware wrapper for GDN linear attention.
 
@@ -86,6 +99,10 @@ class GDNDllmBackend:
         ] = {}
         self.region_state_cache = RegionStateCache(max_entries=128)
         self.strict_region_state_validation = True
+        self._region_dag_layer_snapshots: OrderedDict[
+            tuple[object, int], RegionDAGLayerSnapshot
+        ] = OrderedDict()
+        self._region_dag_layer_snapshot_limit = 4096
 
     def configure_region_state_cache(
         self, *, max_entries: int, strict_validation: bool
@@ -498,6 +515,312 @@ class GDNDllmBackend:
         return torch.cat([outputs_by_bid[i] for i in range(len(seq_lens_cpu))], dim=1)
 
     # ------------------------------------------------------------------ #
+    #  Region-DAG ordered replay                                          #
+    # ------------------------------------------------------------------ #
+
+    def _put_region_dag_layer_snapshot(
+        self,
+        *,
+        frontier_key,
+        layer_id: int,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+    ) -> None:
+        cache_key = (frontier_key, int(layer_id))
+        snapshot = RegionDAGLayerSnapshot(
+            frontier_key=frontier_key,
+            layer_id=int(layer_id),
+            conv_state=conv_state.detach().clone(),
+            recurrent_state=recurrent_state.detach().clone(),
+        )
+        self._region_dag_layer_snapshots[cache_key] = snapshot
+        self._region_dag_layer_snapshots.move_to_end(cache_key)
+        while (
+            len(self._region_dag_layer_snapshots)
+            > self._region_dag_layer_snapshot_limit
+        ):
+            self._region_dag_layer_snapshots.popitem(last=False)
+
+    def _restore_region_dag_layer_snapshot(
+        self,
+        *,
+        frontier_key,
+        layer_id: int,
+        conv_destination: torch.Tensor,
+        recurrent_destination: torch.Tensor,
+    ) -> None:
+        cache_key = (frontier_key, int(layer_id))
+        snapshot = self._region_dag_layer_snapshots.get(cache_key)
+        if snapshot is None:
+            related = [
+                {
+                    "boundary": getattr(key, "boundary", None),
+                    "request_id": getattr(key, "request_id", None),
+                    "request_pool_idx": getattr(key, "request_pool_idx", None),
+                    "request_slot_generation": getattr(
+                        key, "request_slot_generation", None
+                    ),
+                    "model_identity": getattr(key, "model_identity", None),
+                    "model_revision": getattr(key, "model_revision", None),
+                    "adapter_identity": getattr(key, "adapter_identity", None),
+                    "adapter_revision": getattr(key, "adapter_revision", None),
+                    "attention_contract_id": getattr(
+                        key, "attention_contract_id", None
+                    ),
+                }
+                for key, cached_layer_id in self._region_dag_layer_snapshots
+                if cached_layer_id == int(layer_id)
+                and getattr(key, "request_id", None)
+                == getattr(frontier_key, "request_id", None)
+            ]
+            raise RuntimeError(
+                "Region-DAG GDN frontier snapshot miss; refusing later/stale "
+                f"state: requested={frontier_key!r}, layer_id={layer_id}, "
+                f"related={related}"
+            )
+        if snapshot.frontier_key != frontier_key:
+            raise RuntimeError("Region-DAG GDN frontier identity mismatch")
+        if (
+            snapshot.conv_state.device != conv_destination.device
+            or snapshot.conv_state.dtype != conv_destination.dtype
+            or snapshot.conv_state.shape != conv_destination.shape
+        ):
+            raise RuntimeError(
+                "Region-DAG convolution snapshot device/dtype/shape mismatch"
+            )
+        if (
+            snapshot.recurrent_state.device != recurrent_destination.device
+            or snapshot.recurrent_state.dtype != recurrent_destination.dtype
+            or snapshot.recurrent_state.shape != recurrent_destination.shape
+        ):
+            raise RuntimeError(
+                "Region-DAG recurrent snapshot device/dtype/shape mismatch"
+            )
+        conv_destination.copy_(snapshot.conv_state)
+        recurrent_destination.copy_(snapshot.recurrent_state)
+        self._region_dag_layer_snapshots.move_to_end(cache_key)
+
+    def validate_region_dag_frontiers(self, frontier_keys) -> None:
+        """Fail unless every GDN layer published every advertised frontier."""
+        if not self.gdn_layer_ids:
+            raise RuntimeError("Region-DAG model has no classified GDN layers")
+        for request_frontiers in frontier_keys:
+            if not request_frontiers:
+                raise RuntimeError("Region-DAG request published no GDN frontiers")
+            for boundary, frontier_key in request_frontiers.items():
+                if int(frontier_key.boundary) != int(boundary):
+                    raise RuntimeError("Region-DAG frontier map/key boundary mismatch")
+                missing_layers = [
+                    layer_id
+                    for layer_id in self.gdn_layer_ids
+                    if (frontier_key, int(layer_id))
+                    not in self._region_dag_layer_snapshots
+                ]
+                if missing_layers:
+                    raise RuntimeError(
+                        f"Region-DAG frontier {boundary} is missing GDN layer "
+                        f"snapshots {missing_layers}"
+                    )
+
+    def _forward_region_dag(
+        self,
+        layer: "RadixLinearAttention",
+        forward_batch: "ForwardBatch",
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run every recurrent row in textual order and snapshot exact frontiers."""
+        specs = forward_batch.region_dag_execution_specs_cpu
+        query_positions = forward_batch.region_dag_query_positions_cpu
+        frontier_keys = forward_batch.region_dag_frontier_keys_cpu
+        restore_required = forward_batch.region_dag_restore_required_cpu
+        references = forward_batch.region_dag_reference_cpu
+        if not (
+            specs is not None
+            and query_positions is not None
+            and frontier_keys is not None
+            and restore_required is not None
+            and references is not None
+        ):
+            raise RuntimeError("Region-DAG GDN execution metadata is incomplete")
+        batch_size = len(specs)
+        if not all(
+            len(values) == batch_size
+            for values in (
+                query_positions,
+                frontier_keys,
+                restore_required,
+                references,
+            )
+        ):
+            raise RuntimeError("Region-DAG GDN execution metadata is misbatched")
+
+        forward_metadata = self.gdn_backend.forward_metadata
+        cache_indices = forward_metadata.mamba_cache_indices
+        if int(cache_indices.numel()) < batch_size:
+            raise RuntimeError("Region-DAG GDN cache-index metadata is truncated")
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states = mamba_cache_params.conv[0]
+        ssm_states = mamba_cache_params.temporal
+
+        outputs = []
+        row_offset = 0
+        for bid, spec in enumerate(specs):
+            positions = tuple(int(position) for position in query_positions[bid])
+            if not positions:
+                raise RuntimeError("Region-DAG GDN query rows must be nonempty")
+            replay_start = positions[0]
+            if positions != tuple(range(replay_start, spec.sequence_length)):
+                raise RuntimeError(
+                    "Region-DAG GDN rows must cover the complete ordered replay suffix"
+                )
+            row_end = row_offset + len(positions)
+            request_mixed_qkv = mixed_qkv[row_offset:row_end]
+            request_a = a[row_offset:row_end]
+            request_b = b[row_offset:row_end]
+            mamba_cache_idx = int(cache_indices[bid].item())
+            conv_destination = conv_states[mamba_cache_idx]
+            recurrent_destination = ssm_states[mamba_cache_idx]
+
+            if bool(references[bid]):
+                if replay_start != 0 or bool(restore_required[bid]):
+                    raise RuntimeError(
+                        "Region-DAG reference must start at zero without restoration"
+                    )
+                conv_destination.zero_()
+                recurrent_destination.zero_()
+            elif bool(restore_required[bid]):
+                key = frontier_keys[bid].get(replay_start)
+                if key is None or int(key.boundary) != replay_start:
+                    raise RuntimeError(
+                        "Region-DAG cached replay is missing its exact frontier key"
+                    )
+                self._restore_region_dag_layer_snapshot(
+                    frontier_key=key,
+                    layer_id=layer.layer_id,
+                    conv_destination=conv_destination,
+                    recurrent_destination=recurrent_destination,
+                )
+            elif replay_start != 0:
+                raise RuntimeError(
+                    "Region-DAG nonzero replay cannot run without a proven restore"
+                )
+            else:
+                conv_destination.zero_()
+                recurrent_destination.zero_()
+
+            boundaries = sorted(
+                {
+                    replay_start,
+                    spec.sequence_length,
+                    *(
+                        region.start
+                        for region in spec.regions
+                        if replay_start <= region.start <= spec.sequence_length
+                    ),
+                }
+            )
+            request_outputs = []
+            for start, end in zip(boundaries, boundaries[1:]):
+                frontier_key = frontier_keys[bid].get(start)
+                if frontier_key is None or int(frontier_key.boundary) != start:
+                    raise RuntimeError(
+                        f"Region-DAG is missing frontier identity at {start}"
+                    )
+                self._put_region_dag_layer_snapshot(
+                    frontier_key=frontier_key,
+                    layer_id=layer.layer_id,
+                    conv_state=conv_destination,
+                    recurrent_state=recurrent_destination,
+                )
+                relative_start = start - replay_start
+                relative_end = end - replay_start
+                segment_mixed_qkv = request_mixed_qkv[
+                    relative_start:relative_end
+                ]
+                segment_a = request_a[relative_start:relative_end]
+                segment_b = request_b[relative_start:relative_end]
+                segment_len = end - start
+                if segment_len <= 0:
+                    raise RuntimeError("Region-DAG GDN segment must be nonempty")
+                cache_index_tensor = torch.tensor(
+                    [mamba_cache_idx], dtype=torch.int32, device=mixed_qkv.device
+                )
+                query_start_loc = torch.tensor(
+                    [0, segment_len], dtype=torch.int32, device=mixed_qkv.device
+                )
+                segment_post_conv = causal_conv1d_fn(
+                    segment_mixed_qkv.transpose(0, 1),
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states,
+                    has_initial_state=torch.ones(
+                        1, dtype=torch.bool, device=mixed_qkv.device
+                    ),
+                    cache_indices=cache_index_tensor,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=[segment_len],
+                ).transpose(0, 1)[:segment_len]
+                query, key, value = torch.split(
+                    segment_post_conv,
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                    dim=-1,
+                )
+                query = query.view(
+                    1, segment_len, layer.num_q_heads, layer.head_q_dim
+                )
+                key = key.view(1, segment_len, layer.num_k_heads, layer.head_k_dim)
+                value = value.view(
+                    1, segment_len, layer.num_v_heads, layer.head_v_dim
+                )
+                g, beta_val = fused_gdn_gating(
+                    layer.A_log, segment_a, segment_b, layer.dt_bias
+                )
+                if layer.num_v_heads // layer.num_k_heads > 1:
+                    repeat_factor = layer.num_v_heads // layer.num_k_heads
+                    query = query.repeat_interleave(repeat_factor, dim=2)
+                    key = key.repeat_interleave(repeat_factor, dim=2)
+                output, final_state = fused_recurrent_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta_val,
+                    initial_state=recurrent_destination.unsqueeze(0),
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=query_start_loc.to(dtype=torch.long),
+                )
+                if final_state is None:
+                    raise RuntimeError(
+                        "Region-DAG GDN kernel did not return a recurrent state"
+                    )
+                recurrent_destination.copy_(
+                    final_state.squeeze(0).to(recurrent_destination.dtype)
+                )
+                request_outputs.append(output)
+
+            final_key = frontier_keys[bid].get(spec.sequence_length)
+            if final_key is None:
+                raise RuntimeError("Region-DAG is missing its final frontier identity")
+            self._put_region_dag_layer_snapshot(
+                frontier_key=final_key,
+                layer_id=layer.layer_id,
+                conv_state=conv_destination,
+                recurrent_state=recurrent_destination,
+            )
+            outputs.append(torch.cat(request_outputs, dim=1))
+            row_offset = row_end
+
+        if row_offset != int(mixed_qkv.shape[0]):
+            raise RuntimeError(
+                "Region-DAG GDN row metadata does not consume the flattened input"
+            )
+        return torch.cat(outputs, dim=1)
+
+    # ------------------------------------------------------------------ #
     #  Extend: dLLM-aware forward                                         #
     # ------------------------------------------------------------------ #
 
@@ -510,6 +833,10 @@ class GDNDllmBackend:
         b: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        if getattr(forward_batch, "region_dag_execution_specs_cpu", None) is not None:
+            return self._forward_region_dag(
+                layer, forward_batch, mixed_qkv, a, b
+            )
         # Check if this is a dLLM forward (flags set by the algorithm)
         persist_state = getattr(forward_batch, 'dllm_gdn_persist_state', None)
         if persist_state is None:
@@ -1197,7 +1524,12 @@ class GDNDllmBackend:
         return self.region_state_cache.invalidate_region(request_id, region_id)
 
     def invalidate_request_state(self, request_id: str) -> int:
-        return self.region_state_cache.invalidate_request(request_id)
+        invalidated = self.region_state_cache.invalidate_request(request_id)
+        for cache_key in tuple(self._region_dag_layer_snapshots):
+            frontier_key, _ = cache_key
+            if getattr(frontier_key, "request_id", None) == request_id:
+                del self._region_dag_layer_snapshots[cache_key]
+        return invalidated
 
     # ------------------------------------------------------------------ #
     #  Cleanup                                                            #
@@ -1206,6 +1538,10 @@ class GDNDllmBackend:
     def discard_saved(self, req_pool_idx: int) -> None:
         """Free saved projections for a completed request."""
         self._saved.pop(req_pool_idx, None)
+        for cache_key in tuple(self._region_dag_layer_snapshots):
+            frontier_key, _ = cache_key
+            if getattr(frontier_key, "request_pool_idx", None) == int(req_pool_idx):
+                del self._region_dag_layer_snapshots[cache_key]
 
     def discard_saved_batch(self, req_pool_indices: list) -> None:
         """Free saved projections for a batch of requests."""

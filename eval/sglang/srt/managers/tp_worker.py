@@ -496,6 +496,13 @@ class TpModelWorker(BaseTpWorker):
                     {},
                 )
             ),
+            region_dag_snapshot_publications=dict(
+                getattr(
+                    self.dllm_algorithm,
+                    "_region_dag_snapshot_publications",
+                    {},
+                )
+            ),
         )
 
     def forward_batch_generation(

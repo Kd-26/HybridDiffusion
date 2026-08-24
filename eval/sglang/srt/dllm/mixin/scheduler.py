@@ -13,6 +13,11 @@ from sglang.srt.dllm.region.execution_spec import (
     hash_positions,
     hash_token_ids,
 )
+from sglang.srt.dllm.region.runtime import (
+    RegionDAGInstrumentation,
+    build_region_dag_frontier_key,
+    build_region_dag_runtime_plan,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -70,11 +75,116 @@ class SchedulerDllmMixin:
         )
         req.hybrid_commit_required = not req.is_dllm_prefill()
 
+    def _prepare_region_dag_request(self: Scheduler, req: Req) -> None:
+        """Validate scheduler-owned identity without entering legacy handoff."""
+        spec = getattr(req, "region_dag_execution_spec", None)
+        if spec is None:
+            return
+        if getattr(req, "hybrid_execution_spec", None) is not None:
+            raise RuntimeError(
+                "Region-DAG and exact-prefix routes are mutually exclusive"
+            )
+        spec.validate()
+        if spec.sequence_length != len(req.origin_input_ids):
+            raise RuntimeError(
+                "Region-DAG sequence length changed after request validation"
+            )
+        if (
+            not req.region_dag_initialized
+            and req.region_dag_mode == "reference"
+            and req.prefix_indices is not None
+            and len(req.prefix_indices) != 0
+        ):
+            raise RuntimeError(
+                "Region-DAG reference execution requires an uncached full sequence"
+            )
+        req.region_dag_model_identity = str(
+            getattr(self.server_args, "model_path", "")
+        )
+        req.region_dag_model_revision = str(
+            getattr(self.server_args, "revision", "") or ""
+        )
+        plan = req.region_dag_runtime_plan
+        if plan is None:
+            raise RuntimeError("Region-DAG request is missing its runtime plan")
+        if (
+            req.region_dag_mode == "cached"
+            and plan.gdn_replay_start > 0
+            and req.req_pool_idx is None
+        ):
+            if not req.region_dag_allow_full_replay:
+                raise RuntimeError(
+                    "Region-DAG cached execution requires an existing request-pool "
+                    "slot and a proven GDN frontier snapshot"
+                )
+            req.region_dag_runtime_plan = build_region_dag_runtime_plan(
+                spec, plan.edited_regions, force_full_replay=True
+            )
+            req.region_dag_instrumentation = RegionDAGInstrumentation.from_plan(
+                spec, req.region_dag_runtime_plan
+            )
+            req.region_dag_instrumentation.recovery_replays = 1
+            req.region_dag_mode = "reference"
+
     @staticmethod
-    def _complete_dllm_prefill(
-        req: Req, result: GenerationBatchResult
-    ) -> None:
+    def _bind_region_dag_request_slot(req: Req) -> None:
+        """Create exact GDN-frontier identities after the real slot exists."""
+        spec = getattr(req, "region_dag_execution_spec", None)
+        if spec is None:
+            return
+        if req.req_pool_idx is None:
+            raise RuntimeError(
+                "Region-DAG metadata cannot bind without a real request-pool slot"
+            )
+        boundaries = tuple(
+            sorted(
+                {0, spec.sequence_length, *(region.start for region in spec.regions)}
+            )
+        )
+        req.region_dag_frontier_keys = {
+            boundary: build_region_dag_frontier_key(
+                spec=spec,
+                boundary=boundary,
+                request_id=str(req.rid),
+                request_pool_idx=int(req.req_pool_idx),
+                request_slot_generation=int(req.hybrid_request_slot_generation),
+                model_identity=req.region_dag_model_identity,
+                model_revision=req.region_dag_model_revision,
+                adapter_identity=str(getattr(req, "lora_id", "") or ""),
+                adapter_revision=req.region_dag_adapter_revision,
+            )
+            for boundary in boundaries
+        }
+        replay_start = req.region_dag_runtime_plan.gdn_replay_start
+        req.region_dag_restore_required = bool(
+            req.region_dag_mode == "cached" and replay_start > 0
+        )
+
+    @staticmethod
+    def _complete_dllm_prefill(req: Req, result: GenerationBatchResult) -> None:
         """Transition to decode only after an exact model snapshot is published."""
+        region_spec = getattr(req, "region_dag_execution_spec", None)
+        if region_spec is not None:
+            publications = (
+                getattr(result, "region_dag_snapshot_publications", None) or {}
+            )
+            if req.req_pool_idx is None:
+                raise RuntimeError(
+                    "Region-DAG prefill completed without a request-pool slot"
+                )
+            publication = publications.get(int(req.req_pool_idx))
+            expected = dict(req.region_dag_frontier_keys)
+            if publication is None or publication != expected:
+                raise RuntimeError(
+                    "Region-DAG prefill completed without every exact GDN "
+                    f"frontier: expected={expected!r} observed={publication!r}"
+                )
+            req.region_dag_initialized = True
+            req.region_dag_restore_required = bool(
+                req.region_dag_mode == "cached"
+                and req.region_dag_runtime_plan.gdn_replay_start > 0
+            )
+
         spec = getattr(req, "hybrid_execution_spec", None)
         if spec is not None:
             publications = (
@@ -843,6 +953,7 @@ class SchedulerDllmMixin:
     ) -> ScheduleBatch:
         """Create and prepare a new DLLM batch."""
         for req in can_run_list:
+            self._prepare_region_dag_request(req)
             self._prepare_hybrid_request(req)
             if req.dllm_initial_kv_cache_hits is None:
                 req.dllm_initial_kv_cache_hits = min(
@@ -858,7 +969,25 @@ class SchedulerDllmMixin:
             self.spec_algorithm,
             dllm_config=self.dllm_config,
         )
-        new_batch.prepare_for_extend()
+        region_reqs = [
+            req
+            for req in can_run_list
+            if getattr(req, "region_dag_execution_spec", None) is not None
+        ]
+        if region_reqs and len(region_reqs) != len(can_run_list):
+            raise RuntimeError(
+                "Region-DAG requests cannot share a batch with legacy dLLM requests"
+            )
+        if region_reqs and all(req.region_dag_initialized for req in region_reqs):
+            new_batch.prepare_for_region_dag_replay()
+        else:
+            if region_reqs and any(req.region_dag_initialized for req in region_reqs):
+                raise RuntimeError(
+                    "Region-DAG reference and cached lifecycles cannot share a batch"
+                )
+            new_batch.prepare_for_extend()
+        for req in region_reqs:
+            self._bind_region_dag_request_slot(req)
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 

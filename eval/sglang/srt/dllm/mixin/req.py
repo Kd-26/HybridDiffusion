@@ -5,7 +5,15 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.dllm.region.execution_spec import HybridExecutionSpec
+from sglang.srt.dllm.region.execution_spec import (
+    HybridExecutionSpec,
+    RegionDAGExecutionSpec,
+)
+from sglang.srt.dllm.region.runtime import (
+    RegionDAGInstrumentation,
+    RegionDAGRuntimePlan,
+    build_region_dag_runtime_plan,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -50,8 +58,64 @@ class ReqDllmMixin:
         self.hybrid_model_identity = ""
         self.hybrid_model_revision = ""
         self.hybrid_adapter_revision = ""
-        if dllm_config is not None and getattr(
-            dllm_config, "exact_prefix_handoff", False
+        # Cluster-3 is an explicit request contract.  It never weakens or
+        # auto-selects over the validated Cluster-1 prefix/suffix lifecycle.
+        self.region_dag_execution_spec: Optional[RegionDAGExecutionSpec] = None
+        self.region_dag_runtime_plan: Optional[RegionDAGRuntimePlan] = None
+        self.region_dag_instrumentation: Optional[RegionDAGInstrumentation] = None
+        self.region_dag_mode = ""
+        self.region_dag_allow_full_replay = False
+        self.region_dag_initialized = False
+        self.region_dag_restore_required = False
+        self.region_dag_frontier_keys = {}
+        self.region_dag_model_identity = ""
+        self.region_dag_model_revision = ""
+        self.region_dag_adapter_revision = ""
+
+        sampling_params = getattr(self, "sampling_params", None)
+        custom_params = getattr(sampling_params, "custom_params", None)
+        region_request = (
+            custom_params.get("region_dag") if isinstance(custom_params, dict) else None
+        )
+        if region_request is not None:
+            if dllm_config is None:
+                raise ValueError("Region-DAG execution requires a dLLM configuration")
+            if not isinstance(region_request, dict):
+                raise TypeError("custom_params.region_dag must be an object")
+            if "execution_spec" not in region_request:
+                raise ValueError("Region-DAG request is missing execution_spec")
+            spec_value = region_request["execution_spec"]
+            self.region_dag_execution_spec = (
+                spec_value
+                if isinstance(spec_value, RegionDAGExecutionSpec)
+                else RegionDAGExecutionSpec.from_dict(spec_value)
+            )
+            if self.region_dag_execution_spec.sequence_length != len(
+                self.origin_input_ids
+            ):
+                raise ValueError(
+                    "Region-DAG sequence_length must equal the submitted token count"
+                )
+            self.region_dag_mode = str(region_request.get("mode", "cached"))
+            if self.region_dag_mode not in ("reference", "cached"):
+                raise ValueError("Region-DAG mode must be 'reference' or 'cached'")
+            self.region_dag_allow_full_replay = bool(
+                region_request.get("allow_full_replay", False)
+            )
+            edited_regions = tuple(region_request.get("edited_regions", ()))
+            self.region_dag_runtime_plan = build_region_dag_runtime_plan(
+                self.region_dag_execution_spec,
+                edited_regions,
+                force_full_replay=self.region_dag_mode == "reference",
+            )
+            self.region_dag_instrumentation = RegionDAGInstrumentation.from_plan(
+                self.region_dag_execution_spec, self.region_dag_runtime_plan
+            )
+
+        if (
+            self.region_dag_execution_spec is None
+            and dllm_config is not None
+            and getattr(dllm_config, "exact_prefix_handoff", False)
         ):
             self.hybrid_execution_spec = HybridExecutionSpec.prefix_diffusion(
                 ar_boundary=len(self.origin_input_ids),
@@ -70,7 +134,9 @@ class ReqDllmMixin:
             # Exact handoff needs one causal prefix forward to seal KV and GDN
             # state before any suffix decode can request a restore.  Short
             # prompts therefore cannot use the legacy decode-direct shortcut.
-            if self.hybrid_execution_spec is not None:
+            if self.region_dag_execution_spec is not None:
+                self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+            elif self.hybrid_execution_spec is not None:
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
             elif len(self.origin_input_ids) < self.dllm_config.block_size:
                 self.dllm_phase = DllmReqPhase.INCOMING_DECODE
@@ -87,6 +153,14 @@ class ReqDllmMixin:
         ]
 
     def determine_dllm_phase(self: Req):
+        # Region-DAG execution is a controlled paged-prefill operation.  It is
+        # finalized by its own lifecycle and must never enter legacy block
+        # decode based on MASK inspection.
+        if self.region_dag_execution_spec is not None:
+            if not self.region_dag_initialized:
+                self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+            return
+
         # An exact-handoff request cannot decode until its original causal
         # prefix has been materialized and published by the model.  In
         # particular, the diffusion MASK block appended to ``dllm_ids`` must
@@ -114,6 +188,13 @@ class ReqDllmMixin:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
 
     def _init_fill_ids_for_dllm(self: Req):
+        if self.region_dag_execution_spec is not None:
+            # The contract describes the complete canonical sequence.  Never
+            # append the legacy contiguous diffusion block to this route.
+            self.dllm_ids = list(self.origin_input_ids)
+            self.fill_ids = list(self.origin_input_ids)
+            return
+
         if not self.dllm_ids:
             self.dllm_ids = (
                 self.origin_input_ids

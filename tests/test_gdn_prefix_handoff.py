@@ -1,10 +1,13 @@
 import importlib.util
 import sys
 import types
+from collections import namedtuple
+from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
 
 import torch
+import pytest
 
 
 ROOT = Path(__file__).parents[1]
@@ -214,3 +217,229 @@ def test_kv_descriptor_change_prevents_restore():
     )
     assert not lookup.hit
     assert lookup.miss_reason is CACHE.RegionStateMissReason.POSITION_MISMATCH
+
+
+FrontierKey = namedtuple(
+    "FrontierKey",
+    (
+        "request_id",
+        "request_pool_idx",
+        "request_slot_generation",
+        "boundary",
+        "model_identity",
+        "model_revision",
+        "adapter_identity",
+        "adapter_revision",
+        "attention_contract_id",
+    ),
+)
+
+
+def frontier_key(boundary=8, revision="revision"):
+    return FrontierKey(
+        request_id="request-a",
+        request_pool_idx=1,
+        request_slot_generation=9,
+        boundary=boundary,
+        model_identity="model",
+        model_revision=revision,
+        adapter_identity="",
+        adapter_revision="",
+        attention_contract_id="region_dag_conservative_gdn_v1",
+    )
+
+
+def test_region_dag_layer_snapshot_is_immutable_and_restores_exactly():
+    backend = BACKEND_MODULE.GDNDllmBackend(
+        FakeBackend(), types.SimpleNamespace(num_hidden_layers=2)
+    )
+    conv = torch.randn(3, 2)
+    recurrent = torch.randn(2, 2, 3)
+    expected_conv = conv.clone()
+    expected_recurrent = recurrent.clone()
+    key = frontier_key()
+    backend._put_region_dag_layer_snapshot(
+        frontier_key=key,
+        layer_id=1,
+        conv_state=conv,
+        recurrent_state=recurrent,
+    )
+    conv.add_(100)
+    recurrent.zero_()
+    backend._restore_region_dag_layer_snapshot(
+        frontier_key=key,
+        layer_id=1,
+        conv_destination=conv,
+        recurrent_destination=recurrent,
+    )
+    assert torch.equal(conv, expected_conv)
+    assert torch.equal(recurrent, expected_recurrent)
+
+
+def test_region_dag_layer_snapshot_never_uses_later_or_wrong_revision_state():
+    backend = BACKEND_MODULE.GDNDllmBackend(
+        FakeBackend(), types.SimpleNamespace(num_hidden_layers=2)
+    )
+    conv = torch.randn(3, 2)
+    recurrent = torch.randn(2, 2, 3)
+    backend._put_region_dag_layer_snapshot(
+        frontier_key=frontier_key(boundary=16),
+        layer_id=1,
+        conv_state=conv,
+        recurrent_state=recurrent,
+    )
+    with pytest.raises(RuntimeError, match="frontier snapshot miss"):
+        backend._restore_region_dag_layer_snapshot(
+            frontier_key=frontier_key(boundary=8),
+            layer_id=1,
+            conv_destination=conv,
+            recurrent_destination=recurrent,
+        )
+    with pytest.raises(RuntimeError, match="frontier snapshot miss"):
+        backend._restore_region_dag_layer_snapshot(
+            frontier_key=frontier_key(boundary=16, revision="other"),
+            layer_id=1,
+            conv_destination=conv,
+            recurrent_destination=recurrent,
+        )
+
+
+def test_region_dag_layer_snapshots_are_removed_with_request_cleanup():
+    backend = BACKEND_MODULE.GDNDllmBackend(
+        FakeBackend(), types.SimpleNamespace(num_hidden_layers=2)
+    )
+    key = frontier_key()
+    backend._put_region_dag_layer_snapshot(
+        frontier_key=key,
+        layer_id=1,
+        conv_state=torch.randn(3, 2),
+        recurrent_state=torch.randn(2, 2, 3),
+    )
+    backend.invalidate_request_state("request-a")
+    assert not backend._region_dag_layer_snapshots
+
+
+def test_region_dag_frontier_publication_requires_every_gdn_layer():
+    backend = BACKEND_MODULE.GDNDllmBackend(
+        FakeBackend(), types.SimpleNamespace(num_hidden_layers=2)
+    )
+    key = frontier_key()
+    for layer_id in backend.gdn_layer_ids:
+        backend._put_region_dag_layer_snapshot(
+            frontier_key=key,
+            layer_id=layer_id,
+            conv_state=torch.randn(3, 2),
+            recurrent_state=torch.randn(2, 2, 3),
+        )
+    backend.validate_region_dag_frontiers([{key.boundary: key}])
+    del backend._region_dag_layer_snapshots[(key, backend.gdn_layer_ids[-1])]
+    with pytest.raises(RuntimeError, match="missing GDN layer snapshots"):
+        backend.validate_region_dag_frontiers([{key.boundary: key}])
+
+
+def _region_forward_backend():
+    cache = types.SimpleNamespace(
+        conv=[torch.zeros(3, 3)],
+        temporal=torch.zeros(3, 1, 1, 1),
+    )
+    pool = types.SimpleNamespace(mamba2_layer_cache=lambda _layer_id: cache)
+    backend = object.__new__(BACKEND_MODULE.GDNDllmBackend)
+    backend.req_to_token_pool = pool
+    backend.gdn_backend = types.SimpleNamespace(
+        forward_metadata=types.SimpleNamespace(
+            mamba_cache_indices=torch.tensor([1], dtype=torch.int32)
+        )
+    )
+    backend.gdn_layer_ids = [0]
+    backend._region_dag_layer_snapshots = OrderedDict()
+    backend._region_dag_layer_snapshot_limit = 64
+    return backend
+
+
+def _region_forward_batch(reference, positions):
+    boundaries = (0, 2, 4, 6, 8)
+    keys = {boundary: frontier_key(boundary=boundary) for boundary in boundaries}
+    regions = tuple(types.SimpleNamespace(start=start) for start in boundaries[:-1])
+    spec = types.SimpleNamespace(sequence_length=8, regions=regions)
+    return types.SimpleNamespace(
+        region_dag_execution_specs_cpu=[spec],
+        region_dag_query_positions_cpu=[tuple(positions)],
+        region_dag_frontier_keys_cpu=[keys],
+        region_dag_restore_required_cpu=[not reference and positions[0] > 0],
+        region_dag_reference_cpu=[reference],
+    )
+
+
+def test_region_dag_cached_gdn_replay_matches_full_ordered_reference(monkeypatch):
+    def fake_conv(
+        values,
+        _weights,
+        _bias,
+        *,
+        conv_states,
+        cache_indices,
+        **_kwargs,
+    ):
+        conv_states[int(cache_indices[0])].add_(values.sum(dim=1))
+        return values
+
+    def fake_gating(_a_log, a, b, _dt_bias):
+        return a, b
+
+    def fake_recurrence(*, q, initial_state, **_kwargs):
+        base = initial_state.reshape(1, 1, 1, 1)
+        output = q.cumsum(dim=1) + base
+        return output, output[:, -1].reshape_as(initial_state)
+
+    monkeypatch.setattr(BACKEND_MODULE, "causal_conv1d_fn", fake_conv)
+    monkeypatch.setattr(BACKEND_MODULE, "fused_gdn_gating", fake_gating)
+    monkeypatch.setattr(
+        BACKEND_MODULE, "fused_recurrent_gated_delta_rule", fake_recurrence
+    )
+    layer = types.SimpleNamespace(
+        layer_id=0,
+        conv_weights=None,
+        bias=None,
+        activation=None,
+        q_dim=1,
+        k_dim=1,
+        v_dim=1,
+        num_q_heads=1,
+        num_k_heads=1,
+        num_v_heads=1,
+        head_q_dim=1,
+        head_k_dim=1,
+        head_v_dim=1,
+        A_log=None,
+        dt_bias=None,
+    )
+    original = torch.arange(24, dtype=torch.float32).view(8, 3) / 10
+    a = torch.ones(8, 1)
+    b = torch.ones(8, 1)
+    cached_backend = _region_forward_backend()
+    cached_backend._forward_region_dag(
+        layer,
+        _region_forward_batch(True, range(8)),
+        original,
+        a,
+        b,
+    )
+
+    edited = original.clone()
+    edited[2:, 0].add_(0.5)
+    cached = cached_backend._forward_region_dag(
+        layer,
+        _region_forward_batch(False, range(2, 8)),
+        edited[2:],
+        a[2:],
+        b[2:],
+    )
+    full_backend = _region_forward_backend()
+    full = full_backend._forward_region_dag(
+        layer,
+        _region_forward_batch(True, range(8)),
+        edited,
+        a,
+        b,
+    )
+    assert torch.equal(cached, full[:, 2:])

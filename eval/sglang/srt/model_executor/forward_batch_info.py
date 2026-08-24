@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -437,6 +437,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     hybrid_adapter_identities_cpu: Optional[List[str]] = None
     hybrid_adapter_revisions_cpu: Optional[List[str]] = None
     hybrid_stable_token_ids_cpu: Optional[List[List[int]]] = None
+    # Cluster-3 CPU metadata and exact absolute query rows.
+    region_dag_execution_specs_cpu: Optional[List[Any]] = None
+    region_dag_runtime_plans_cpu: Optional[List[Any]] = None
+    region_dag_query_positions_cpu: Optional[List[Tuple[int, ...]]] = None
+    region_dag_frontier_keys_cpu: Optional[List[Dict[int, Any]]] = None
+    region_dag_restore_required_cpu: Optional[List[bool]] = None
+    region_dag_reference_cpu: Optional[List[bool]] = None
+    region_dag_allow_full_replay_cpu: Optional[List[bool]] = None
+    region_dag_custom_mask: Optional[torch.Tensor] = None
 
     # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
     multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
@@ -573,6 +582,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 "hybrid_adapter_identities_cpu",
                 "hybrid_adapter_revisions_cpu",
                 "hybrid_stable_token_ids_cpu",
+                "region_dag_execution_specs_cpu",
+                "region_dag_runtime_plans_cpu",
+                "region_dag_query_positions_cpu",
+                "region_dag_frontier_keys_cpu",
+                "region_dag_restore_required_cpu",
+                "region_dag_reference_cpu",
+                "region_dag_allow_full_replay_cpu",
             ):
                 setattr(ret, field_name, getattr(batch, field_name, None))
 
@@ -626,7 +642,49 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dllm_is_prefill = batch.dllm_config is not None and any(
             r.is_dllm_prefill() for r in batch.reqs
         )
-        if (
+        region_dag_specs = getattr(ret, "region_dag_execution_specs_cpu", None)
+        if region_dag_specs is not None:
+            query_positions_cpu = ret.region_dag_query_positions_cpu
+            if query_positions_cpu is None or len(query_positions_cpu) != ret.batch_size:
+                raise RuntimeError(
+                    "Region-DAG query-position metadata is missing or misbatched"
+                )
+            query_position_tensors = [
+                torch.tensor(positions, dtype=torch.int64, device=device)
+                for positions in query_positions_cpu
+            ]
+            query_counts = [int(value.numel()) for value in query_position_tensors]
+            if any(count <= 0 for count in query_counts):
+                raise RuntimeError("Region-DAG requests require nonempty query rows")
+            if sum(query_counts) != int(batch.input_ids.numel()):
+                raise RuntimeError(
+                    "Region-DAG query rows do not match submitted input tokens"
+                )
+            from sglang.srt.dllm.attention_mask import (
+                build_region_dag_paged_custom_mask,
+                select_region_dag_mask_backend,
+            )
+
+            ret.region_dag_custom_mask = build_region_dag_paged_custom_mask(
+                region_dag_specs, query_position_tensors, device=device
+            )
+            ret.dllm_selected_mask_backend = select_region_dag_mask_backend(
+                region_dag_specs[0].attention_contract_id
+            )
+            if any(
+                spec.attention_contract_id
+                != region_dag_specs[0].attention_contract_id
+                for spec in region_dag_specs
+            ):
+                raise RuntimeError(
+                    "Region-DAG attention contracts cannot differ within a batch"
+                )
+            ret.dllm_request_token_counts = query_counts
+            positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
+            ret.positions = torch.cat(query_position_tensors).to(
+                dtype=positions_dtype
+            )
+        elif (
             batch.dllm_config is not None
             and dllm_mask_types_cpu is not None
             and batch.extend_seq_lens is not None

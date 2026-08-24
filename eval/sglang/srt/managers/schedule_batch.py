@@ -36,6 +36,7 @@ import dataclasses
 import logging
 import os
 import re
+import time
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
@@ -2239,6 +2240,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         inline prefill requests use their full prompt tokens. The algorithm
         detects prefill requests (no MASKs) and handles them differently.
         """
+        region_reqs = [
+            req
+            for req in self.reqs
+            if getattr(req, "region_dag_execution_spec", None) is not None
+        ]
+        if region_reqs:
+            if len(region_reqs) != len(self.reqs):
+                raise RuntimeError(
+                    "Region-DAG requests cannot enter a mixed legacy decode batch"
+                )
+            return self.prepare_for_region_dag_replay()
+
         from sglang.srt.mem_cache.common import (
             alloc_paged_token_slots_extend,
             alloc_token_slots,
@@ -2586,6 +2599,137 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for i, req in enumerate(self.reqs):
             req.kv_committed_len = seq_lens[i]
             req.kv_allocated_len = seq_lens[i]
+        return True
+
+    def prepare_for_region_dag_replay(self):
+        """Prepare explicit absolute replay rows without allocating new KV pages.
+
+        A Region-DAG cached pass may overwrite only the physical KV locations
+        already owned by its canonical sequence.  The request page table stays
+        full-length; query rows are the ordered conservative GDN replay suffix.
+        """
+        started = time.perf_counter()
+        if not self.reqs:
+            raise RuntimeError("Region-DAG replay requires at least one request")
+
+        input_ids = []
+        query_positions = []
+        out_cache_locations = []
+        req_pool_indices = []
+        seq_lens = []
+        prefix_lens = []
+        extend_lens = []
+        pool_size = int(self.token_to_kv_pool_allocator.size)
+
+        for request_index, req in enumerate(self.reqs):
+            spec = getattr(req, "region_dag_execution_spec", None)
+            plan = getattr(req, "region_dag_runtime_plan", None)
+            if spec is None or plan is None:
+                raise RuntimeError(
+                    f"request {request_index} is missing Region-DAG metadata"
+                )
+            if not req.region_dag_initialized:
+                raise RuntimeError(
+                    f"request {request_index} has no initialized Region-DAG state"
+                )
+            if req.req_pool_idx is None:
+                raise RuntimeError(
+                    f"request {request_index} has no real request-pool slot"
+                )
+            if req.kv_committed_len < spec.sequence_length:
+                raise RuntimeError(
+                    f"request {request_index} canonical KV length "
+                    f"{req.kv_committed_len} is shorter than {spec.sequence_length}"
+                )
+            positions = tuple(plan.attention_query_positions)
+            expected = tuple(range(plan.gdn_replay_start, spec.sequence_length))
+            if positions != expected:
+                raise RuntimeError(
+                    f"request {request_index} Region-DAG replay rows are not the "
+                    "ordered conservative suffix"
+                )
+            live_locations = self.req_to_token_pool.req_to_token[
+                int(req.req_pool_idx), : spec.sequence_length
+            ]
+            if (
+                live_locations.ndim != 1
+                or live_locations.numel() != spec.sequence_length
+            ):
+                raise RuntimeError(
+                    f"request {request_index} canonical page table has invalid shape"
+                )
+            canonical_locations = (
+                live_locations.detach().to(dtype=torch.int64, copy=True).contiguous()
+            )
+            if canonical_locations.device != live_locations.device:
+                raise RuntimeError(
+                    f"request {request_index} canonical page table changed device"
+                )
+            if not bool(
+                ((canonical_locations > 0) & (canonical_locations <= pool_size))
+                .all()
+                .item()
+            ):
+                raise RuntimeError(
+                    f"request {request_index} has invalid physical KV locations"
+                )
+            position_tensor = torch.tensor(
+                positions, dtype=torch.int64, device=canonical_locations.device
+            )
+            selected_locations = canonical_locations[position_tensor].contiguous()
+            if selected_locations.dtype is not torch.int64:
+                raise RuntimeError("Region-DAG out_cache_loc must be torch.int64")
+
+            input_ids.extend(req.origin_input_ids[position] for position in positions)
+            query_positions.append(positions)
+            out_cache_locations.append(selected_locations)
+            req_pool_indices.append(int(req.req_pool_idx))
+            seq_lens.append(spec.sequence_length)
+            prefix_lens.append(plan.gdn_replay_start)
+            extend_lens.append(len(positions))
+            req.extend_input_len = len(positions)
+            req.extend_batch_idx += 1
+            metrics = req.region_dag_instrumentation
+            if metrics is not None:
+                metrics.kv_cache_hits += len(plan.reused_positions)
+
+        self.forward_mode = ForwardMode.DLLM_EXTEND
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
+        self.req_pool_indices = torch.tensor(
+            req_pool_indices, dtype=torch.int64, device=self.device
+        )
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.seq_lens = self.seq_lens_cpu.to(self.device, non_blocking=True)
+        self.orig_seq_lens = self.seq_lens.to(dtype=torch.int32)
+        self.seq_lens_sum = sum(seq_lens)
+        self.prefix_lens = prefix_lens
+        self.extend_lens = extend_lens
+        self.extend_num_tokens = sum(extend_lens)
+        self.extend_logprob_start_lens = None
+        self.extend_input_logprob_token_ids = None
+        self.out_cache_loc = torch.cat(out_cache_locations).contiguous()
+        self.output_ids = None
+        self.input_embeds = None
+        self.replace_embeds = None
+        self.replace_positions = None
+        self.multimodal_inputs = [req.multimodal_inputs for req in self.reqs]
+        self.token_type_ids = None
+        self.lora_ids = [req.lora_id for req in self.reqs]
+        self.mamba_track_indices = None
+        self.mamba_track_mask = None
+        self.mamba_track_seqlens = None
+        self._dllm_rpx_cpu = req_pool_indices
+        self._dllm_seq_lens_cpu = seq_lens
+        self._dllm_attn_mask_types_cpu = None
+        self.region_dag_query_positions_cpu = query_positions
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self, self.model_config.vocab_size
+        )
+        elapsed = time.perf_counter() - started
+        for req in self.reqs:
+            metrics = req.region_dag_instrumentation
+            if metrics is not None:
+                metrics.gather_scatter_time = elapsed
         return True
 
     def prepare_for_decode(self):
@@ -3001,6 +3145,75 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else []
                 for req in self.reqs
             ],
+            region_dag_execution_specs_cpu=(
+                [req.region_dag_execution_spec for req in self.reqs]
+                if self.reqs
+                and all(
+                    getattr(req, "region_dag_execution_spec", None) is not None
+                    for req in self.reqs
+                )
+                else None
+            ),
+            region_dag_runtime_plans_cpu=(
+                [req.region_dag_runtime_plan for req in self.reqs]
+                if self.reqs
+                and all(
+                    getattr(req, "region_dag_execution_spec", None) is not None
+                    for req in self.reqs
+                )
+                else None
+            ),
+            region_dag_query_positions_cpu=(
+                getattr(self, "region_dag_query_positions_cpu", None)
+                or (
+                    [
+                        tuple(range(req.region_dag_execution_spec.sequence_length))
+                        for req in self.reqs
+                    ]
+                    if self.reqs
+                    and all(
+                        getattr(req, "region_dag_execution_spec", None) is not None
+                        for req in self.reqs
+                    )
+                    else None
+                )
+            ),
+            region_dag_frontier_keys_cpu=(
+                [dict(req.region_dag_frontier_keys) for req in self.reqs]
+                if self.reqs
+                and all(
+                    getattr(req, "region_dag_execution_spec", None) is not None
+                    for req in self.reqs
+                )
+                else None
+            ),
+            region_dag_restore_required_cpu=(
+                [bool(req.region_dag_restore_required) for req in self.reqs]
+                if self.reqs
+                and all(
+                    getattr(req, "region_dag_execution_spec", None) is not None
+                    for req in self.reqs
+                )
+                else None
+            ),
+            region_dag_reference_cpu=(
+                [not bool(req.region_dag_initialized) for req in self.reqs]
+                if self.reqs
+                and all(
+                    getattr(req, "region_dag_execution_spec", None) is not None
+                    for req in self.reqs
+                )
+                else None
+            ),
+            region_dag_allow_full_replay_cpu=(
+                [bool(req.region_dag_allow_full_replay) for req in self.reqs]
+                if self.reqs
+                and all(
+                    getattr(req, "region_dag_execution_spec", None) is not None
+                    for req in self.reqs
+                )
+                else None
+            ),
             _dllm_overlap_fn=getattr(self, "_dllm_overlap_fn", None),
             reqs=self.reqs,
             has_grammar=self.has_grammar,
@@ -3227,6 +3440,15 @@ class ModelWorkerBatch:
     hybrid_adapter_revisions_cpu: Optional[List[str]] = None
     # Variable-length CPU fallback input; never captured as a graph tensor.
     hybrid_stable_token_ids_cpu: Optional[List[List[int]]] = None
+    # Cluster-3 immutable CPU metadata. Region requests are never mixed with
+    # the legacy prefix/suffix route and never captured as CUDA graph inputs.
+    region_dag_execution_specs_cpu: Optional[List[Any]] = None
+    region_dag_runtime_plans_cpu: Optional[List[Any]] = None
+    region_dag_query_positions_cpu: Optional[List[Tuple[int, ...]]] = None
+    region_dag_frontier_keys_cpu: Optional[List[Dict[int, Any]]] = None
+    region_dag_restore_required_cpu: Optional[List[bool]] = None
+    region_dag_reference_cpu: Optional[List[bool]] = None
+    region_dag_allow_full_replay_cpu: Optional[List[bool]] = None
     _dllm_overlap_fn: Optional[Any] = None
 
     # For constrained decoding

@@ -586,6 +586,59 @@ class FlashInferAttnBackend(AttentionBackend):
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify, False, False
             )
+        elif getattr(forward_batch, "region_dag_execution_specs_cpu", None) is not None:
+            from sglang.srt.dllm.attention_mask import (
+                validate_region_dag_paged_custom_mask,
+            )
+
+            specs = forward_batch.region_dag_execution_specs_cpu
+            query_positions = forward_batch.region_dag_query_positions_cpu
+            custom_mask = getattr(forward_batch, "region_dag_custom_mask", None)
+            if custom_mask is None:
+                raise RuntimeError(
+                    "Region-DAG forward is missing its custom paged mask"
+                )
+            if query_positions is None or len(query_positions) != len(specs):
+                raise RuntimeError(
+                    "Region-DAG forward has inconsistent query-position metadata"
+                )
+            query_counts = [len(positions) for positions in query_positions]
+            kv_counts = [int(spec.sequence_length) for spec in specs]
+            validate_region_dag_paged_custom_mask(custom_mask, query_counts, kv_counts)
+            prefix_lens = forward_batch.extend_prefix_lens
+            observed_query_counts = (
+                (forward_batch.seq_lens - prefix_lens).detach().cpu().tolist()
+            )
+            if observed_query_counts != query_counts:
+                raise RuntimeError(
+                    "Region-DAG FlashInfer query indptr differs from absolute rows: "
+                    f"observed={observed_query_counts} expected={query_counts}"
+                )
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                prefix_lens=prefix_lens,
+                prefill_wrappers=self.prefill_wrappers_paged,
+                use_ragged=False,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=None,
+                fixed_split_size=self.prefill_split_tile_size,
+                custom_mask=custom_mask,
+                dllm_native_bidir_mask=False,
+                dllm_attn_mask_types=None,
+            )
+            forward_batch.dllm_selected_mask_backend = "custom_paged"
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_paged,
+                False,
+                False,
+                dllm_force_bidir_mask=True,
+                dllm_selected_mask_backend="custom_paged",
+                dllm_planned_custom_mask=custom_mask,
+                dllm_native_bidir_mask=False,
+            )
         elif (
             forward_batch.forward_mode.is_dllm_mode()
             and self.is_hybrid_diffusion_algorithm

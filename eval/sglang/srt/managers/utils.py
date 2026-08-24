@@ -35,6 +35,7 @@ class GenerationBatchResult:
     mamba_track_commit_info: Optional[dict] = None
     hybrid_boundary_commits: Optional[dict[int, HybridBoundaryCommit]] = None
     hybrid_snapshot_publications: Optional[dict[int, RegionStateKey]] = None
+    region_dag_snapshot_publications: Optional[dict[int, dict[int, object]]] = None
 
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
