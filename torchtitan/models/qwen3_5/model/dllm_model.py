@@ -154,6 +154,160 @@ def create_block_diff_4d_mask(
 
 
 # ---------------------------------------------------------------------------
+# Pure Region-DAG reference masks (not wired into the training forward path)
+# ---------------------------------------------------------------------------
+
+REGION_DAG_CONSERVATIVE_GDN_V1 = "region_dag_conservative_gdn_v1"
+
+
+def _region_dag_reference_value(value, name):
+    return value[name] if isinstance(value, dict) else getattr(value, name)
+
+
+def create_region_dag_attention_mask(
+    region_contract,
+    query_positions=None,
+    device=None,
+):
+    """Create the canonical boolean Region-DAG reference mask.
+
+    Parent visibility is the complete transitive ancestor closure. This helper
+    is intentionally independent of the `[x0; xt]` training forward and exists
+    only as a pure reference oracle.
+    """
+    contract_id = str(
+        _region_dag_reference_value(region_contract, "attention_contract_id")
+    )
+    if contract_id != REGION_DAG_CONSERVATIVE_GDN_V1:
+        raise ValueError(f"unsupported Region-DAG contract {contract_id!r}")
+    sequence_length = int(
+        _region_dag_reference_value(region_contract, "sequence_length")
+    )
+    regions = tuple(_region_dag_reference_value(region_contract, "regions"))
+    by_id = {
+        str(_region_dag_reference_value(region, "region_id")): region
+        for region in regions
+    }
+    if sequence_length <= 0 or not regions or len(by_id) != len(regions):
+        raise ValueError("invalid Region-DAG reference partition")
+
+    membership = [""] * sequence_length
+    cursor = 0
+    for region in sorted(
+        regions,
+        key=lambda value: int(_region_dag_reference_value(value, "start")),
+    ):
+        region_id = str(_region_dag_reference_value(region, "region_id"))
+        start = int(_region_dag_reference_value(region, "start"))
+        end = int(_region_dag_reference_value(region, "end"))
+        if start != cursor or end <= start:
+            raise ValueError("invalid Region-DAG reference interval partition")
+        parents = tuple(_region_dag_reference_value(region, "parent_region_ids"))
+        if any(parent not in by_id for parent in parents):
+            raise ValueError(f"region {region_id!r} has an unknown parent")
+        membership[start:end] = [region_id] * (end - start)
+        cursor = end
+    if cursor != sequence_length:
+        raise ValueError("Region-DAG reference partition does not cover the sequence")
+
+    target_device = torch.device(device) if device is not None else torch.device("cpu")
+    if query_positions is None:
+        query_positions = torch.arange(
+            sequence_length, dtype=torch.int64, device=target_device
+        )
+    elif not torch.is_tensor(query_positions):
+        query_positions = torch.tensor(
+            query_positions, dtype=torch.int64, device=target_device
+        )
+    else:
+        if query_positions.dtype is not torch.int64 or query_positions.ndim != 1:
+            raise ValueError("Region-DAG reference query positions must be 1-D int64")
+        query_positions = query_positions.to(device=target_device)
+    values = query_positions.detach().cpu().tolist()
+    if (
+        not values
+        or values != sorted(values)
+        or len(set(values)) != len(values)
+        or values[0] < 0
+        or values[-1] >= sequence_length
+    ):
+        raise ValueError("invalid Region-DAG reference query positions")
+
+    def ancestors(region_id):
+        found = set()
+        visiting = set()
+
+        def visit(current):
+            if current in visiting:
+                raise ValueError("Region-DAG reference graph contains a cycle")
+            visiting.add(current)
+            for parent in _region_dag_reference_value(
+                by_id[current], "parent_region_ids"
+            ):
+                if parent not in found:
+                    visit(parent)
+                    found.add(parent)
+            visiting.remove(current)
+
+        visit(region_id)
+        return found
+
+    mask = torch.zeros(
+        (len(values), sequence_length), dtype=torch.bool, device=target_device
+    )
+    for row, query_position in enumerate(values):
+        region_id = membership[query_position]
+        region = by_id[region_id]
+        status = str(_region_dag_reference_value(region, "status"))
+        if status.startswith("RegionStatus."):
+            status = status.rsplit(".", 1)[-1].lower()
+        for ancestor_id in ancestors(region_id):
+            ancestor = by_id[ancestor_id]
+            ancestor_status = str(_region_dag_reference_value(ancestor, "status"))
+            if ancestor_status.startswith("RegionStatus."):
+                ancestor_status = ancestor_status.rsplit(".", 1)[-1].lower()
+            if status == "stable" and ancestor_status != "stable":
+                raise ValueError("stable Region-DAG query has an active ancestor")
+            mask[
+                row,
+                int(_region_dag_reference_value(ancestor, "start")) : int(
+                    _region_dag_reference_value(ancestor, "end")
+                ),
+            ] = True
+        start = int(_region_dag_reference_value(region, "start"))
+        end = int(_region_dag_reference_value(region, "end"))
+        if status == "stable":
+            mask[row, start : query_position + 1] = True
+        elif status == "active":
+            mask[row, start:end] = True
+        else:
+            raise ValueError(f"invalid Region-DAG status {status!r}")
+    return mask.contiguous()
+
+
+def create_region_dag_4d_mask(
+    region_contract,
+    batch_size,
+    dtype,
+    device,
+    query_positions=None,
+):
+    """Convert the pure Region-DAG boolean oracle to an additive 4-D mask."""
+    if int(batch_size) <= 0:
+        raise ValueError("Region-DAG reference batch size must be positive")
+    boolean_mask = create_region_dag_attention_mask(
+        region_contract,
+        query_positions=query_positions,
+        device=device,
+    )
+    attention_mask = torch.zeros(
+        boolean_mask.shape, dtype=dtype, device=boolean_mask.device
+    )
+    attention_mask.masked_fill_(~boolean_mask, torch.finfo(dtype).min)
+    return attention_mask.unsqueeze(0).unsqueeze(0).expand(int(batch_size), -1, -1, -1)
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
