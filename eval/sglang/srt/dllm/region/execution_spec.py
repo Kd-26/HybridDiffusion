@@ -9,6 +9,7 @@ from typing import Any, Mapping, Tuple
 
 
 HYBRID_ATTENTION_CONTRACT_V1 = "causal_prefix_diffusion_suffix_v1"
+REGION_DAG_CONSERVATIVE_GDN_V1 = "region_dag_conservative_gdn_v1"
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,11 @@ class HybridExecutionRoute(str, Enum):
     PREFIX_DIFFUSION = "prefix_diffusion"
 
 
+class RegionStatus(str, Enum):
+    STABLE = "stable"
+    ACTIVE = "active"
+
+
 @dataclass(frozen=True, order=True)
 class PositionInterval:
     """Compact half-open token interval; positions are never materialized."""
@@ -107,6 +113,259 @@ class PositionInterval:
     @property
     def length(self) -> int:
         return self.end - self.start
+
+
+@dataclass(frozen=True)
+class RegionDAGRegion:
+    """One immutable contiguous region in a Region-DAG request."""
+
+    region_id: str
+    region_version: int
+    start: int
+    end: int
+    status: RegionStatus
+    parent_region_ids: Tuple[str, ...]
+    recorded_parent_versions: Tuple[Tuple[str, int], ...]
+    token_hash: str
+    position_hash: str
+    attention_contract_id: str = REGION_DAG_CONSERVATIVE_GDN_V1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", RegionStatus(self.status))
+        object.__setattr__(self, "parent_region_ids", tuple(self.parent_region_ids))
+        object.__setattr__(
+            self,
+            "recorded_parent_versions",
+            tuple(
+                (str(region_id), int(version))
+                for region_id, version in self.recorded_parent_versions
+            ),
+        )
+        if not self.region_id:
+            raise ValueError("Region-DAG region_id must be nonempty")
+        if self.region_version < 0:
+            raise ValueError(f"region {self.region_id!r} has a negative version")
+        if self.start < 0 or self.end <= self.start:
+            raise ValueError(
+                f"region {self.region_id!r} has invalid half-open interval "
+                f"[{self.start}, {self.end})"
+            )
+        if any(not parent for parent in self.parent_region_ids):
+            raise ValueError(f"region {self.region_id!r} has an empty parent ID")
+        if len(set(self.parent_region_ids)) != len(self.parent_region_ids):
+            raise ValueError(f"region {self.region_id!r} has duplicate parents")
+        if self.region_id in self.parent_region_ids:
+            raise ValueError(f"region {self.region_id!r} cannot depend on itself")
+        recorded_ids = tuple(
+            region_id for region_id, _ in self.recorded_parent_versions
+        )
+        if recorded_ids != self.parent_region_ids:
+            raise ValueError(
+                f"region {self.region_id!r} recorded parent versions must "
+                "follow the declared parent order exactly"
+            )
+        if any(version < 0 for _, version in self.recorded_parent_versions):
+            raise ValueError(
+                f"region {self.region_id!r} has a negative recorded parent version"
+            )
+        if not self.token_hash or not self.position_hash:
+            raise ValueError(
+                f"region {self.region_id!r} token and position hashes must be nonempty"
+            )
+        if self.attention_contract_id != REGION_DAG_CONSERVATIVE_GDN_V1:
+            raise ValueError(
+                f"region {self.region_id!r} has unsupported attention contract "
+                f"{self.attention_contract_id!r}"
+            )
+
+    @property
+    def interval(self) -> PositionInterval:
+        return PositionInterval(self.start, self.end)
+
+    @property
+    def is_stable(self) -> bool:
+        return self.status is RegionStatus.STABLE
+
+    @property
+    def is_active(self) -> bool:
+        return self.status is RegionStatus.ACTIVE
+
+    def to_dict(self) -> dict[str, Any]:
+        record = asdict(self)
+        record["status"] = self.status.value
+        return record
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "RegionDAGRegion":
+        return cls(
+            region_id=str(value["region_id"]),
+            region_version=int(value["region_version"]),
+            start=int(value["start"]),
+            end=int(value["end"]),
+            status=RegionStatus(value["status"]),
+            parent_region_ids=tuple(value.get("parent_region_ids", ())),
+            recorded_parent_versions=tuple(
+                (str(region_id), int(version))
+                for region_id, version in value.get("recorded_parent_versions", ())
+            ),
+            token_hash=str(value["token_hash"]),
+            position_hash=str(value["position_hash"]),
+            attention_contract_id=str(value["attention_contract_id"]),
+        )
+
+
+@dataclass(frozen=True)
+class RegionDAGExecutionSpec:
+    """Immutable opt-in contract for multiple stable and active regions."""
+
+    sequence_length: int
+    regions: Tuple[RegionDAGRegion, ...]
+    diffusion_steps: int
+    attention_contract_id: str = REGION_DAG_CONSERVATIVE_GDN_V1
+
+    def __post_init__(self) -> None:
+        regions = tuple(
+            region if isinstance(region, RegionDAGRegion) else RegionDAGRegion(**region)
+            for region in self.regions
+        )
+        object.__setattr__(
+            self,
+            "regions",
+            tuple(sorted(regions, key=lambda region: (region.start, region.end))),
+        )
+        self.validate()
+
+    @property
+    def region_ids(self) -> Tuple[str, ...]:
+        return tuple(region.region_id for region in self.regions)
+
+    @property
+    def stable_regions(self) -> Tuple[RegionDAGRegion, ...]:
+        return tuple(region for region in self.regions if region.is_stable)
+
+    @property
+    def active_regions(self) -> Tuple[RegionDAGRegion, ...]:
+        return tuple(region for region in self.regions if region.is_active)
+
+    def region(self, region_id: str) -> RegionDAGRegion:
+        for region in self.regions:
+            if region.region_id == region_id:
+                return region
+        raise KeyError(f"unknown Region-DAG region {region_id!r}")
+
+    def validate(self) -> None:
+        if self.attention_contract_id != REGION_DAG_CONSERVATIVE_GDN_V1:
+            raise ValueError(
+                f"unsupported Region-DAG attention contract "
+                f"{self.attention_contract_id!r}"
+            )
+        if self.sequence_length <= 0:
+            raise ValueError("Region-DAG sequence_length must be positive")
+        if self.diffusion_steps <= 0:
+            raise ValueError("Region-DAG diffusion_steps must be positive")
+        if not self.regions:
+            raise ValueError("Region-DAG requires at least one region")
+        if len(set(self.region_ids)) != len(self.region_ids):
+            raise ValueError("Region-DAG region IDs must be unique")
+        if not self.active_regions:
+            raise ValueError("Region-DAG requires at least one active region")
+
+        cursor = 0
+        for region in self.regions:
+            if region.attention_contract_id != self.attention_contract_id:
+                raise ValueError(
+                    f"region {region.region_id!r} attention contract differs "
+                    "from its Region-DAG execution spec"
+                )
+            if region.start < cursor:
+                raise ValueError(
+                    f"region {region.region_id!r} overlaps an earlier interval "
+                    f"at position {region.start}"
+                )
+            if region.start > cursor:
+                raise ValueError(f"Region-DAG has a gap [{cursor}, {region.start})")
+            cursor = region.end
+        if cursor != self.sequence_length:
+            raise ValueError(
+                f"Region-DAG intervals end at {cursor}, expected "
+                f"sequence_length={self.sequence_length}"
+            )
+
+        by_id = {region.region_id: region for region in self.regions}
+        for region in self.regions:
+            missing = [
+                parent for parent in region.parent_region_ids if parent not in by_id
+            ]
+            if missing:
+                raise ValueError(
+                    f"region {region.region_id!r} has unknown parents {missing}"
+                )
+            expected_parent_versions = tuple(
+                (parent, by_id[parent].region_version)
+                for parent in region.parent_region_ids
+            )
+            if region.recorded_parent_versions != expected_parent_versions:
+                raise ValueError(
+                    f"region {region.region_id!r} recorded parent versions "
+                    f"{region.recorded_parent_versions} do not match current "
+                    f"versions {expected_parent_versions}"
+                )
+
+        state: dict[str, int] = {}
+
+        def visit(region_id: str) -> None:
+            marker = state.get(region_id, 0)
+            if marker == 1:
+                raise ValueError(f"Region-DAG contains a cycle at {region_id!r}")
+            if marker == 2:
+                return
+            state[region_id] = 1
+            for parent in by_id[region_id].parent_region_ids:
+                visit(parent)
+            state[region_id] = 2
+
+        for region_id in self.region_ids:
+            visit(region_id)
+
+        for region in self.stable_regions:
+            pending = list(region.parent_region_ids)
+            seen = set()
+            while pending:
+                ancestor_id = pending.pop()
+                if ancestor_id in seen:
+                    continue
+                seen.add(ancestor_id)
+                ancestor = by_id[ancestor_id]
+                if ancestor.is_active:
+                    raise ValueError(
+                        f"stable region {region.region_id!r} depends on active "
+                        f"ancestor {ancestor_id!r}"
+                    )
+                pending.extend(ancestor.parent_region_ids)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sequence_length": self.sequence_length,
+            "regions": [region.to_dict() for region in self.regions],
+            "diffusion_steps": self.diffusion_steps,
+            "attention_contract_id": self.attention_contract_id,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "RegionDAGExecutionSpec":
+        return cls(
+            sequence_length=int(value["sequence_length"]),
+            regions=tuple(
+                (
+                    region
+                    if isinstance(region, RegionDAGRegion)
+                    else RegionDAGRegion.from_dict(region)
+                )
+                for region in value["regions"]
+            ),
+            diffusion_steps=int(value["diffusion_steps"]),
+            attention_contract_id=str(value["attention_contract_id"]),
+        )
 
 
 @dataclass(frozen=True)
