@@ -166,3 +166,28 @@ flow without new branches in their hot path.
 - Training-only `[x0; xt]` construction is not reused as a production serving
   shortcut.
 - Instrumentation hooks only actual `torch.nn.Module` objects.
+
+## Post-implementation overlap conclusion
+
+The implementation uses the audited production objects rather than adding a
+parallel serving engine. `Req` owns the opt-in immutable contract and runtime
+plan; `ScheduleBatch` gathers the conservative replay suffix from the existing
+real page table; `ForwardBatch` preserves absolute positions and builds the
+contract mask; the existing FlashInfer backend plans `custom_paged`; the
+existing Qwen layers execute the rows; and `GDNDllmBackend` restores and
+publishes layer-local frontier snapshots. `HybridDiffusionSelfSpec` remains the
+model-authoritative publisher consumed by the scheduler.
+
+The new Region-DAG branch is mutually exclusive with Cluster-1 exact-prefix
+handoff and is isolated from legacy dLLM batches. Non-Region requests retain
+their former lifecycle. The allocator's int32 page table is unchanged;
+external selected locations remain detached contiguous int64. No training
+forward, loss, checkpoint, precision policy, or dependency was changed.
+
+The controlled exporter reuses the Cluster-1 real-model loader and tensor
+hashing and the Cluster-2 verified Qwen row hooks. This is intentional
+instrumentation reuse, not runtime duplication. It adds validator-scoped CUDA
+event probes to concrete full-attention and GDN backend calls and removes them
+on normal and exceptional exits. A missing probe, frontier, request slot,
+custom mask, comparison tensor, or timing sample is a failure rather than an
+inferred zero.
