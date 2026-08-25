@@ -2,6 +2,7 @@ import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +25,94 @@ def load_module():
 MODULE = load_module()
 
 
+def fused_qkvzba_split_reshape_cat_contiguous(qkvz, ba, *_args):
+    """Test stand-in patched by LayerZeroEvidence like the Qwen CUDA helper."""
+    return qkvz, qkvz, ba, ba
+
+
+class FakeLinearAttention(torch.nn.Module):
+    def __init__(self, *, out_proj_keyword=False):
+        super().__init__()
+        self.in_proj_qkvz = torch.nn.Identity()
+        self.in_proj_ba = torch.nn.Identity()
+        self.attn = torch.nn.Identity()
+        self.out_proj = torch.nn.Identity()
+        self.out_proj_keyword = out_proj_keyword
+
+    def forward(self, hidden_states):
+        qkvz = self.in_proj_qkvz(hidden_states)
+        ba = self.in_proj_ba(hidden_states)
+        mixed_qkv, _z, _b, _a = fused_qkvzba_split_reshape_cat_contiguous(qkvz, ba)
+        core = self.attn(mixed_qkv)
+        if self.out_proj_keyword:
+            return self.out_proj(input=core)
+        return self.out_proj(core)
+
+
+class FakeDecoderLayer(torch.nn.Module):
+    layer_id = 0
+
+    def __init__(self, *, out_proj_keyword=False):
+        super().__init__()
+        self.input_layernorm = torch.nn.Identity()
+        self.linear_attn = FakeLinearAttention(out_proj_keyword=out_proj_keyword)
+
+    def forward(self, hidden_states):
+        hidden = self.input_layernorm(hidden_states)
+        hidden = self.linear_attn(hidden)
+        return hidden, torch.zeros_like(hidden)
+
+
+class FakeBackend:
+    def _restore_region_dag_layer_snapshot(self, **_kwargs):
+        return None
+
+
+def make_hook_runtime(*, out_proj_keyword=False):
+    layer = FakeDecoderLayer(out_proj_keyword=out_proj_keyword)
+
+    class ModelTraceHooks:
+        @staticmethod
+        def _language_model(model):
+            return model
+
+    runtime = SimpleNamespace(
+        cluster1=SimpleNamespace(ModelTraceHooks=ModelTraceHooks),
+        model_runner=SimpleNamespace(model=SimpleNamespace(layers=[layer])),
+        backend=FakeBackend(),
+    )
+    return runtime, layer
+
+
+def run_hook_capture(*, layer_keyword=False, out_proj_keyword=False):
+    runtime, layer = make_hook_runtime(out_proj_keyword=out_proj_keyword)
+    hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    with MODULE.LayerZeroEvidence(runtime) as evidence:
+        with evidence.capture("test", rows=3):
+            if layer_keyword:
+                layer(hidden_states=hidden)
+            else:
+                layer(hidden)
+        values = dict(evidence.values["test"])
+    return hidden, values, evidence, layer
+
+
+def hook_count(layer):
+    modules = (
+        layer,
+        layer.input_layernorm,
+        layer.linear_attn,
+        layer.linear_attn.in_proj_qkvz,
+        layer.linear_attn.in_proj_ba,
+        layer.linear_attn.attn,
+        layer.linear_attn.out_proj,
+    )
+    return sum(
+        len(module._forward_pre_hooks) + len(module._forward_hooks)
+        for module in modules
+    )
+
+
 def test_cli_help_does_not_load_model_or_cuda():
     completed = subprocess.run(
         [sys.executable, str(SCRIPT), "--help"],
@@ -34,6 +123,83 @@ def test_cli_help_does_not_load_model_or_cuda():
     )
     assert "--output-dir" in completed.stdout
     assert "freshly segmented" in completed.stdout
+
+
+def test_decoder_layer_pre_hook_accepts_entirely_positional_invocation():
+    hidden, values, _evidence, _layer = run_hook_capture()
+    assert torch.equal(values["decoder_layer_input_hidden_states"], hidden)
+
+
+def test_decoder_layer_pre_hook_accepts_entirely_keyword_invocation():
+    hidden, values, _evidence, _layer = run_hook_capture(layer_keyword=True)
+    assert torch.equal(values["decoder_layer_input_hidden_states"], hidden)
+
+
+def test_hook_tensor_resolver_prioritizes_hidden_states_keyword():
+    positional = torch.zeros(2, 3)
+    preferred = torch.ones(2, 3)
+    resolved = MODULE._resolve_hook_tensor(
+        (positional,),
+        {"hidden_states": preferred},
+        preferred_keyword="hidden_states",
+        evidence_name="decoder_layer_input_hidden_states",
+    )
+    assert resolved is preferred
+
+
+def test_empty_positional_inputs_use_keyword_tensor_without_index_error():
+    hidden = torch.ones(2, 3)
+    resolved = MODULE._resolve_hook_tensor(
+        (),
+        {"hidden_states": hidden},
+        preferred_keyword="hidden_states",
+        evidence_name="decoder_layer_input_hidden_states",
+    )
+    assert resolved is hidden
+
+
+def test_hook_tensor_resolver_fails_closed_when_no_tensor_exists():
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "decoder_layer_input_hidden_states hook received no tensor input; "
+            "positional_count=0, keyword_keys=\\['hidden_states'\\]"
+        ),
+    ):
+        MODULE._resolve_hook_tensor(
+            (),
+            {"hidden_states": "not-a-tensor"},
+            preferred_keyword="hidden_states",
+            evidence_name="decoder_layer_input_hidden_states",
+        )
+
+
+def test_out_proj_pre_hook_accepts_positional_input():
+    hidden, values, _evidence, _layer = run_hook_capture()
+    assert torch.equal(values["gdn_output_before_output_projection"], hidden)
+
+
+def test_out_proj_pre_hook_accepts_keyword_input():
+    hidden, values, _evidence, _layer = run_hook_capture(out_proj_keyword=True)
+    assert torch.equal(values["gdn_output_before_output_projection"], hidden)
+
+
+def test_layer_zero_hooks_are_removed_after_normal_completion():
+    _hidden, _values, evidence, layer = run_hook_capture(
+        layer_keyword=True, out_proj_keyword=True
+    )
+    assert evidence.released
+    assert hook_count(layer) == 0
+
+
+def test_layer_zero_hooks_are_removed_after_capture_exception():
+    runtime, layer = make_hook_runtime()
+    with pytest.raises(RuntimeError, match="received no tensor input"):
+        with MODULE.LayerZeroEvidence(runtime) as evidence:
+            with evidence.capture("test", rows=3):
+                layer(hidden_states="not-a-tensor")
+    assert evidence.released
+    assert hook_count(layer) == 0
 
 
 def test_segmented_reference_freshly_recomputes_prefix_every_time():

@@ -91,6 +91,35 @@ def _first_tensor(value: Any) -> Any:
     return None
 
 
+def _resolve_hook_tensor(
+    inputs: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    *,
+    preferred_keyword: Optional[str] = None,
+    evidence_name: str,
+) -> Any:
+    """Resolve hook evidence across positional and keyword module calls."""
+    if preferred_keyword is not None and preferred_keyword in kwargs:
+        tensor = _first_tensor(kwargs[preferred_keyword])
+        if tensor is not None:
+            return tensor
+
+    tensor = _first_tensor(inputs)
+    if tensor is not None:
+        return tensor
+
+    # Controlled compatibility fallback for modules with a different keyword
+    # parameter name. Forward-hook kwargs are ordered by the Python call.
+    tensor = _first_tensor(tuple(kwargs.values()))
+    if tensor is not None:
+        return tensor
+
+    raise RuntimeError(
+        f"{evidence_name} hook received no tensor input; "
+        f"positional_count={len(inputs)}, keyword_keys={sorted(kwargs)}"
+    )
+
+
 def _cpu_tensor(value: Any) -> Any:
     torch = __import__("torch")
     if not torch.is_tensor(value):
@@ -268,11 +297,17 @@ class LayerZeroEvidence:
         )
 
     def _install_hooks(self) -> None:
-        def layer_pre(
-            _module: Any, inputs: tuple[Any, ...], _kwargs: Mapping[str, Any]
-        ):
+        def layer_pre(_module: Any, inputs: tuple[Any, ...], kwargs: Mapping[str, Any]):
             if self.active_label is not None:
-                self._record("decoder_layer_input_hidden_states", inputs[0])
+                self._record(
+                    "decoder_layer_input_hidden_states",
+                    _resolve_hook_tensor(
+                        inputs,
+                        kwargs,
+                        preferred_keyword="hidden_states",
+                        evidence_name="decoder_layer_input_hidden_states",
+                    ),
+                )
 
         def layer_post(_module: Any, _inputs: Any, output: Any):
             if self.active_label is None:
@@ -297,8 +332,20 @@ class LayerZeroEvidence:
             return hook
 
         def pre_hook(name: str) -> Callable[..., None]:
-            def hook(_module: Any, inputs: tuple[Any, ...], _kwargs: Mapping[str, Any]):
-                self._record(name, inputs[0])
+            def hook(
+                _module: Any,
+                inputs: tuple[Any, ...],
+                kwargs: Mapping[str, Any],
+            ):
+                if self.active_label is not None:
+                    self._record(
+                        name,
+                        _resolve_hook_tensor(
+                            inputs,
+                            kwargs,
+                            evidence_name=name,
+                        ),
+                    )
 
             return hook
 
