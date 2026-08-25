@@ -191,3 +191,30 @@ event probes to concrete full-attention and GDN backend calls and removes them
 on normal and exceptional exits. A missing probe, frontier, request slot,
 custom mask, comparison tensor, or timing sample is a failure rather than an
 inferred zero.
+
+## Canonical frontier-construction repair
+
+The A30 provenance diagnostic established that cache cloning and restoration
+were exact (`S == R == D`), but production initialization was not canonical.
+It published boundary snapshots while processing an N-row monolithic prefill.
+The strict segmented oracle built the same boundary with a b-row prefix
+execution, so BF16 projection/kernel tiling produced a different live GDN
+frontier before any cache operation. This was production-visible, not only a
+validator labeling error.
+
+Positive-frontier cached requests now use two scheduler-owned prefill rounds.
+The first executes exactly `[0:b)` at the original absolute positions using a
+projected `region_dag_conservative_gdn_v1` contract and publishes only
+frontiers at or before `b`. The scheduler verifies that publication and the KV
+boundary before marking the frontier established. The second round attaches
+`[b:N)`, requires restoration of the committed boundary, and publishes the
+complete frontier set before decode initialization. Entirely active requests
+with `b=0` keep the existing full-replay lifecycle.
+
+The projection preserves declared region statuses, parent ordering, versions,
+token/position hashes, BF16 dtype, and the source attention contract. It does
+not fork recurrent state or merge parents: GDN still replays the conservative
+ordered suffix. Batch-specific execution specs, query positions, frontier
+maps, restore flags, and reference flags are carried through
+`ModelWorkerBatch`; they are never reconstructed from the full request during
+the prefix round.

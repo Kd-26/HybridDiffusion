@@ -525,7 +525,7 @@ class LayerZeroEvidence:
 
 
 class FrontierStateProvenance:
-    """Scoped L/S/R/D trace around authoritative Region-DAG state operations."""
+    """Scoped B/L/S/R/D trace around canonical frontier state operations."""
 
     def __init__(self, runtime: Any, boundary: int):
         self.runtime = runtime
@@ -605,6 +605,35 @@ class FrontierStateProvenance:
                     self.active_phase == "snapshot"
                     and int(frontier_key.boundary) == self.boundary
                 )
+                if should_capture:
+                    self._generation += 1
+                    generation = self._generation
+                    assert self.active_step is not None
+                    self._snapshot_generations[(self.active_step, layer_id)] = (
+                        generation
+                    )
+                    mamba_slot = self.backend._current_mamba_slot(
+                        int(frontier_key.request_pool_idx)
+                    )
+                    for state_kind, source in (
+                        ("convolution", kwargs["conv_state"]),
+                        ("recurrent", kwargs["recurrent_state"]),
+                    ):
+                        self._checkpoint(
+                            checkpoint="L",
+                            state_kind=state_kind,
+                            tensor=source,
+                            frontier_key=frontier_key,
+                            layer_id=layer_id,
+                            mamba_state_slot=mamba_slot,
+                            snapshot_generation=generation,
+                            source_slot_generation=int(
+                                frontier_key.request_slot_generation
+                            ),
+                            destination_slot_generation=int(
+                                frontier_key.request_slot_generation
+                            ),
+                        )
                 result = original(*args, **kwargs)
                 if not should_capture:
                     return result
@@ -613,13 +642,6 @@ class FrontierStateProvenance:
                 )
                 if snapshot is None:
                     raise RuntimeError("published frontier snapshot is unavailable")
-                self._generation += 1
-                generation = self._generation
-                assert self.active_step is not None
-                self._snapshot_generations[(self.active_step, layer_id)] = generation
-                mamba_slot = self.backend._current_mamba_slot(
-                    int(frontier_key.request_pool_idx)
-                )
                 for state_kind, source, stored in (
                     ("convolution", kwargs["conv_state"], snapshot.conv_state),
                     (
@@ -758,7 +780,7 @@ class FrontierStateProvenance:
         finally:
             self.active_phase = None
 
-    def record_live_prefix(self, req: Any) -> None:
+    def record_reference_frontier(self, req: Any) -> None:
         if self.active_step is None:
             raise RuntimeError("frontier provenance has no active diffusion step")
         frontier_key = req.region_dag_frontier_keys.get(self.boundary)
@@ -774,7 +796,7 @@ class FrontierStateProvenance:
                 ("recurrent", cache.temporal[mamba_slot]),
             ):
                 self._checkpoint(
-                    checkpoint="L",
+                    checkpoint="B",
                     state_kind=state_kind,
                     tensor=tensor,
                     frontier_key=frontier_key,
@@ -805,7 +827,9 @@ class FrontierStateProvenance:
             for state_kind in ("convolution", "recurrent"):
                 checkpoints = tensors[layer_id].get(state_kind, {})
                 missing = [
-                    name for name in ("L", "S", "R", "D") if name not in checkpoints
+                    name
+                    for name in ("B", "L", "S", "R", "D")
+                    if name not in checkpoints
                 ]
                 if missing:
                     raise RuntimeError(
@@ -813,7 +837,13 @@ class FrontierStateProvenance:
                         f"is missing checkpoints {missing}"
                     )
                 state_comparisons = {}
-                for left, right in (("L", "S"), ("S", "R"), ("R", "D"), ("D", "L")):
+                for left, right in (
+                    ("B", "L"),
+                    ("L", "S"),
+                    ("S", "R"),
+                    ("R", "D"),
+                    ("D", "B"),
+                ):
                     name = f"{left}_vs_{right}"
                     evidence = _tensor_difference(checkpoints[left], checkpoints[right])
                     state_comparisons[name] = evidence
@@ -920,42 +950,6 @@ class ThreeWayDiagnostic:
         cache = self.runtime.model_runner.req_to_token_pool.mamba2_layer_cache(0)
         return cache.conv[0][slot], cache.temporal[slot]
 
-    def _prepare_segmented_suffix(
-        self, req: Any, tokens: list[int], spec: Any, case: Any
-    ) -> tuple[Any, dict[str, float]]:
-        from sglang.srt.dllm.region.runtime import build_region_dag_runtime_plan
-        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-        plan = build_region_dag_runtime_plan(spec, case.edited_regions)
-        boundary = int(plan.gdn_replay_start)
-        req.prefix_indices = self.runtime.runtime._canonical_prefix_locations(
-            req.req_pool_idx, boundary
-        )
-        req.origin_input_ids = list(tokens)
-        req.fill_ids = list(tokens)
-        req.set_extend_input_len(len(tokens) - boundary)
-        self.runtime._attach_request(
-            req, spec, plan, mode="segmented_reference", initialized=True
-        )
-        req.region_dag_restore_required = False
-        self.runtime._bind_frontiers(req)
-        batch = self.runtime._new_batch(req)
-        _, gather_scatter_ms = self.runtime._cuda_timed(batch.prepare_for_extend)
-        batch.region_dag_query_positions_cpu = [plan.attention_query_positions]
-        worker_batch = batch.get_model_worker_batch()
-        forward_batch, mask_build_ms = self.runtime._cuda_timed(
-            lambda: ForwardBatch.init_new(worker_batch, self.runtime.model_runner)
-        )
-        forward_batch.region_dag_diagnostic_live_prefix_cpu = [True]
-        if bool(forward_batch.region_dag_restore_required_cpu[0]):
-            raise RuntimeError("segmented reference leaked a restore request")
-        if int(forward_batch.input_ids.numel()) != plan.query_count:
-            raise RuntimeError("segmented reference did not schedule suffix-only rows")
-        return forward_batch, {
-            "gather_scatter": gather_scatter_ms,
-            "mask_build": mask_build_ms,
-        }
-
     def _path_metadata(
         self, forward_batch: Any, trace: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -1028,27 +1022,44 @@ class ThreeWayDiagnostic:
                     self.runtime._clear()
 
                 def create_segmented_request() -> Any:
-                    return self.runtime.runtime._make_req(
-                        f"{case.case_id}:B:{step}", edited_tokens[:boundary]
+                    req, prefix_batch, prefix_prepare = (
+                        self.runtime._prepare_canonical_frontier(
+                            f"{case.case_id}:B:{step}", edited_tokens, spec, case
+                        )
+                    )
+                    return SimpleNamespace(
+                        req=req,
+                        prefix_batch=prefix_batch,
+                        prefix_prepare=prefix_prepare,
                     )
 
-                def recompute_prefix(req: Any) -> dict[str, float]:
-                    _, prefix_ms = self.runtime._cuda_timed(
-                        lambda: self.runtime.runtime._run_prefix(req)
+                def recompute_prefix(state: Any) -> dict[str, float]:
+                    _, prefix_ms, _ = self.runtime._run_forward(
+                        state.prefix_batch, row_hooks
                     )
-                    return {"prefix": prefix_ms}
+                    frontier_provenance.record_reference_frontier(state.req)
+                    self.runtime.backend._region_dag_layer_snapshots.clear()
+                    return {
+                        **state.prefix_prepare,
+                        "frontier_forward": prefix_ms,
+                    }
 
                 def cache_entries() -> int:
                     return len(self.runtime.backend._region_dag_layer_snapshots)
 
-                def prepare_suffix(req: Any, prefix_timing: Mapping[str, float]) -> Any:
+                def prepare_suffix(
+                    state: Any, prefix_timing: Mapping[str, float]
+                ) -> Any:
                     cache_entries_before_suffix = cache_entries()
-                    forward_batch, prepare = self._prepare_segmented_suffix(
-                        req, edited_tokens, spec, case
+                    forward_batch, prepare = self.runtime._prepare_frontier_suffix(
+                        state.req,
+                        edited_tokens,
+                        spec,
+                        case,
+                        restore=False,
                     )
-                    conv, recurrent = self._layer_zero_live_state(req)
+                    conv, recurrent = self._layer_zero_live_state(state.req)
                     layer_zero.record_state("B_segmented", conv, recurrent)
-                    frontier_provenance.record_live_prefix(req)
                     return SimpleNamespace(
                         restore_required=False,
                         forward_batch=forward_batch,
@@ -1056,7 +1067,7 @@ class ThreeWayDiagnostic:
                         cache_entries_before_suffix=cache_entries_before_suffix,
                     )
 
-                def execute_suffix(req: Any, prepared: Any) -> Any:
+                def execute_suffix(_state: Any, prepared: Any) -> Any:
                     with layer_zero.capture("B_segmented", rows):
                         segmented_trace, segmented_forward_ms, _ = (
                             self.runtime._run_forward(prepared.forward_batch, row_hooks)
@@ -1091,14 +1102,25 @@ class ThreeWayDiagnostic:
                 base_spec = self.cluster3.build_execution_spec(
                     case, original_tokens, edited=False
                 )
-                baseline_req, baseline_batch, _ = self.runtime._prepare_reference(
-                    f"{case.case_id}:C:{step}", original_tokens, base_spec, case
+                baseline_req, baseline_batch, frontier_prepare = (
+                    self.runtime._prepare_canonical_frontier(
+                        f"{case.case_id}:C:{step}",
+                        original_tokens,
+                        base_spec,
+                        case,
+                    )
                 )
                 with frontier_provenance.phase("snapshot"):
-                    self.runtime._run_forward(baseline_batch, row_hooks)
+                    _, frontier_forward_ms, _ = self.runtime._run_forward(
+                        baseline_batch, row_hooks
+                    )
                 stable_before = self.runtime._reused_hash(baseline_req, boundary)
-                cached_batch, cached_prepare = self.runtime._prepare_cached(
-                    baseline_req, edited_tokens, spec, case
+                cached_batch, cached_prepare = self.runtime._prepare_frontier_suffix(
+                    baseline_req,
+                    edited_tokens,
+                    spec,
+                    case,
+                    restore=True,
                 )
                 with (
                     frontier_provenance.phase("restore"),
@@ -1242,6 +1264,9 @@ class ThreeWayDiagnostic:
                                 + reference_forward_ms
                             ),
                             "reference_full_ms": sum(segmented.timings.values()),
+                            "canonical_frontier_establishment_ms": (
+                                sum(frontier_prepare.values()) + frontier_forward_ms
+                            ),
                             "cached_suffix_ms": (
                                 cached_prepare["gather_scatter"]
                                 + cached_prepare["mask_build"]

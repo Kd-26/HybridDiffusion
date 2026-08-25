@@ -15,6 +15,7 @@ from sglang.srt.dllm.region.execution_spec import (
 )
 from sglang.srt.dllm.region.runtime import (
     RegionDAGInstrumentation,
+    build_canonical_frontier_execution_spec,
     build_region_dag_frontier_key,
     build_region_dag_runtime_plan,
 )
@@ -107,24 +108,53 @@ class SchedulerDllmMixin:
         plan = req.region_dag_runtime_plan
         if plan is None:
             raise RuntimeError("Region-DAG request is missing its runtime plan")
-        if (
-            req.region_dag_mode == "cached"
-            and plan.gdn_replay_start > 0
-            and req.req_pool_idx is None
-        ):
-            if not req.region_dag_allow_full_replay:
-                raise RuntimeError(
-                    "Region-DAG cached execution requires an existing request-pool "
-                    "slot and a proven GDN frontier snapshot"
+        if req.region_dag_mode == "cached" and plan.gdn_replay_start > 0:
+            if (
+                not req.region_dag_initialized
+                and not req.region_dag_frontier_established
+            ):
+                build_canonical_frontier_execution_spec(
+                    spec, plan.gdn_replay_start
                 )
-            req.region_dag_runtime_plan = build_region_dag_runtime_plan(
-                spec, plan.edited_regions, force_full_replay=True
-            )
-            req.region_dag_instrumentation = RegionDAGInstrumentation.from_plan(
-                spec, req.region_dag_runtime_plan
-            )
-            req.region_dag_instrumentation.recovery_replays = 1
-            req.region_dag_mode = "reference"
+                if req.prefix_indices is None or len(req.prefix_indices) != 0:
+                    raise RuntimeError(
+                        "canonical Region-DAG frontier construction requires an "
+                        "uncached request"
+                    )
+                req.region_dag_frontier_establishing = True
+                req.region_dag_restore_required = False
+                req.fill_ids = list(req.origin_input_ids[: plan.gdn_replay_start])
+                req.set_extend_input_len(
+                    plan.gdn_replay_start - len(req.prefix_indices)
+                )
+            elif (
+                req.region_dag_frontier_established
+                and not req.region_dag_initialized
+            ):
+                boundary = int(plan.gdn_replay_start)
+                if req.prefix_indices is None or len(req.prefix_indices) != boundary:
+                    raise RuntimeError(
+                        "canonical Region-DAG suffix attachment requires the exact "
+                        f"frontier prefix: boundary={boundary} "
+                        f"matched={0 if req.prefix_indices is None else len(req.prefix_indices)}"
+                    )
+                req.region_dag_frontier_establishing = False
+                req.region_dag_restore_required = True
+                req.fill_ids = list(req.origin_input_ids)
+            elif req.req_pool_idx is None:
+                if not req.region_dag_allow_full_replay:
+                    raise RuntimeError(
+                        "initialized Region-DAG cached execution lost its "
+                        "request-pool slot"
+                    )
+                req.region_dag_runtime_plan = build_region_dag_runtime_plan(
+                    spec, plan.edited_regions, force_full_replay=True
+                )
+                req.region_dag_instrumentation = RegionDAGInstrumentation.from_plan(
+                    spec, req.region_dag_runtime_plan
+                )
+                req.region_dag_instrumentation.recovery_replays = 1
+                req.region_dag_mode = "reference"
 
     @staticmethod
     def _bind_region_dag_request_slot(req: Req) -> None:
@@ -157,7 +187,10 @@ class SchedulerDllmMixin:
         }
         replay_start = req.region_dag_runtime_plan.gdn_replay_start
         req.region_dag_restore_required = bool(
-            req.region_dag_mode == "cached" and replay_start > 0
+            req.region_dag_mode == "cached"
+            and replay_start > 0
+            and not req.region_dag_frontier_establishing
+            and (req.region_dag_frontier_established or req.region_dag_initialized)
         )
 
     @staticmethod
@@ -180,6 +213,8 @@ class SchedulerDllmMixin:
                     f"frontier: expected={expected!r} observed={publication!r}"
                 )
             req.region_dag_initialized = True
+            req.region_dag_frontier_established = True
+            req.region_dag_frontier_establishing = False
             req.region_dag_restore_required = bool(
                 req.region_dag_mode == "cached"
                 and req.region_dag_runtime_plan.gdn_replay_start > 0
@@ -248,6 +283,29 @@ class SchedulerDllmMixin:
             cached_len = (
                 len(req.prefix_indices) if req.prefix_indices is not None else 0
             )
+            if bool(getattr(req, "region_dag_frontier_establishing", False)):
+                boundary = int(req.region_dag_runtime_plan.gdn_replay_start)
+                publications = (
+                    getattr(result, "region_dag_snapshot_publications", None) or {}
+                )
+                publication = publications.get(int(req.req_pool_idx))
+                expected = {
+                    position: key
+                    for position, key in req.region_dag_frontier_keys.items()
+                    if position <= boundary
+                }
+                if cached_len != boundary or publication != expected:
+                    raise RuntimeError(
+                        "canonical Region-DAG frontier establishment did not "
+                        f"publish its exact stable prefix: boundary={boundary} "
+                        f"cached_len={cached_len} expected={expected!r} "
+                        f"observed={publication!r}"
+                    )
+                req.region_dag_frontier_establishing = False
+                req.region_dag_frontier_established = True
+                req.region_dag_restore_required = True
+                req.fill_ids = list(req.origin_input_ids)
+                continue
             if cached_len >= origin_len:
                 self._complete_dllm_prefill(req, result)
 
@@ -978,6 +1036,34 @@ class SchedulerDllmMixin:
             raise RuntimeError(
                 "Region-DAG requests cannot share a batch with legacy dLLM requests"
             )
+        establishing_frontier = bool(region_reqs) and all(
+            req.region_dag_frontier_establishing for req in region_reqs
+        )
+        attaching_suffix = bool(region_reqs) and all(
+            req.region_dag_frontier_established
+            and not req.region_dag_initialized
+            and not req.region_dag_frontier_establishing
+            for req in region_reqs
+        )
+        if region_reqs and (
+            any(req.region_dag_frontier_establishing for req in region_reqs)
+            != establishing_frontier
+        ):
+            raise RuntimeError(
+                "canonical Region-DAG frontier establishment cannot share a batch"
+            )
+        if region_reqs and (
+            any(
+                req.region_dag_frontier_established
+                and not req.region_dag_initialized
+                and not req.region_dag_frontier_establishing
+                for req in region_reqs
+            )
+            != attaching_suffix
+        ):
+            raise RuntimeError(
+                "canonical Region-DAG suffix attachment cannot share a batch"
+            )
         if region_reqs and all(req.region_dag_initialized for req in region_reqs):
             new_batch.prepare_for_region_dag_replay()
         else:
@@ -988,6 +1074,46 @@ class SchedulerDllmMixin:
             new_batch.prepare_for_extend()
         for req in region_reqs:
             self._bind_region_dag_request_slot(req)
+        if establishing_frontier:
+            new_batch.region_dag_execution_specs_cpu = [
+                build_canonical_frontier_execution_spec(
+                    req.region_dag_execution_spec,
+                    req.region_dag_runtime_plan.gdn_replay_start,
+                )
+                for req in region_reqs
+            ]
+            new_batch.region_dag_query_positions_cpu = [
+                tuple(range(req.region_dag_runtime_plan.gdn_replay_start))
+                for req in region_reqs
+            ]
+            new_batch.region_dag_frontier_keys_cpu = [
+                {
+                    boundary: key
+                    for boundary, key in req.region_dag_frontier_keys.items()
+                    if boundary <= req.region_dag_runtime_plan.gdn_replay_start
+                }
+                for req in region_reqs
+            ]
+            new_batch.region_dag_restore_required_cpu = [False] * len(region_reqs)
+            new_batch.region_dag_reference_cpu = [True] * len(region_reqs)
+        elif attaching_suffix:
+            new_batch.region_dag_execution_specs_cpu = [
+                req.region_dag_execution_spec for req in region_reqs
+            ]
+            new_batch.region_dag_query_positions_cpu = [
+                tuple(
+                    range(
+                        req.region_dag_runtime_plan.gdn_replay_start,
+                        req.region_dag_execution_spec.sequence_length,
+                    )
+                )
+                for req in region_reqs
+            ]
+            new_batch.region_dag_frontier_keys_cpu = [
+                dict(req.region_dag_frontier_keys) for req in region_reqs
+            ]
+            new_batch.region_dag_restore_required_cpu = [True] * len(region_reqs)
+            new_batch.region_dag_reference_cpu = [False] * len(region_reqs)
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 

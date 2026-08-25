@@ -16,8 +16,11 @@ keeps graph invalidation and recurrent execution deliberately separate:
 ## Controlled exporter
 
 `eval/scripts/cluster3_region_dag_validation.py` loads one real
-HybridDiffusion-2B model and runs a complete Region-DAG recomputation and a
-production-metadata cached replay for the same inputs. It compares every
+HybridDiffusion-2B model and runs a canonical segmented recomputation and a
+production-metadata cached replay for the same inputs. Both positive-frontier
+paths execute the same `[0:b)` Region-DAG prefix shape before evaluating the
+suffix, while the separate three-way diagnostic retains the monolithic path as
+a BF16 numerical audit. The validator compares every
 captured transformer-layer hidden state, final hidden state, GDN convolution
 and recurrent state, logits, and top-1 token. Pre-frontier full-attention KV
 and exact GDN state are hashed before and after cached execution and are also
@@ -63,13 +66,16 @@ CUDA_LAUNCH_BLOCKING=1 python \
 
 The command writes `one1-three-way-diagnostic.json`. Path A is the 256-row
 monolithic numerical audit. Path B freshly recomputes rows 0–63 from zero and
-then continues the live state for rows 64–255; its `reference_full_ms` includes
-both segments and it cannot read or publish a Region-DAG snapshot. Path C uses
-the production exact-frontier restore and evaluates the same 192 suffix rows.
+then continues the live state for rows 64–255 without a restore; its temporary
+publication is removed before live continuation. Path C establishes the same
+64-row canonical frontier, commits it, and evaluates the same 192 suffix rows
+through the production exact-frontier restore.
 Only the strict, shape-matched B-versus-C comparison diagnoses cache handoff;
 A-versus-B drift remains visible separately. The diagnostic reports evidence
-and a decision case, but never claims A30 acceptance or changes the numerical
-oracle automatically.
+for `B_vs_L`, `L_vs_S`, `S_vs_R`, `R_vs_D`, and `D_vs_B`; `L` is captured from
+the exact live source immediately before cloning `S`. Frontier-establishment
+latency and warm suffix latency are reported separately. The diagnostic never
+claims speedup or A30 acceptance from its debug-synchronized run.
 
 ## A30 protocol
 

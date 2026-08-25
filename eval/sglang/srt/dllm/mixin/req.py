@@ -27,6 +27,18 @@ class DllmReqPhase(str, enum.Enum):
 
 
 class ReqDllmMixin:
+    def requires_canonical_region_frontier(self) -> bool:
+        """Return whether radix matching must wait for prefix establishment."""
+        plan = getattr(self, "region_dag_runtime_plan", None)
+        return bool(
+            getattr(self, "region_dag_execution_spec", None) is not None
+            and getattr(self, "region_dag_mode", "") == "cached"
+            and plan is not None
+            and int(plan.gdn_replay_start) > 0
+            and not getattr(self, "region_dag_frontier_established", False)
+            and not getattr(self, "region_dag_initialized", False)
+        )
+
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_ids = []
@@ -66,6 +78,8 @@ class ReqDllmMixin:
         self.region_dag_mode = ""
         self.region_dag_allow_full_replay = False
         self.region_dag_initialized = False
+        self.region_dag_frontier_established = False
+        self.region_dag_frontier_establishing = False
         self.region_dag_restore_required = False
         self.region_dag_frontier_keys = {}
         self.region_dag_model_identity = ""

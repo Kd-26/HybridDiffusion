@@ -10,9 +10,11 @@ from sglang.srt.dllm.region.execution_spec import (
     RegionStatus,
 )
 from sglang.srt.dllm.region.runtime import (
+    RegionDAGFrontierExecutionSpec,
     RegionDAGFrontierKey,
     RegionDAGInstrumentation,
     RegionDAGRuntimePlan,
+    build_canonical_frontier_execution_spec,
     build_region_dag_frontier_key,
     build_region_dag_runtime_plan,
 )
@@ -25,11 +27,13 @@ __all__ = [
     "HybridExecutionSpec",
     "PositionInterval",
     "RegionDAGExecutionSpec",
+    "RegionDAGFrontierExecutionSpec",
     "RegionDAGRegion",
     "RegionStatus",
     "RegionDAGFrontierKey",
     "RegionDAGInstrumentation",
     "RegionDAGRuntimePlan",
+    "build_canonical_frontier_execution_spec",
     "build_region_dag_frontier_key",
     "build_region_dag_runtime_plan",
 ]

@@ -14,6 +14,7 @@ from sglang.srt.dllm.region.dependency_graph import DependencyGraph
 from sglang.srt.dllm.region.execution_spec import (
     REGION_DAG_CONSERVATIVE_GDN_V1,
     RegionDAGExecutionSpec,
+    RegionDAGRegion,
 )
 
 
@@ -32,6 +33,72 @@ def _ordered_unique_region_ids(
     selected_set = set(selected)
     return tuple(
         region.region_id for region in spec.regions if region.region_id in selected_set
+    )
+
+
+@dataclass(frozen=True)
+class RegionDAGFrontierExecutionSpec:
+    """Reusable-prefix contract used to construct one canonical frontier."""
+
+    sequence_length: int
+    regions: Tuple[RegionDAGRegion, ...]
+    diffusion_steps: int
+    source_sequence_length: int
+    attention_contract_id: str = REGION_DAG_CONSERVATIVE_GDN_V1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "regions", tuple(self.regions))
+        self.validate()
+
+    def validate(self) -> None:
+        if self.attention_contract_id != REGION_DAG_CONSERVATIVE_GDN_V1:
+            raise ValueError("canonical frontier attention contract is invalid")
+        if (
+            self.sequence_length <= 0
+            or self.sequence_length >= self.source_sequence_length
+        ):
+            raise ValueError(
+                "canonical frontier boundary must be inside the full sequence"
+            )
+        if self.diffusion_steps <= 0 or not self.regions:
+            raise ValueError("canonical frontier execution metadata is incomplete")
+        cursor = 0
+        known = set()
+        for region in self.regions:
+            if region.start != cursor or region.end > self.sequence_length:
+                raise ValueError("canonical frontier regions must partition its prefix")
+            if any(parent not in known for parent in region.parent_region_ids):
+                raise ValueError(
+                    "canonical frontier stable parents must precede their children"
+                )
+            known.add(region.region_id)
+            cursor = region.end
+        if cursor != self.sequence_length:
+            raise ValueError("canonical frontier regions do not reach its boundary")
+
+
+def build_canonical_frontier_execution_spec(
+    spec: RegionDAGExecutionSpec, boundary: int
+) -> RegionDAGFrontierExecutionSpec:
+    """Project the stable topological prefix ending at an exact replay frontier."""
+    if not isinstance(spec, RegionDAGExecutionSpec):
+        raise TypeError(
+            "canonical frontier construction requires RegionDAGExecutionSpec"
+        )
+    spec.validate()
+    boundary = int(boundary)
+    valid_boundaries = {region.start for region in spec.active_regions}
+    if boundary not in valid_boundaries:
+        raise ValueError(
+            f"canonical frontier {boundary} must begin an active Region-DAG region"
+        )
+    prefix_regions = tuple(region for region in spec.regions if region.end <= boundary)
+    return RegionDAGFrontierExecutionSpec(
+        sequence_length=boundary,
+        regions=prefix_regions,
+        diffusion_steps=spec.diffusion_steps,
+        source_sequence_length=spec.sequence_length,
+        attention_contract_id=spec.attention_contract_id,
     )
 
 

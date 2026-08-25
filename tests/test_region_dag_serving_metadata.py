@@ -88,6 +88,12 @@ INIT_FILL = class_method(
     "_init_fill_ids_for_dllm",
     {"Req": object},
 )
+REQUIRES_CANONICAL_FRONTIER = class_method(
+    REQ_PATH,
+    "ReqDllmMixin",
+    "requires_canonical_region_frontier",
+    {},
+)
 
 
 class ForwardMode:
@@ -134,11 +140,35 @@ BIND_SLOT = class_method(
         "build_region_dag_frontier_key": RUNTIME.build_region_dag_frontier_key,
     },
 )
+PREPARE_REGION_REQUEST = class_method(
+    SCHEDULER_PATH,
+    "SchedulerDllmMixin",
+    "_prepare_region_dag_request",
+    {
+        "Scheduler": object,
+        "Req": object,
+        "RegionDAGInstrumentation": RUNTIME.RegionDAGInstrumentation,
+        "build_canonical_frontier_execution_spec": (
+            RUNTIME.build_canonical_frontier_execution_spec
+        ),
+        "build_region_dag_runtime_plan": RUNTIME.build_region_dag_runtime_plan,
+    },
+)
 COMPLETE_PREFILL = class_method(
     SCHEDULER_PATH,
     "SchedulerDllmMixin",
     "_complete_dllm_prefill",
     {"Req": object, "GenerationBatchResult": object, "DllmReqPhase": Phase},
+)
+PROCESS_EMPTY_PREFILL = class_method(
+    SCHEDULER_PATH,
+    "SchedulerDllmMixin",
+    "_process_empty_dllm_prefill_result",
+    {
+        "Scheduler": object,
+        "ScheduleBatch": object,
+        "GenerationBatchResult": object,
+    },
 )
 INIT_FLASHINFER_METADATA = class_method(
     FLASHINFER_PATH,
@@ -203,6 +233,7 @@ def make_request(mode="reference", allow_full_replay=False):
         extend_batch_idx=0,
         multimodal_inputs=None,
     )
+    req.set_extend_input_len = lambda value: setattr(req, "extend_input_len", value)
     INIT_REQUEST(req, make_config())
     return req
 
@@ -314,6 +345,75 @@ def test_frontier_keys_cover_every_region_start_and_final_boundary():
     bind_request(req)
     assert tuple(req.region_dag_frontier_keys) == (0, 2, 4, 6, 8)
     assert req.region_dag_frontier_keys[2].preceding_regions[0][0] == "A"
+
+
+def test_cached_request_establishes_frontier_before_attaching_suffix():
+    req = make_request(mode="cached")
+    scheduler = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(model_path="model", revision="revision")
+    )
+
+    PREPARE_REGION_REQUEST(scheduler, req)
+    assert req.region_dag_frontier_establishing
+    assert not req.region_dag_frontier_established
+    assert not req.region_dag_restore_required
+    assert req.fill_ids == [0, 1]
+    assert req.extend_input_len == 2
+
+    bind_request(req)
+    req.prefix_indices = torch.tensor([11, 12], dtype=torch.int64)
+    expected = {
+        boundary: key
+        for boundary, key in req.region_dag_frontier_keys.items()
+        if boundary <= 2
+    }
+    req.is_dllm = lambda: True
+    req.is_dllm_prefill = lambda: True
+    lifecycle = types.SimpleNamespace(
+        tree_cache=types.SimpleNamespace(cache_unfinished_req=lambda _req: None),
+        _complete_dllm_prefill=lambda *_args: pytest.fail(
+            "partial frontier establishment completed the full prefill"
+        ),
+    )
+    PROCESS_EMPTY_PREFILL(
+        lifecycle,
+        types.SimpleNamespace(reqs=[req]),
+        types.SimpleNamespace(
+            region_dag_snapshot_publications={req.req_pool_idx: expected}
+        ),
+    )
+    assert req.region_dag_frontier_established
+    assert not req.region_dag_frontier_establishing
+    assert req.region_dag_restore_required
+    assert req.fill_ids == list(range(8))
+
+    PREPARE_REGION_REQUEST(scheduler, req)
+    assert req.region_dag_frontier_established
+    assert not req.region_dag_initialized
+    assert req.region_dag_restore_required
+    assert req.fill_ids == list(range(8))
+
+
+def test_radix_matching_is_deferred_only_for_unestablished_positive_frontier():
+    req = make_request(mode="cached")
+    assert REQUIRES_CANONICAL_FRONTIER(req)
+
+    req.region_dag_frontier_established = True
+    assert not REQUIRES_CANONICAL_FRONTIER(req)
+
+    req = make_request(mode="reference")
+    assert not REQUIRES_CANONICAL_FRONTIER(req)
+
+
+def test_suffix_attachment_rejects_a_prefix_beyond_the_frontier():
+    req = make_request(mode="cached")
+    req.region_dag_frontier_established = True
+    req.prefix_indices = torch.tensor([11, 12, 13], dtype=torch.int64)
+    scheduler = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(model_path="model", revision="revision")
+    )
+    with pytest.raises(RuntimeError, match="exact frontier prefix"):
+        PREPARE_REGION_REQUEST(scheduler, req)
 
 
 def test_region_initialization_requires_all_published_gdn_frontiers():

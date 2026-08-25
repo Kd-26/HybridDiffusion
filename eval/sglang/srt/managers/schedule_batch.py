@@ -96,8 +96,6 @@ from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
-    from typing import Any, Dict
-
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
@@ -984,6 +982,11 @@ class Req(ReqDllmMixin):
         else:
             self.fill_ids = self.origin_input_ids + self.output_ids
 
+        if tree_cache is not None and self.requires_canonical_region_frontier():
+            # The canonical frontier must execute every row [0:b) with one
+            # shape. A token-only radix hit has no equivalent GDN provenance.
+            tree_cache = None
+
         input_len = len(self.fill_ids)
 
         # Streaming sessions reuse committed KV from the session slot, so
@@ -1006,6 +1009,15 @@ class Req(ReqDllmMixin):
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        region_plan = getattr(self, "region_dag_runtime_plan", None)
+        if (
+            region_plan is not None
+            and bool(getattr(self, "region_dag_frontier_established", False))
+            and not bool(getattr(self, "region_dag_initialized", False))
+        ):
+            # The suffix-attachment round must resolve the frontier created by
+            # this request, never a longer token-only match from another one.
+            max_prefix_len = min(max_prefix_len, int(region_plan.gdn_replay_start))
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
@@ -3146,7 +3158,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for req in self.reqs
             ],
             region_dag_execution_specs_cpu=(
-                [req.region_dag_execution_spec for req in self.reqs]
+                getattr(self, "region_dag_execution_specs_cpu", None)
+                or [req.region_dag_execution_spec for req in self.reqs]
                 if self.reqs
                 and all(
                     getattr(req, "region_dag_execution_spec", None) is not None
@@ -3179,7 +3192,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             ),
             region_dag_frontier_keys_cpu=(
-                [dict(req.region_dag_frontier_keys) for req in self.reqs]
+                getattr(self, "region_dag_frontier_keys_cpu", None)
+                or [dict(req.region_dag_frontier_keys) for req in self.reqs]
                 if self.reqs
                 and all(
                     getattr(req, "region_dag_execution_spec", None) is not None
@@ -3188,7 +3202,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else None
             ),
             region_dag_restore_required_cpu=(
-                [bool(req.region_dag_restore_required) for req in self.reqs]
+                getattr(self, "region_dag_restore_required_cpu", None)
+                or [bool(req.region_dag_restore_required) for req in self.reqs]
                 if self.reqs
                 and all(
                     getattr(req, "region_dag_execution_spec", None) is not None
@@ -3197,7 +3212,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else None
             ),
             region_dag_reference_cpu=(
-                [not bool(req.region_dag_initialized) for req in self.reqs]
+                getattr(self, "region_dag_reference_cpu", None)
+                or [not bool(req.region_dag_initialized) for req in self.reqs]
                 if self.reqs
                 and all(
                     getattr(req, "region_dag_execution_spec", None) is not None

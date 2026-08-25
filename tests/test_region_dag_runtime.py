@@ -67,6 +67,25 @@ def test_runtime_plan_keeps_logical_closure_and_gdn_replay_separate():
     assert plan.invalidated_ranges == ((10, 20), (30, 40))
 
 
+@pytest.mark.parametrize(
+    ("boundary", "region_ids"),
+    [(10, ("A",)), (30, ("A", "B", "C"))],
+)
+def test_canonical_frontier_projects_exact_topological_prefix(boundary, region_ids):
+    source = abcd_spec()
+    frontier = RUNTIME.build_canonical_frontier_execution_spec(source, boundary)
+    assert frontier.sequence_length == boundary
+    assert frontier.source_sequence_length == source.sequence_length
+    assert tuple(region.region_id for region in frontier.regions) == region_ids
+    assert frontier.attention_contract_id == source.attention_contract_id
+    assert frontier.diffusion_steps == source.diffusion_steps
+
+
+def test_canonical_frontier_rejects_non_replay_boundaries():
+    with pytest.raises(ValueError, match="begin an active"):
+        RUNTIME.build_canonical_frontier_execution_spec(abcd_spec(), 20)
+
+
 def test_multiple_edits_are_canonicalized_in_text_order():
     plan = RUNTIME.build_region_dag_runtime_plan(abcd_spec(), ("D", "B"))
     assert plan.edited_regions == ("B", "D")

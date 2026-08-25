@@ -318,7 +318,7 @@ def test_frontier_provenance_records_exact_l_s_r_d_without_aliasing():
 
     with MODULE.FrontierStateProvenance(runtime, 64) as provenance:
         provenance.start_step(0)
-        provenance.record_live_prefix(req)
+        provenance.record_reference_frontier(req)
         with provenance.phase("snapshot"):
             for layer_id in backend.gdn_layer_ids:
                 cache = pool.mamba2_layer_cache(layer_id)
@@ -356,9 +356,14 @@ def test_frontier_provenance_records_exact_l_s_r_d_without_aliasing():
         for layer_id in backend.gdn_layer_ids:
             for state_kind in ("convolution", "recurrent"):
                 checkpoints = result["checkpoints"][str(layer_id)][state_kind]
-                assert set(checkpoints) == {"L", "S", "R", "D"}
+                assert set(checkpoints) == {"B", "L", "S", "R", "D"}
                 assert len({checkpoints[name]["sha256"] for name in checkpoints}) == 1
                 assert checkpoints["S"]["snapshot_generation"] > 0
+                assert checkpoints["L"]["request_id"] == checkpoints["S"]["request_id"]
+                assert (
+                    checkpoints["L"]["request_pool_slot"]
+                    == checkpoints["S"]["request_pool_slot"]
+                )
     assert provenance.released
 
 
@@ -381,7 +386,7 @@ def test_frontier_provenance_reports_first_bitwise_mismatch():
 
     with MODULE.FrontierStateProvenance(runtime, 64) as provenance:
         provenance.start_step(0)
-        provenance.record_live_prefix(req)
+        provenance.record_reference_frontier(req)
         with provenance.phase("snapshot"):
             for layer_id in backend.gdn_layer_ids:
                 cache = pool.mamba2_layer_cache(layer_id)
@@ -404,7 +409,7 @@ def test_frontier_provenance_reports_first_bitwise_mismatch():
     assert result["first_unequal_checkpoint"] == {
         "layer_id": 0,
         "state_kind": "convolution",
-        "comparison": "L_vs_S",
+        "comparison": "B_vs_L",
     }
 
 

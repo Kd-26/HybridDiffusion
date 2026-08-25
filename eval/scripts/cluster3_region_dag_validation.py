@@ -1128,6 +1128,116 @@ class Cluster3ValidationRuntime:
             },
         )
 
+    def _prepare_canonical_frontier(
+        self,
+        rid: str,
+        token_ids: list[int],
+        spec: Any,
+        case: ValidationCase,
+    ) -> tuple[Any, Any, dict[str, float]]:
+        """Schedule only the stable topological prefix that owns the frontier."""
+        torch = __import__("torch")
+        from sglang.srt.dllm.region.runtime import (
+            build_canonical_frontier_execution_spec,
+            build_region_dag_runtime_plan,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        plan = build_region_dag_runtime_plan(spec, case.edited_regions)
+        boundary = int(plan.gdn_replay_start)
+        frontier_spec = build_canonical_frontier_execution_spec(spec, boundary)
+        req = self.runtime._make_req(rid, token_ids)
+        self._attach_request(
+            req, spec, plan, mode="canonical_frontier", initialized=False
+        )
+        req.region_dag_frontier_establishing = True
+        req.prefix_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        req.fill_ids = list(token_ids[:boundary])
+        req.set_extend_input_len(boundary)
+        batch = self._new_batch(req)
+        _, gather_scatter_ms = self._cuda_timed(batch.prepare_for_extend)
+        self._bind_frontiers(req)
+        batch.region_dag_execution_specs_cpu = [frontier_spec]
+        batch.region_dag_query_positions_cpu = [tuple(range(boundary))]
+        batch.region_dag_frontier_keys_cpu = [
+            {
+                position: key
+                for position, key in req.region_dag_frontier_keys.items()
+                if position <= boundary
+            }
+        ]
+        batch.region_dag_restore_required_cpu = [False]
+        batch.region_dag_reference_cpu = [True]
+        worker_batch = batch.get_model_worker_batch()
+        forward_batch, mask_build_ms = self._cuda_timed(
+            lambda: ForwardBatch.init_new(worker_batch, self.model_runner)
+        )
+        if tuple(forward_batch.region_dag_query_positions_cpu[0]) != tuple(
+            range(boundary)
+        ):
+            raise RuntimeError("canonical frontier changed original prefix positions")
+        if int(forward_batch.input_ids.numel()) != boundary:
+            raise RuntimeError("canonical frontier did not schedule exactly its prefix")
+        return (
+            req,
+            forward_batch,
+            {
+                "gather_scatter": gather_scatter_ms,
+                "mask_build": mask_build_ms,
+            },
+        )
+
+    def _prepare_frontier_suffix(
+        self,
+        req: Any,
+        token_ids: list[int],
+        spec: Any,
+        case: ValidationCase,
+        *,
+        restore: bool,
+    ) -> tuple[Any, dict[str, float]]:
+        """Attach the full suffix to a canonical live or committed frontier."""
+        from sglang.srt.dllm.region.runtime import build_region_dag_runtime_plan
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        plan = build_region_dag_runtime_plan(spec, case.edited_regions)
+        boundary = int(plan.gdn_replay_start)
+        req.prefix_indices = self.runtime._canonical_prefix_locations(
+            req.req_pool_idx, boundary
+        )
+        req.origin_input_ids = list(token_ids)
+        req.fill_ids = list(token_ids)
+        req.set_extend_input_len(len(token_ids) - boundary)
+        self._attach_request(
+            req,
+            spec,
+            plan,
+            mode="canonical_cached" if restore else "canonical_segmented",
+            initialized=True,
+        )
+        req.region_dag_frontier_established = True
+        req.region_dag_restore_required = bool(restore)
+        self._bind_frontiers(req)
+        batch = self._new_batch(req)
+        _, gather_scatter_ms = self._cuda_timed(batch.prepare_for_extend)
+        batch.region_dag_query_positions_cpu = [plan.attention_query_positions]
+        batch.region_dag_restore_required_cpu = [bool(restore)]
+        batch.region_dag_reference_cpu = [False]
+        worker_batch = batch.get_model_worker_batch()
+        forward_batch, mask_build_ms = self._cuda_timed(
+            lambda: ForwardBatch.init_new(worker_batch, self.model_runner)
+        )
+        if not restore:
+            forward_batch.region_dag_diagnostic_live_prefix_cpu = [True]
+        if bool(forward_batch.region_dag_restore_required_cpu[0]) != bool(restore):
+            raise RuntimeError("canonical suffix restore contract was not preserved")
+        if int(forward_batch.input_ids.numel()) != plan.query_count:
+            raise RuntimeError("canonical suffix did not schedule exact replay rows")
+        return forward_batch, {
+            "gather_scatter": gather_scatter_ms,
+            "mask_build": mask_build_ms,
+        }
+
     def _prepare_cached(
         self,
         req: Any,
@@ -1414,6 +1524,8 @@ class Cluster3ValidationRuntime:
         timing_samples: dict[str, list[float]] = {
             "reference_full_ms": [],
             "cached_total_ms": [],
+            "canonical_frontier_establishment_ms": [],
+            "warm_cached_suffix_ms": [],
             "full_attention_ms": [],
             "gdn_replay_ms": [],
             "mask_build_ms": [],
@@ -1445,35 +1557,69 @@ class Cluster3ValidationRuntime:
 
                     self._clear()
                     torch.cuda.reset_peak_memory_stats(self.device)
-                    (
-                        reference_req,
-                        reference_batch,
-                        reference_prepare,
-                    ) = self._prepare_reference(
-                        f"{case.case_id}:reference:{repetition}:{step}",
-                        edited_tokens,
-                        edited_spec,
-                        case,
-                    )
-                    (
-                        reference_trace,
-                        reference_forward_ms,
-                        _,
-                    ) = self._run_forward(reference_batch, hooks)
-                    self._validate_trace_rows(
-                        reference_trace,
-                        expected_rows=case.sequence_length,
-                        label="Region-DAG reference",
-                    )
-                    if reference_trace["positions"] != tuple(
-                        range(case.sequence_length)
-                    ):
-                        raise RuntimeError(
-                            "Region-DAG reference changed absolute positions"
+                    if replay_start == 0:
+                        reference_req, reference_batch, reference_prepare = (
+                            self._prepare_reference(
+                                f"{case.case_id}:reference:{repetition}:{step}",
+                                edited_tokens,
+                                edited_spec,
+                                case,
+                            )
+                        )
+                        reference_trace, reference_forward_ms, _ = self._run_forward(
+                            reference_batch, hooks
+                        )
+                        reference_frontier_trace = None
+                    else:
+                        (
+                            reference_req,
+                            reference_frontier_batch,
+                            reference_frontier_prepare,
+                        ) = self._prepare_canonical_frontier(
+                            f"{case.case_id}:reference:{repetition}:{step}",
+                            edited_tokens,
+                            edited_spec,
+                            case,
+                        )
+                        (
+                            reference_frontier_trace,
+                            reference_frontier_ms,
+                            _,
+                        ) = self._run_forward(reference_frontier_batch, hooks)
+                        self.backend._region_dag_layer_snapshots.clear()
+                        reference_batch, reference_suffix_prepare = (
+                            self._prepare_frontier_suffix(
+                                reference_req,
+                                edited_tokens,
+                                edited_spec,
+                                case,
+                                restore=False,
+                            )
+                        )
+                        reference_trace, reference_suffix_ms, _ = self._run_forward(
+                            reference_batch, hooks
+                        )
+                        reference_prepare = {
+                            "frontier": sum(reference_frontier_prepare.values()),
+                            "suffix": sum(reference_suffix_prepare.values()),
+                        }
+                        reference_forward_ms = (
+                            reference_frontier_ms + reference_suffix_ms
                         )
                     reference_reused_hash = self._reused_hash(
                         reference_req, replay_start
                     )
+                    self._validate_trace_rows(
+                        reference_trace,
+                        expected_rows=plan.query_count,
+                        label="canonical segmented Region-DAG reference",
+                    )
+                    if reference_trace["positions"] != tuple(
+                        plan.attention_query_positions
+                    ):
+                        raise RuntimeError(
+                            "Region-DAG reference changed absolute positions"
+                        )
                     repetition_reference_peak = max(
                         repetition_reference_peak,
                         int(torch.cuda.max_memory_allocated(self.device)),
@@ -1483,21 +1629,26 @@ class Cluster3ValidationRuntime:
                     base_spec = build_execution_spec(
                         case, original_tokens, edited=False
                     )
-                    (
-                        baseline_req,
-                        baseline_batch,
-                        _,
-                    ) = self._prepare_reference(
+                    prepare_baseline = (
+                        self._prepare_reference
+                        if replay_start == 0
+                        else self._prepare_canonical_frontier
+                    )
+                    baseline_req, baseline_batch, baseline_prepare = prepare_baseline(
                         f"{case.case_id}:cached:{repetition}:{step}",
                         original_tokens,
                         base_spec,
                         case,
                     )
-                    baseline_trace, _, _ = self._run_forward(baseline_batch, hooks)
+                    baseline_trace, baseline_forward_ms, _ = self._run_forward(
+                        baseline_batch, hooks
+                    )
                     self._validate_trace_rows(
                         baseline_trace,
-                        expected_rows=case.sequence_length,
-                        label="Region-DAG cache population",
+                        expected_rows=(
+                            case.sequence_length if replay_start == 0 else replay_start
+                        ),
+                        label="canonical Region-DAG frontier establishment",
                     )
                     before = self._reused_hash(baseline_req, replay_start)
                     if reference_reused_hash != before:
@@ -1506,9 +1657,18 @@ class Cluster3ValidationRuntime:
                             "complete Region-DAG recomputation"
                         )
                     torch.cuda.reset_peak_memory_stats(self.device)
-                    cached_batch, cached_prepare = self._prepare_cached(
-                        baseline_req, edited_tokens, edited_spec, case
-                    )
+                    if replay_start == 0:
+                        cached_batch, cached_prepare = self._prepare_cached(
+                            baseline_req, edited_tokens, edited_spec, case
+                        )
+                    else:
+                        cached_batch, cached_prepare = self._prepare_frontier_suffix(
+                            baseline_req,
+                            edited_tokens,
+                            edited_spec,
+                            case,
+                            restore=True,
+                        )
                     (
                         cached_trace,
                         cached_forward_ms,
@@ -1531,17 +1691,14 @@ class Cluster3ValidationRuntime:
                         int(torch.cuda.max_memory_allocated(self.device)),
                     )
 
-                    reference_suffix = self._slice_reference(
-                        reference_trace, replay_start
-                    )
-                    comparison = self._compare(reference_suffix, cached_trace)
+                    comparison = self._compare(reference_trace, cached_trace)
                     if collect:
                         comparisons.append(comparison)
                         paired_hashes.append(
                             {
                                 "repetition": repetition + 1,
                                 "step": step + 1,
-                                "reference": self._trace_hashes(reference_suffix),
+                                "reference": self._trace_hashes(reference_trace),
                                 "cached": self._trace_hashes(cached_trace),
                                 "reused_reference_state": reference_reused_hash,
                                 "reused_cached_state": before,
@@ -1573,15 +1730,23 @@ class Cluster3ValidationRuntime:
                         observed_positions.append(cached_trace["positions"])
 
                     repetition_timings["reference_full_ms"] += (
-                        reference_prepare["gather_scatter"]
-                        + reference_prepare["mask_build"]
-                        + reference_forward_ms
+                        sum(reference_prepare.values()) + reference_forward_ms
                     )
-                    repetition_timings["cached_total_ms"] += (
+                    frontier_establishment_ms = (
+                        sum(baseline_prepare.values()) + baseline_forward_ms
+                        if replay_start > 0
+                        else 0.0
+                    )
+                    warm_cached_suffix_ms = (
                         cached_prepare["gather_scatter"]
                         + cached_prepare["mask_build"]
                         + cached_forward_ms
                     )
+                    repetition_timings[
+                        "canonical_frontier_establishment_ms"
+                    ] += frontier_establishment_ms
+                    repetition_timings["warm_cached_suffix_ms"] += warm_cached_suffix_ms
+                    repetition_timings["cached_total_ms"] += warm_cached_suffix_ms
                     for target, source in (
                         ("full_attention_ms", "full_attention"),
                         ("gdn_replay_ms", "gdn_replay"),
@@ -1616,12 +1781,20 @@ class Cluster3ValidationRuntime:
                     repetition_work[
                         "reference_full_attention_query_token_layer_positions"
                     ] += sum(reference_trace["rows"]["attention"])
+                    if reference_frontier_trace is not None:
+                        repetition_work[
+                            "reference_full_attention_query_token_layer_positions"
+                        ] += sum(reference_frontier_trace["rows"]["attention"])
                     repetition_work[
                         "cached_full_attention_query_token_layer_positions"
                     ] += sum(cached_trace["rows"]["attention"])
                     repetition_work["reference_gdn_token_layer_positions"] += sum(
                         reference_trace["rows"]["gdn"]
                     )
+                    if reference_frontier_trace is not None:
+                        repetition_work["reference_gdn_token_layer_positions"] += sum(
+                            reference_frontier_trace["rows"]["gdn"]
+                        )
                     repetition_work["cached_gdn_replay_token_layer_positions"] += sum(
                         cached_trace["rows"]["gdn"]
                     )
