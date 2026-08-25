@@ -1,6 +1,7 @@
 import importlib.util
 import subprocess
 import sys
+from collections import OrderedDict, namedtuple
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -66,6 +67,99 @@ class FakeDecoderLayer(torch.nn.Module):
 class FakeBackend:
     def _restore_region_dag_layer_snapshot(self, **_kwargs):
         return None
+
+
+class ProvenanceKey(
+    namedtuple(
+        "ProvenanceKeyBase",
+        (
+            "request_id",
+            "request_pool_idx",
+            "request_slot_generation",
+            "boundary",
+            "preceding_regions",
+        ),
+    )
+):
+    __slots__ = ()
+
+    def to_dict(self):
+        return {
+            "request_id": self.request_id,
+            "request_pool_idx": self.request_pool_idx,
+            "request_slot_generation": self.request_slot_generation,
+            "boundary": self.boundary,
+            "preceding_regions": self.preceding_regions,
+        }
+
+
+class FakeProvenanceBackend:
+    def __init__(self, pool):
+        self.pool = pool
+        self.gdn_layer_ids = [0, 1]
+        self._region_dag_layer_snapshots = OrderedDict()
+
+    def _current_mamba_slot(self, request_pool_idx):
+        return self.pool.mapping[int(request_pool_idx)]
+
+    def _put_region_dag_layer_snapshot(
+        self, *, frontier_key, layer_id, conv_state, recurrent_state
+    ):
+        self._region_dag_layer_snapshots[(frontier_key, int(layer_id))] = (
+            SimpleNamespace(
+                frontier_key=frontier_key,
+                layer_id=int(layer_id),
+                conv_state=conv_state.detach().clone(),
+                recurrent_state=recurrent_state.detach().clone(),
+            )
+        )
+
+    def _restore_region_dag_layer_snapshot(
+        self,
+        *,
+        frontier_key,
+        layer_id,
+        conv_destination,
+        recurrent_destination,
+    ):
+        snapshot = self._region_dag_layer_snapshots[(frontier_key, int(layer_id))]
+        conv_destination.copy_(snapshot.conv_state)
+        recurrent_destination.copy_(snapshot.recurrent_state)
+
+
+class FakeProvenancePool:
+    def __init__(self):
+        self.mapping = {1: 2, 2: 3}
+        self.layers = {
+            layer_id: SimpleNamespace(
+                conv=[torch.zeros(5, 2, 3)],
+                temporal=torch.zeros(5, 2, 2),
+            )
+            for layer_id in (0, 1)
+        }
+
+    def mamba2_layer_cache(self, layer_id):
+        return self.layers[int(layer_id)]
+
+
+def provenance_key(request_id, request_pool_idx, generation, boundary=64):
+    return ProvenanceKey(
+        request_id=request_id,
+        request_pool_idx=request_pool_idx,
+        request_slot_generation=generation,
+        boundary=boundary,
+        preceding_regions=(("A", 3, (("root", 2),), "token-sha", "position-sha"),),
+    )
+
+
+def make_provenance_runtime():
+    pool = FakeProvenancePool()
+    backend = FakeProvenanceBackend(pool)
+    runtime = SimpleNamespace(
+        backend=backend,
+        model_runner=SimpleNamespace(req_to_token_pool=pool),
+    )
+    return runtime, pool, backend
 
 
 def make_hook_runtime(*, out_proj_keyword=False):
@@ -200,6 +294,118 @@ def test_layer_zero_hooks_are_removed_after_capture_exception():
                 layer(hidden_states="not-a-tensor")
     assert evidence.released
     assert hook_count(layer) == 0
+
+
+def test_frontier_provenance_records_exact_l_s_r_d_without_aliasing():
+    runtime, pool, backend = make_provenance_runtime()
+    live_key = provenance_key("B", 1, 11)
+    cached_key = provenance_key("C", 2, 12)
+    req = SimpleNamespace(
+        req_pool_idx=1,
+        hybrid_request_slot_generation=11,
+        region_dag_frontier_keys={64: live_key},
+    )
+    expected = {}
+    for layer_id in backend.gdn_layer_ids:
+        cache = pool.mamba2_layer_cache(layer_id)
+        conv = torch.arange(6, dtype=torch.float32).reshape(2, 3) + layer_id
+        recurrent = torch.arange(4, dtype=torch.float32).reshape(2, 2) + layer_id
+        cache.conv[0][2].copy_(conv)
+        cache.temporal[2].copy_(recurrent)
+        cache.conv[0][3].copy_(conv)
+        cache.temporal[3].copy_(recurrent)
+        expected[layer_id] = (conv.clone(), recurrent.clone())
+
+    with MODULE.FrontierStateProvenance(runtime, 64) as provenance:
+        provenance.start_step(0)
+        provenance.record_live_prefix(req)
+        with provenance.phase("snapshot"):
+            for layer_id in backend.gdn_layer_ids:
+                cache = pool.mamba2_layer_cache(layer_id)
+                backend._put_region_dag_layer_snapshot(
+                    frontier_key=cached_key,
+                    layer_id=layer_id,
+                    conv_state=cache.conv[0][3],
+                    recurrent_state=cache.temporal[3],
+                )
+
+        for layer_id in backend.gdn_layer_ids:
+            cache = pool.mamba2_layer_cache(layer_id)
+            cache.conv[0][3].fill_(-1)
+            cache.temporal[3].fill_(-1)
+        with provenance.phase("restore"):
+            for layer_id in reversed(backend.gdn_layer_ids):
+                cache = pool.mamba2_layer_cache(layer_id)
+                backend._restore_region_dag_layer_snapshot(
+                    frontier_key=cached_key,
+                    layer_id=layer_id,
+                    conv_destination=cache.conv[0][3],
+                    recurrent_destination=cache.temporal[3],
+                )
+        for layer_id in backend.gdn_layer_ids:
+            snapshot = backend._region_dag_layer_snapshots[(cached_key, layer_id)]
+            snapshot.conv_state.fill_(999)
+            snapshot.recurrent_state.fill_(999)
+            cache = pool.mamba2_layer_cache(layer_id)
+            assert torch.equal(cache.conv[0][3], expected[layer_id][0])
+            assert torch.equal(cache.temporal[3], expected[layer_id][1])
+
+        result = provenance.result()
+        assert result["all_bitwise_equal"]
+        assert result["first_unequal_checkpoint"] is None
+        for layer_id in backend.gdn_layer_ids:
+            for state_kind in ("convolution", "recurrent"):
+                checkpoints = result["checkpoints"][str(layer_id)][state_kind]
+                assert set(checkpoints) == {"L", "S", "R", "D"}
+                assert len({checkpoints[name]["sha256"] for name in checkpoints}) == 1
+                assert checkpoints["S"]["snapshot_generation"] > 0
+    assert provenance.released
+
+
+def test_frontier_provenance_reports_first_bitwise_mismatch():
+    runtime, pool, backend = make_provenance_runtime()
+    live_key = provenance_key("B", 1, 11)
+    cached_key = provenance_key("C", 2, 12)
+    req = SimpleNamespace(
+        req_pool_idx=1,
+        hybrid_request_slot_generation=11,
+        region_dag_frontier_keys={64: live_key},
+    )
+    for layer_id in backend.gdn_layer_ids:
+        cache = pool.mamba2_layer_cache(layer_id)
+        cache.conv[0][2].fill_(1)
+        cache.temporal[2].fill_(1)
+        cache.conv[0][3].fill_(1)
+        cache.temporal[3].fill_(1)
+    pool.mamba2_layer_cache(0).conv[0][3, 0, 0] = 2
+
+    with MODULE.FrontierStateProvenance(runtime, 64) as provenance:
+        provenance.start_step(0)
+        provenance.record_live_prefix(req)
+        with provenance.phase("snapshot"):
+            for layer_id in backend.gdn_layer_ids:
+                cache = pool.mamba2_layer_cache(layer_id)
+                backend._put_region_dag_layer_snapshot(
+                    frontier_key=cached_key,
+                    layer_id=layer_id,
+                    conv_state=cache.conv[0][3],
+                    recurrent_state=cache.temporal[3],
+                )
+        with provenance.phase("restore"):
+            for layer_id in backend.gdn_layer_ids:
+                cache = pool.mamba2_layer_cache(layer_id)
+                backend._restore_region_dag_layer_snapshot(
+                    frontier_key=cached_key,
+                    layer_id=layer_id,
+                    conv_destination=cache.conv[0][3],
+                    recurrent_destination=cache.temporal[3],
+                )
+        result = provenance.result()
+    assert result["first_unequal_checkpoint"] == {
+        "layer_id": 0,
+        "state_kind": "convolution",
+        "comparison": "L_vs_S",
+    }
 
 
 def test_segmented_reference_freshly_recomputes_prefix_every_time():

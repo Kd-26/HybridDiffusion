@@ -145,6 +145,51 @@ def _tensor_description(value: Any) -> dict[str, Any]:
     }
 
 
+def _tensor_provenance(value: Any) -> dict[str, Any]:
+    if not hasattr(value, "stride") or not hasattr(value, "storage_offset"):
+        raise TypeError("frontier provenance requires a tensor")
+    return {
+        **_tensor_description(value),
+        "device": str(value.device),
+        "stride": list(value.stride()),
+        "storage_offset": int(value.storage_offset()),
+        "contiguous": bool(value.is_contiguous()),
+    }
+
+
+def _frontier_identity(frontier_key: Any) -> dict[str, Any]:
+    preceding = tuple(getattr(frontier_key, "preceding_regions", ()))
+    return {
+        "request_id": str(frontier_key.request_id),
+        "request_pool_slot": int(frontier_key.request_pool_idx),
+        "boundary_position": int(frontier_key.boundary),
+        "frontier_key": (
+            frontier_key.to_dict()
+            if callable(getattr(frontier_key, "to_dict", None))
+            else repr(frontier_key)
+        ),
+        "region_versions": [
+            [str(region_id), int(version)]
+            for region_id, version, _parents, _token_hash, _position_hash in preceding
+        ],
+        "parent_versions": [
+            [
+                str(region_id),
+                [[str(parent), int(version)] for parent, version in parents],
+            ]
+            for region_id, _version, parents, _token_hash, _position_hash in preceding
+        ],
+        "token_hashes": [
+            [str(region_id), str(token_hash)]
+            for region_id, _version, _parents, token_hash, _position_hash in preceding
+        ],
+        "position_hashes": [
+            [str(region_id), str(position_hash)]
+            for region_id, _version, _parents, _token_hash, position_hash in preceding
+        ],
+    }
+
+
 def _tensor_difference(left: Any, right: Any) -> dict[str, Any]:
     torch = __import__("torch")
     left = _cpu_tensor(left)
@@ -479,6 +524,337 @@ class LayerZeroEvidence:
         self.close()
 
 
+class FrontierStateProvenance:
+    """Scoped L/S/R/D trace around authoritative Region-DAG state operations."""
+
+    def __init__(self, runtime: Any, boundary: int):
+        self.runtime = runtime
+        self.backend = runtime.backend
+        self.boundary = int(boundary)
+        self.active_step: Optional[int] = None
+        self.active_phase: Optional[str] = None
+        self._generation = 0
+        self._records: dict[int, dict[int, dict[str, dict[str, Any]]]] = {}
+        self._tensors: dict[int, dict[int, dict[str, dict[str, Any]]]] = {}
+        self._snapshot_generations: dict[tuple[int, int], int] = {}
+        self._targets: list[tuple[Any, str, bool, Any]] = []
+        try:
+            self._install_publication_trace()
+            self._install_restore_trace()
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _storage_pointer(tensor: Any) -> int:
+        return int(tensor.untyped_storage().data_ptr())
+
+    def _checkpoint(
+        self,
+        *,
+        checkpoint: str,
+        state_kind: str,
+        tensor: Any,
+        frontier_key: Any,
+        layer_id: int,
+        mamba_state_slot: int,
+        snapshot_generation: int,
+        source_slot_generation: int,
+        destination_slot_generation: int,
+    ) -> None:
+        if self.active_step is None:
+            raise RuntimeError("frontier provenance has no active diffusion step")
+        step_records = self._records.setdefault(self.active_step, {})
+        layer_records = step_records.setdefault(int(layer_id), {})
+        state_records = layer_records.setdefault(state_kind, {})
+        if checkpoint in state_records:
+            raise RuntimeError(
+                f"duplicate frontier checkpoint {checkpoint} for layer {layer_id}"
+            )
+        state_records[checkpoint] = {
+            **_tensor_provenance(tensor),
+            **_frontier_identity(frontier_key),
+            "checkpoint": checkpoint,
+            "state_kind": state_kind,
+            "mamba_state_slot": int(mamba_state_slot),
+            "layer_id": int(layer_id),
+            "snapshot_generation": int(snapshot_generation),
+            "source_slot_generation": int(source_slot_generation),
+            "destination_slot_generation": int(destination_slot_generation),
+        }
+        step_tensors = self._tensors.setdefault(self.active_step, {})
+        layer_tensors = step_tensors.setdefault(int(layer_id), {})
+        layer_tensors.setdefault(state_kind, {})[checkpoint] = _cpu_tensor(tensor)
+
+    def _install(self, name: str, replacement_factory: Callable[[Any], Any]) -> None:
+        namespace = getattr(self.backend, "__dict__", {})
+        had_instance_value = name in namespace
+        instance_value = namespace.get(name)
+        original = getattr(self.backend, name, None)
+        if not callable(original):
+            raise RuntimeError(f"frontier provenance cannot observe {name}")
+        setattr(self.backend, name, replacement_factory(original))
+        self._targets.append((self.backend, name, had_instance_value, instance_value))
+
+    def _install_publication_trace(self) -> None:
+        def replacement(original: Callable[..., Any]) -> Callable[..., Any]:
+            def traced(*args: Any, **kwargs: Any) -> Any:
+                frontier_key = kwargs["frontier_key"]
+                layer_id = int(kwargs["layer_id"])
+                should_capture = (
+                    self.active_phase == "snapshot"
+                    and int(frontier_key.boundary) == self.boundary
+                )
+                result = original(*args, **kwargs)
+                if not should_capture:
+                    return result
+                snapshot = self.backend._region_dag_layer_snapshots.get(
+                    (frontier_key, layer_id)
+                )
+                if snapshot is None:
+                    raise RuntimeError("published frontier snapshot is unavailable")
+                self._generation += 1
+                generation = self._generation
+                assert self.active_step is not None
+                self._snapshot_generations[(self.active_step, layer_id)] = generation
+                mamba_slot = self.backend._current_mamba_slot(
+                    int(frontier_key.request_pool_idx)
+                )
+                for state_kind, source, stored in (
+                    ("convolution", kwargs["conv_state"], snapshot.conv_state),
+                    (
+                        "recurrent",
+                        kwargs["recurrent_state"],
+                        snapshot.recurrent_state,
+                    ),
+                ):
+                    if self._storage_pointer(source) == self._storage_pointer(stored):
+                        raise RuntimeError(
+                            f"{state_kind} frontier snapshot aliases its live source"
+                        )
+                    self._checkpoint(
+                        checkpoint="S",
+                        state_kind=state_kind,
+                        tensor=stored,
+                        frontier_key=frontier_key,
+                        layer_id=layer_id,
+                        mamba_state_slot=mamba_slot,
+                        snapshot_generation=generation,
+                        source_slot_generation=int(
+                            frontier_key.request_slot_generation
+                        ),
+                        destination_slot_generation=int(
+                            frontier_key.request_slot_generation
+                        ),
+                    )
+                return result
+
+            return traced
+
+        self._install("_put_region_dag_layer_snapshot", replacement)
+
+    def _install_restore_trace(self) -> None:
+        def replacement(original: Callable[..., Any]) -> Callable[..., Any]:
+            def traced(*args: Any, **kwargs: Any) -> Any:
+                frontier_key = kwargs["frontier_key"]
+                layer_id = int(kwargs["layer_id"])
+                should_capture = (
+                    self.active_phase == "restore"
+                    and int(frontier_key.boundary) == self.boundary
+                )
+                if not should_capture:
+                    return original(*args, **kwargs)
+                snapshot = self.backend._region_dag_layer_snapshots.get(
+                    (frontier_key, layer_id)
+                )
+                if snapshot is None:
+                    raise RuntimeError("authoritative frontier snapshot is unavailable")
+                assert self.active_step is not None
+                generation = self._snapshot_generations.get(
+                    (self.active_step, layer_id)
+                )
+                if generation is None:
+                    raise RuntimeError(
+                        "restored snapshot has no publication generation"
+                    )
+                mamba_slot = self.backend._current_mamba_slot(
+                    int(frontier_key.request_pool_idx)
+                )
+                for state_kind, stored in (
+                    ("convolution", snapshot.conv_state),
+                    ("recurrent", snapshot.recurrent_state),
+                ):
+                    self._checkpoint(
+                        checkpoint="R",
+                        state_kind=state_kind,
+                        tensor=stored,
+                        frontier_key=frontier_key,
+                        layer_id=layer_id,
+                        mamba_state_slot=mamba_slot,
+                        snapshot_generation=generation,
+                        source_slot_generation=int(
+                            frontier_key.request_slot_generation
+                        ),
+                        destination_slot_generation=int(
+                            frontier_key.request_slot_generation
+                        ),
+                    )
+                result = original(*args, **kwargs)
+                for state_kind, stored, destination in (
+                    (
+                        "convolution",
+                        snapshot.conv_state,
+                        kwargs["conv_destination"],
+                    ),
+                    (
+                        "recurrent",
+                        snapshot.recurrent_state,
+                        kwargs["recurrent_destination"],
+                    ),
+                ):
+                    if self._storage_pointer(stored) == self._storage_pointer(
+                        destination
+                    ):
+                        raise RuntimeError(
+                            f"restored {state_kind} destination aliases cache storage"
+                        )
+                    self._checkpoint(
+                        checkpoint="D",
+                        state_kind=state_kind,
+                        tensor=destination,
+                        frontier_key=frontier_key,
+                        layer_id=layer_id,
+                        mamba_state_slot=mamba_slot,
+                        snapshot_generation=generation,
+                        source_slot_generation=int(
+                            frontier_key.request_slot_generation
+                        ),
+                        destination_slot_generation=int(
+                            frontier_key.request_slot_generation
+                        ),
+                    )
+                return result
+
+            return traced
+
+        self._install("_restore_region_dag_layer_snapshot", replacement)
+
+    def start_step(self, step: int) -> None:
+        if self.active_phase is not None:
+            raise RuntimeError("cannot change provenance step during an active phase")
+        self.active_step = int(step)
+        self._records[self.active_step] = {}
+        self._tensors[self.active_step] = {}
+
+    @contextlib.contextmanager
+    def phase(self, name: str) -> Iterator[None]:
+        if name not in ("snapshot", "restore"):
+            raise ValueError(f"unsupported frontier provenance phase {name}")
+        if self.active_step is None or self.active_phase is not None:
+            raise RuntimeError("invalid frontier provenance phase lifecycle")
+        self.active_phase = name
+        try:
+            yield
+        finally:
+            self.active_phase = None
+
+    def record_live_prefix(self, req: Any) -> None:
+        if self.active_step is None:
+            raise RuntimeError("frontier provenance has no active diffusion step")
+        frontier_key = req.region_dag_frontier_keys.get(self.boundary)
+        if frontier_key is None:
+            raise RuntimeError("live prefix has no exact frontier identity")
+        mamba_slot = self.backend._current_mamba_slot(int(req.req_pool_idx))
+        for layer_id in self.backend.gdn_layer_ids:
+            cache = self.runtime.model_runner.req_to_token_pool.mamba2_layer_cache(
+                layer_id
+            )
+            for state_kind, tensor in (
+                ("convolution", cache.conv[0][mamba_slot]),
+                ("recurrent", cache.temporal[mamba_slot]),
+            ):
+                self._checkpoint(
+                    checkpoint="L",
+                    state_kind=state_kind,
+                    tensor=tensor,
+                    frontier_key=frontier_key,
+                    layer_id=layer_id,
+                    mamba_state_slot=mamba_slot,
+                    snapshot_generation=0,
+                    source_slot_generation=int(req.hybrid_request_slot_generation),
+                    destination_slot_generation=int(
+                        frontier_key.request_slot_generation
+                    ),
+                )
+
+    def result(self) -> dict[str, Any]:
+        if self.active_step is None:
+            raise RuntimeError("frontier provenance has no completed step")
+        records = self._records[self.active_step]
+        tensors = self._tensors[self.active_step]
+        required_layers = sorted(int(value) for value in self.backend.gdn_layer_ids)
+        missing_layers = sorted(set(required_layers) - set(records))
+        if missing_layers:
+            raise RuntimeError(
+                f"frontier provenance is missing layers {missing_layers}"
+            )
+        comparisons: dict[str, Any] = {}
+        first_unequal = None
+        for layer_id in required_layers:
+            comparisons[str(layer_id)] = {}
+            for state_kind in ("convolution", "recurrent"):
+                checkpoints = tensors[layer_id].get(state_kind, {})
+                missing = [
+                    name for name in ("L", "S", "R", "D") if name not in checkpoints
+                ]
+                if missing:
+                    raise RuntimeError(
+                        f"frontier provenance layer {layer_id} {state_kind} "
+                        f"is missing checkpoints {missing}"
+                    )
+                state_comparisons = {}
+                for left, right in (("L", "S"), ("S", "R"), ("R", "D"), ("D", "L")):
+                    name = f"{left}_vs_{right}"
+                    evidence = _tensor_difference(checkpoints[left], checkpoints[right])
+                    state_comparisons[name] = evidence
+                    if first_unequal is None and not evidence["exact_equal"]:
+                        first_unequal = {
+                            "layer_id": layer_id,
+                            "state_kind": state_kind,
+                            "comparison": name,
+                        }
+                comparisons[str(layer_id)][state_kind] = state_comparisons
+        return {
+            "boundary": self.boundary,
+            "checkpoints": {
+                str(layer): values for layer, values in sorted(records.items())
+            },
+            "comparisons": comparisons,
+            "first_unequal_checkpoint": first_unequal,
+            "all_bitwise_equal": first_unequal is None,
+        }
+
+    def close(self) -> None:
+        self.active_phase = None
+        self.active_step = None
+        for target, name, had_instance_value, instance_value in reversed(self._targets):
+            if had_instance_value:
+                setattr(target, name, instance_value)
+            else:
+                delattr(target, name)
+        self._targets.clear()
+
+    @property
+    def released(self) -> bool:
+        return not self._targets and self.active_phase is None
+
+    def __enter__(self) -> "FrontierStateProvenance":
+        return self
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+        self.close()
+
+
 def _suffix_capture(values: Mapping[str, Any], boundary: int) -> dict[str, Any]:
     return {
         name: (value[boundary:] if name in LayerZeroEvidence.ROW_TENSORS else value)
@@ -596,6 +972,7 @@ class ThreeWayDiagnostic:
             self.cluster3.build_execution_spec(case, original_tokens, edited=True),
             case.edited_regions,
         )
+        provenance_boundary = int(initial_plan.gdn_replay_start)
         invalidated = set(initial_plan.logical_invalidation_regions)
         diffusion_positions = tuple(
             position
@@ -614,14 +991,22 @@ class ThreeWayDiagnostic:
                 self.runtime.model_runner
             ) as row_hooks,
             LayerZeroEvidence(self.runtime) as layer_zero,
+            FrontierStateProvenance(
+                self.runtime, provenance_boundary
+            ) as frontier_provenance,
         ):
             for step in range(case.diffusion_steps):
+                frontier_provenance.start_step(step)
                 spec = self.cluster3.build_execution_spec(
                     case, edited_tokens, edited=True
                 )
                 plan = self.cluster3.expected_plan(spec, case.edited_regions)
                 boundary = int(plan.gdn_replay_start)
                 rows = int(plan.query_count)
+                if boundary != provenance_boundary:
+                    raise RuntimeError(
+                        "one1 provenance boundary changed across diffusion steps"
+                    )
 
                 self.runtime._clear()
                 reference_req, reference_batch, reference_prepare = (
@@ -663,6 +1048,7 @@ class ThreeWayDiagnostic:
                     )
                     conv, recurrent = self._layer_zero_live_state(req)
                     layer_zero.record_state("B_segmented", conv, recurrent)
+                    frontier_provenance.record_live_prefix(req)
                     return SimpleNamespace(
                         restore_required=False,
                         forward_batch=forward_batch,
@@ -708,18 +1094,23 @@ class ThreeWayDiagnostic:
                 baseline_req, baseline_batch, _ = self.runtime._prepare_reference(
                     f"{case.case_id}:C:{step}", original_tokens, base_spec, case
                 )
-                self.runtime._run_forward(baseline_batch, row_hooks)
+                with frontier_provenance.phase("snapshot"):
+                    self.runtime._run_forward(baseline_batch, row_hooks)
                 stable_before = self.runtime._reused_hash(baseline_req, boundary)
                 cached_batch, cached_prepare = self.runtime._prepare_cached(
                     baseline_req, edited_tokens, spec, case
                 )
-                with layer_zero.capture("C_cached", rows):
+                with (
+                    frontier_provenance.phase("restore"),
+                    layer_zero.capture("C_cached", rows),
+                ):
                     cached_trace, cached_forward_ms, _ = self.runtime._run_forward(
                         cached_batch, row_hooks
                     )
                 layer_zero.validate("C_cached")
                 stable_after = self.runtime._reused_hash(baseline_req, boundary)
                 cached_meta = self._path_metadata(cached_batch, cached_trace)
+                provenance_result = frontier_provenance.result()
 
                 a_suffix = self.runtime._slice_reference(reference_trace, boundary)
                 a_capture = _suffix_capture(layer_zero.values["A_monolithic"], boundary)
@@ -858,6 +1249,7 @@ class ThreeWayDiagnostic:
                             ),
                         },
                         "stable_pre_frontier_unchanged": stable_before == stable_after,
+                        "frontier_state_provenance": provenance_result,
                         "strict_B_vs_C_pass": strict_bc,
                         "decision": decision,
                     }
@@ -866,7 +1258,11 @@ class ThreeWayDiagnostic:
                 for position in diffusion_positions:
                     edited_tokens[position] = int(reference_top1[position])
 
-        if not row_hooks.released or not layer_zero.released:
+        if (
+            not row_hooks.released
+            or not layer_zero.released
+            or not frontier_provenance.released
+        ):
             raise RuntimeError("diagnostic hooks survived three-way execution")
         strict_steps = all(step["strict_B_vs_C_pass"] for step in steps)
         return {
