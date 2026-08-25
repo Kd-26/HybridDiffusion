@@ -636,6 +636,9 @@ class GDNDllmBackend:
         frontier_keys = forward_batch.region_dag_frontier_keys_cpu
         restore_required = forward_batch.region_dag_restore_required_cpu
         references = forward_batch.region_dag_reference_cpu
+        diagnostic_live_prefixes = getattr(
+            forward_batch, "region_dag_diagnostic_live_prefix_cpu", None
+        )
         if not (
             specs is not None
             and query_positions is not None
@@ -645,6 +648,8 @@ class GDNDllmBackend:
         ):
             raise RuntimeError("Region-DAG GDN execution metadata is incomplete")
         batch_size = len(specs)
+        if diagnostic_live_prefixes is None:
+            diagnostic_live_prefixes = [False] * batch_size
         if not all(
             len(values) == batch_size
             for values in (
@@ -652,6 +657,7 @@ class GDNDllmBackend:
                 frontier_keys,
                 restore_required,
                 references,
+                diagnostic_live_prefixes,
             )
         ):
             raise RuntimeError("Region-DAG GDN execution metadata is misbatched")
@@ -682,8 +688,13 @@ class GDNDllmBackend:
             mamba_cache_idx = int(cache_indices[bid].item())
             conv_destination = conv_states[mamba_cache_idx]
             recurrent_destination = ssm_states[mamba_cache_idx]
+            diagnostic_live_prefix = bool(diagnostic_live_prefixes[bid])
 
             if bool(references[bid]):
+                if diagnostic_live_prefix:
+                    raise RuntimeError(
+                        "Region-DAG reference cannot claim a diagnostic live prefix"
+                    )
                 if replay_start != 0 or bool(restore_required[bid]):
                     raise RuntimeError(
                         "Region-DAG reference must start at zero without restoration"
@@ -702,6 +713,15 @@ class GDNDllmBackend:
                     conv_destination=conv_destination,
                     recurrent_destination=recurrent_destination,
                 )
+            elif diagnostic_live_prefix:
+                if replay_start <= 0 or bool(restore_required[bid]):
+                    raise RuntimeError(
+                        "Region-DAG diagnostic live-prefix continuation requires a "
+                        "positive boundary without restoration"
+                    )
+                # Validator-only three-way triage: a fresh causal prefix just ran
+                # in this same request/Mamba slot, so the exact live convolution
+                # and recurrent state must continue without a cache lookup/copy.
             elif replay_start != 0:
                 raise RuntimeError(
                     "Region-DAG nonzero replay cannot run without a proven restore"

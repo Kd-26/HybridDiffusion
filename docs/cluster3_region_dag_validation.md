@@ -43,6 +43,34 @@ Each completed case produces exactly one JSONL record. Results belong in a new
 Cluster-3 directory containing the exact checked-out revision and profile; the
 Cluster-2 `paper100` artifacts must never be reused or overwritten.
 
+### Layer-0 three-way equivalence triage
+
+When monolithic BF16 execution first diverges at GDN layer 0, run the dedicated
+diagnostic before changing the validation oracle:
+
+```bash
+REV=$(git rev-parse HEAD)
+OUT="results/cluster3/${REV}/gdn-equivalence"
+CUDA_LAUNCH_BLOCKING=1 python \
+  eval/scripts/cluster3_gdn_equivalence_diagnostic.py \
+  --model-path "$MODEL_DIR" \
+  --output-dir "$OUT" \
+  --dtype bfloat16 \
+  --tp-size 1 \
+  --max-total-tokens 4096 \
+  --debug-sync-stages
+```
+
+The command writes `one1-three-way-diagnostic.json`. Path A is the 256-row
+monolithic numerical audit. Path B freshly recomputes rows 0–63 from zero and
+then continues the live state for rows 64–255; its `reference_full_ms` includes
+both segments and it cannot read or publish a Region-DAG snapshot. Path C uses
+the production exact-frontier restore and evaluates the same 192 suffix rows.
+Only the strict, shape-matched B-versus-C comparison diagnoses cache handoff;
+A-versus-B drift remains visible separately. The diagnostic reports evidence
+and a decision case, but never claims A30 acceptance or changes the numerical
+oracle automatically.
+
 ## A30 protocol
 
 Use one NVIDIA A30, native BF16, TP=1, HybridDiffusion-2B, and at most 4096

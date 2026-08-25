@@ -356,17 +356,20 @@ def _region_forward_backend():
     return backend
 
 
-def _region_forward_batch(reference, positions):
-    boundaries = (0, 2, 4, 6, 8)
+def _region_forward_batch(reference, positions, *, sequence_length=8, live=False):
+    boundaries = tuple(range(0, sequence_length + 1, 2))
     keys = {boundary: frontier_key(boundary=boundary) for boundary in boundaries}
     regions = tuple(types.SimpleNamespace(start=start) for start in boundaries[:-1])
-    spec = types.SimpleNamespace(sequence_length=8, regions=regions)
+    spec = types.SimpleNamespace(sequence_length=sequence_length, regions=regions)
     return types.SimpleNamespace(
         region_dag_execution_specs_cpu=[spec],
         region_dag_query_positions_cpu=[tuple(positions)],
         region_dag_frontier_keys_cpu=[keys],
-        region_dag_restore_required_cpu=[not reference and positions[0] > 0],
+        region_dag_restore_required_cpu=[
+            not reference and not live and positions[0] > 0
+        ],
         region_dag_reference_cpu=[reference],
+        region_dag_diagnostic_live_prefix_cpu=[live],
     )
 
 
@@ -443,3 +446,80 @@ def test_region_dag_cached_gdn_replay_matches_full_ordered_reference(monkeypatch
         b,
     )
     assert torch.equal(cached, full[:, 2:])
+
+
+def test_region_dag_diagnostic_live_prefix_continues_without_restore(monkeypatch):
+    def fake_conv(
+        values,
+        _weights,
+        _bias,
+        *,
+        conv_states,
+        cache_indices,
+        **_kwargs,
+    ):
+        conv_states[int(cache_indices[0])].add_(values.sum(dim=1))
+        return values
+
+    def fake_recurrence(*, q, initial_state, **_kwargs):
+        base = initial_state.reshape(1, 1, 1, 1)
+        output = q.cumsum(dim=1) + base
+        return output, output[:, -1].reshape_as(initial_state)
+
+    monkeypatch.setattr(BACKEND_MODULE, "causal_conv1d_fn", fake_conv)
+    monkeypatch.setattr(BACKEND_MODULE, "fused_gdn_gating", lambda _x, a, b, _y: (a, b))
+    monkeypatch.setattr(
+        BACKEND_MODULE, "fused_recurrent_gated_delta_rule", fake_recurrence
+    )
+    layer = types.SimpleNamespace(
+        layer_id=0,
+        conv_weights=None,
+        bias=None,
+        activation=None,
+        q_dim=1,
+        k_dim=1,
+        v_dim=1,
+        num_q_heads=1,
+        num_k_heads=1,
+        num_v_heads=1,
+        head_q_dim=1,
+        head_k_dim=1,
+        head_v_dim=1,
+        A_log=None,
+        dt_bias=None,
+    )
+    edited = torch.arange(24, dtype=torch.float32).view(8, 3) / 10
+    a = torch.ones(8, 1)
+    b = torch.ones(8, 1)
+
+    segmented_backend = _region_forward_backend()
+    segmented_backend._forward_region_dag(
+        layer,
+        _region_forward_batch(True, range(2), sequence_length=2),
+        edited[:2],
+        a[:2],
+        b[:2],
+    )
+    segmented_backend._region_dag_layer_snapshots.clear()
+    monkeypatch.setattr(
+        segmented_backend,
+        "_restore_region_dag_layer_snapshot",
+        lambda **_kwargs: pytest.fail("live continuation attempted a restore"),
+    )
+    segmented = segmented_backend._forward_region_dag(
+        layer,
+        _region_forward_batch(False, range(2, 8), live=True),
+        edited[2:],
+        a[2:],
+        b[2:],
+    )
+
+    full_backend = _region_forward_backend()
+    full = full_backend._forward_region_dag(
+        layer,
+        _region_forward_batch(True, range(8)),
+        edited,
+        a,
+        b,
+    )
+    assert torch.equal(segmented, full[:, 2:])
