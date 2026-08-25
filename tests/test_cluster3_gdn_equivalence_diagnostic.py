@@ -413,6 +413,47 @@ def test_frontier_provenance_reports_first_bitwise_mismatch():
     }
 
 
+def test_frontier_provenance_reuses_one_publication_across_steps():
+    runtime, pool, backend = make_provenance_runtime()
+    key = provenance_key("C", 2, 12)
+    req = SimpleNamespace(
+        req_pool_idx=2,
+        hybrid_request_slot_generation=12,
+        region_dag_frontier_keys={64: key},
+    )
+    for layer_id in backend.gdn_layer_ids:
+        cache = pool.mamba2_layer_cache(layer_id)
+        cache.conv[0][3].fill_(layer_id + 1)
+        cache.temporal[3].fill_(layer_id + 1)
+
+    with MODULE.FrontierStateProvenance(runtime, 64) as provenance:
+        provenance.start_step(0)
+        provenance.record_reference_frontier(req)
+        with provenance.phase("snapshot"):
+            for layer_id in backend.gdn_layer_ids:
+                cache = pool.mamba2_layer_cache(layer_id)
+                backend._put_region_dag_layer_snapshot(
+                    frontier_key=key,
+                    layer_id=layer_id,
+                    conv_state=cache.conv[0][3],
+                    recurrent_state=cache.temporal[3],
+                )
+        provenance.start_step(1)
+        provenance.record_reference_frontier(req)
+        provenance.inherit_publication(source_step=0, destination_step=1)
+        with provenance.phase("restore"):
+            for layer_id in backend.gdn_layer_ids:
+                cache = pool.mamba2_layer_cache(layer_id)
+                backend._restore_region_dag_layer_snapshot(
+                    frontier_key=key,
+                    layer_id=layer_id,
+                    conv_destination=cache.conv[0][3],
+                    recurrent_destination=cache.temporal[3],
+                )
+        result = provenance.result()
+    assert result["all_bitwise_equal"]
+
+
 def test_segmented_reference_freshly_recomputes_prefix_every_time():
     events = []
     generation = {"value": 0}

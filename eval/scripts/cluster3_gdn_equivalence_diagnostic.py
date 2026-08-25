@@ -765,8 +765,31 @@ class FrontierStateProvenance:
         if self.active_phase is not None:
             raise RuntimeError("cannot change provenance step during an active phase")
         self.active_step = int(step)
-        self._records[self.active_step] = {}
-        self._tensors[self.active_step] = {}
+        self._records.setdefault(self.active_step, {})
+        self._tensors.setdefault(self.active_step, {})
+
+    def inherit_publication(self, *, source_step: int, destination_step: int) -> None:
+        """Reuse one canonical L/S publication across later diffusion steps."""
+        if self.active_phase is not None:
+            raise RuntimeError("cannot inherit provenance during an active phase")
+        source_records = self._records.get(int(source_step), {})
+        source_tensors = self._tensors.get(int(source_step), {})
+        destination_records = self._records.setdefault(int(destination_step), {})
+        destination_tensors = self._tensors.setdefault(int(destination_step), {})
+        for layer_id in self.backend.gdn_layer_ids:
+            layer_id = int(layer_id)
+            for state_kind in ("convolution", "recurrent"):
+                for checkpoint in ("L", "S"):
+                    record = source_records[layer_id][state_kind][checkpoint]
+                    tensor = source_tensors[layer_id][state_kind][checkpoint]
+                    destination_records.setdefault(layer_id, {}).setdefault(
+                        state_kind, {}
+                    )[checkpoint] = dict(record)
+                    destination_tensors.setdefault(layer_id, {}).setdefault(
+                        state_kind, {}
+                    )[checkpoint] = tensor.clone()
+            generation = self._snapshot_generations[(int(source_step), layer_id)]
+            self._snapshot_generations[(int(destination_step), layer_id)] = generation
 
     @contextlib.contextmanager
     def phase(self, name: str) -> Iterator[None]:
@@ -989,6 +1012,7 @@ class ThreeWayDiagnostic:
                 self.runtime, provenance_boundary
             ) as frontier_provenance,
         ):
+            reference_steps = []
             for step in range(case.diffusion_steps):
                 frontier_provenance.start_step(step)
                 spec = self.cluster3.build_execution_spec(
@@ -1097,31 +1121,86 @@ class ThreeWayDiagnostic:
                 segmented_meta = self._path_metadata(
                     segmented.forward_batch, segmented.trace
                 )
-
-                self.runtime._clear()
-                base_spec = self.cluster3.build_execution_spec(
-                    case, original_tokens, edited=False
-                )
-                baseline_req, baseline_batch, frontier_prepare = (
-                    self.runtime._prepare_canonical_frontier(
-                        f"{case.case_id}:C:{step}",
-                        original_tokens,
-                        base_spec,
-                        case,
+                a_suffix = self.runtime._slice_reference(reference_trace, boundary)
+                a_capture = _suffix_capture(layer_zero.values["A_monolithic"], boundary)
+                b_capture = dict(layer_zero.values["B_segmented"])
+                a_b_trace = self.runtime._compare(a_suffix, segmented.trace)
+                a_b_detailed = _capture_comparison(a_capture, b_capture)
+                reference_steps.append(
+                    SimpleNamespace(
+                        step=step,
+                        spec=spec,
+                        plan=plan,
+                        boundary=boundary,
+                        rows=rows,
+                        edited_tokens=list(edited_tokens),
+                        reference_prepare=reference_prepare,
+                        reference_forward_ms=reference_forward_ms,
+                        reference_trace=reference_trace,
+                        reference_meta=reference_meta,
+                        segmented=segmented,
+                        segmented_meta=segmented_meta,
+                        a_suffix=a_suffix,
+                        a_capture=a_capture,
+                        b_capture=b_capture,
+                        a_b_trace=a_b_trace,
+                        a_b_detailed=a_b_detailed,
                     )
                 )
-                with frontier_provenance.phase("snapshot"):
-                    _, frontier_forward_ms, _ = self.runtime._run_forward(
-                        baseline_batch, row_hooks
+                reference_top1 = reference_trace["top1"]
+                for position in diffusion_positions:
+                    edited_tokens[position] = int(reference_top1[position])
+
+            self.runtime._clear()
+            base_spec = self.cluster3.build_execution_spec(
+                case, original_tokens, edited=False
+            )
+            baseline_req, baseline_batch, frontier_prepare = (
+                self.runtime._prepare_canonical_frontier(
+                    f"{case.case_id}:C",
+                    original_tokens,
+                    base_spec,
+                    case,
+                )
+            )
+            frontier_provenance.start_step(0)
+            with frontier_provenance.phase("snapshot"):
+                _, frontier_forward_ms, _ = self.runtime._run_forward(
+                    baseline_batch, row_hooks
+                )
+            frontier_establishment_ms = (
+                sum(frontier_prepare.values()) + frontier_forward_ms
+            )
+
+            for context in reference_steps:
+                step = context.step
+                spec = context.spec
+                plan = context.plan
+                boundary = context.boundary
+                rows = context.rows
+                segmented = context.segmented
+                segmented_meta = context.segmented_meta
+                b_capture = context.b_capture
+                frontier_provenance.start_step(step)
+                if step > 0:
+                    frontier_provenance.inherit_publication(
+                        source_step=0, destination_step=step
                     )
                 stable_before = self.runtime._reused_hash(baseline_req, boundary)
-                cached_batch, cached_prepare = self.runtime._prepare_frontier_suffix(
-                    baseline_req,
-                    edited_tokens,
-                    spec,
-                    case,
-                    restore=True,
-                )
+                if step == 0:
+                    cached_batch, cached_prepare = (
+                        self.runtime._prepare_frontier_suffix(
+                            baseline_req,
+                            context.edited_tokens,
+                            spec,
+                            case,
+                            restore=True,
+                        )
+                    )
+                else:
+                    cached_batch, cached_prepare = self.runtime._prepare_cached(
+                        baseline_req, context.edited_tokens, spec, case
+                    )
                 with (
                     frontier_provenance.phase("restore"),
                     layer_zero.capture("C_cached", rows),
@@ -1133,16 +1212,11 @@ class ThreeWayDiagnostic:
                 stable_after = self.runtime._reused_hash(baseline_req, boundary)
                 cached_meta = self._path_metadata(cached_batch, cached_trace)
                 provenance_result = frontier_provenance.result()
-
-                a_suffix = self.runtime._slice_reference(reference_trace, boundary)
-                a_capture = _suffix_capture(layer_zero.values["A_monolithic"], boundary)
-                b_capture = dict(layer_zero.values["B_segmented"])
                 c_capture = dict(layer_zero.values["C_cached"])
-                a_b_trace = self.runtime._compare(a_suffix, segmented.trace)
                 b_c_trace = self.runtime._compare(segmented.trace, cached_trace)
                 positions = tuple(plan.attention_query_positions)
 
-                a_mask = reference_meta["mask"].reshape(
+                a_mask = context.reference_meta["mask"].reshape(
                     case.sequence_length, case.sequence_length
                 )[boundary:]
                 b_mask = segmented_meta["mask"].reshape(rows, case.sequence_length)
@@ -1171,7 +1245,7 @@ class ThreeWayDiagnostic:
                     "segmented_region_cache_entries_before_suffix": (
                         segmented.cache_entries_before_suffix
                     ),
-                    "segmented_restore_calls": layer_zero.restore_calls["B_segmented"],
+                    "segmented_restore_calls": segmented.restore_calls,
                     "cached_restore_calls": layer_zero.restore_calls["C_cached"],
                 }
                 detailed_bc = _capture_comparison(b_capture, c_capture)
@@ -1216,9 +1290,8 @@ class ThreeWayDiagnostic:
                     and bool(b_c_trace[3])
                     and stable_before == stable_after
                 )
-                a_b_detailed = _capture_comparison(a_capture, b_capture)
                 monolithic_projection_drift = any(
-                    not a_b_detailed[name]["exact_equal"]
+                    not context.a_b_detailed[name]["exact_equal"]
                     for name in ("in_proj_qkvz_output", "in_proj_ba_output")
                 )
                 if not input_identity_pass or not projection_inputs_match:
@@ -1239,14 +1312,16 @@ class ThreeWayDiagnostic:
                         "step": step + 1,
                         "boundary": boundary,
                         "input_contract_B_vs_C": input_contract,
-                        "layer0_A_vs_B": a_b_detailed,
+                        "layer0_A_vs_B": context.a_b_detailed,
                         "layer0_B_vs_C": detailed_bc,
                         "trace_A_vs_B": {
-                            "max_logits_error": a_b_trace[0],
-                            "max_hidden_error": a_b_trace[1],
-                            "max_gdn_error": a_b_trace[2],
+                            "max_logits_error": context.a_b_trace[0],
+                            "max_hidden_error": context.a_b_trace[1],
+                            "max_gdn_error": context.a_b_trace[2],
                             "top1": _top1_evidence(
-                                a_suffix["top1"], segmented.trace["top1"], positions
+                                context.a_suffix["top1"],
+                                segmented.trace["top1"],
+                                positions,
                             ),
                         },
                         "trace_B_vs_C": {
@@ -1254,18 +1329,20 @@ class ThreeWayDiagnostic:
                             "max_hidden_error": b_c_trace[1],
                             "max_gdn_error": b_c_trace[2],
                             "top1": _top1_evidence(
-                                segmented.trace["top1"], cached_trace["top1"], positions
+                                segmented.trace["top1"],
+                                cached_trace["top1"],
+                                positions,
                             ),
                         },
                         "timings_ms": {
                             "monolithic_numerical_audit_ms": (
-                                reference_prepare["gather_scatter"]
-                                + reference_prepare["mask_build"]
-                                + reference_forward_ms
+                                context.reference_prepare["gather_scatter"]
+                                + context.reference_prepare["mask_build"]
+                                + context.reference_forward_ms
                             ),
                             "reference_full_ms": sum(segmented.timings.values()),
                             "canonical_frontier_establishment_ms": (
-                                sum(frontier_prepare.values()) + frontier_forward_ms
+                                frontier_establishment_ms if step == 0 else 0.0
                             ),
                             "cached_suffix_ms": (
                                 cached_prepare["gather_scatter"]
@@ -1279,9 +1356,6 @@ class ThreeWayDiagnostic:
                         "decision": decision,
                     }
                 )
-                reference_top1 = reference_trace["top1"]
-                for position in diffusion_positions:
-                    edited_tokens[position] = int(reference_top1[position])
 
         if (
             not row_hooks.released
