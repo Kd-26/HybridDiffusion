@@ -197,6 +197,58 @@ def test_batched_flattened_paged_mask_uses_exact_query_and_kv_counts():
     assert flattened[4 * 8 :].view(3, 3).all()
 
 
+@pytest.mark.parametrize("explicit_device", [None, "cpu"])
+def test_paged_mask_uses_canonical_cpu_device(explicit_device):
+    positions = torch.tensor([2, 3, 6, 7], dtype=torch.int64)
+    flattened = MASKS.build_region_dag_paged_custom_mask(
+        [abcd_spec()], [positions], device=explicit_device
+    )
+    assert flattened.dtype is torch.bool
+    assert flattened.ndim == 1
+    assert flattened.is_contiguous()
+    assert flattened.device == torch.device("cpu")
+
+
+def test_generic_cuda_device_canonicalizes_to_current_index(monkeypatch):
+    monkeypatch.setattr(MASKS.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(MASKS.torch.cuda, "current_device", lambda: 3)
+    assert MASKS.canonical_runtime_device("cuda") == torch.device("cuda:3")
+
+
+def test_generic_cuda_device_fails_when_cuda_is_unavailable(monkeypatch):
+    monkeypatch.setattr(MASKS.torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA is unavailable"):
+        MASKS.canonical_runtime_device("cuda")
+
+
+def test_paged_mask_rejects_real_indexed_device_mismatch(monkeypatch):
+    class PositionsOnCudaOne:
+        device = torch.device("cuda:1")
+
+    monkeypatch.setattr(MASKS.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(MASKS.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(MASKS, "_validate_region_query_positions", lambda *_: None)
+    with pytest.raises(ValueError, match=r"cuda:1, expected cuda:0"):
+        MASKS.build_region_dag_paged_custom_mask(
+            [abcd_spec()], [PositionsOnCudaOne()], device="cuda"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_zero_positions_and_generic_cuda_build_on_device_zero():
+    with torch.cuda.device(0):
+        positions = torch.tensor(
+            [2, 3, 6, 7], dtype=torch.int64, device=torch.device("cuda:0")
+        )
+        flattened = MASKS.build_region_dag_paged_custom_mask(
+            [abcd_spec()], [positions], device="cuda"
+        )
+        assert flattened.dtype is torch.bool
+        assert flattened.ndim == 1
+        assert flattened.is_contiguous()
+        assert flattened.device == torch.device("cuda:0")
+
+
 def test_region_route_is_forced_to_custom_paged():
     selected = MASKS.select_region_dag_mask_backend(
         EXECUTION.REGION_DAG_CONSERVATIVE_GDN_V1

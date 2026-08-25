@@ -14,6 +14,18 @@ DLLM_SELECTED_MASK_BACKENDS = frozenset(
 REGION_DAG_CONSERVATIVE_GDN_V1 = "region_dag_conservative_gdn_v1"
 
 
+def canonical_runtime_device(device: Any) -> torch.device:
+    """Resolve a generic CUDA device to the process's indexed CUDA device."""
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "generic CUDA device was requested but CUDA is unavailable"
+            )
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
 def validate_bidir_mask_backend(value: str) -> str:
     if value not in DLLM_BIDIR_MASK_BACKENDS:
         allowed = ", ".join(sorted(DLLM_BIDIR_MASK_BACKENDS))
@@ -242,8 +254,8 @@ def build_region_dag_paged_custom_mask(
     masks = []
     query_counts = []
     kv_counts = []
-    target_device = (
-        torch.device(device) if device is not None else query_positions[0].device
+    target_device = canonical_runtime_device(
+        device if device is not None else query_positions[0].device
     )
     for request_index, (spec, positions) in enumerate(zip(specs, query_positions)):
         _validate_region_query_positions(
