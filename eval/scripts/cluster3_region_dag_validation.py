@@ -428,6 +428,36 @@ def _token_hash(token_ids: Iterable[int]) -> str:
     return digest.hexdigest()
 
 
+def _apply_reference_top1_at_absolute_positions(
+    edited_tokens: list[int],
+    diffusion_positions: Iterable[int],
+    reference_trace: Mapping[str, Any],
+) -> None:
+    """Scatter compact query-row predictions back to absolute token positions."""
+    query_positions = tuple(int(position) for position in reference_trace["positions"])
+    reference_top1 = reference_trace["top1"]
+    if len(query_positions) != len(reference_top1):
+        raise RuntimeError(
+            "reference top-1 rows do not match the traced absolute positions"
+        )
+    row_by_position = {
+        position: row_index for row_index, position in enumerate(query_positions)
+    }
+    if len(row_by_position) != len(query_positions):
+        raise RuntimeError("reference trace contains duplicate absolute positions")
+    requested_positions = tuple(int(position) for position in diffusion_positions)
+    missing_positions = [
+        position for position in requested_positions if position not in row_by_position
+    ]
+    if missing_positions:
+        raise RuntimeError(
+            "diffusion positions are absent from the compact reference trace: "
+            f"{missing_positions[:8]}"
+        )
+    for position in requested_positions:
+        edited_tokens[position] = int(reference_top1[row_by_position[position]])
+
+
 def _position_hash(start: int, end: int) -> str:
     digest = hashlib.sha256()
     digest.update(int(start).to_bytes(8, "little", signed=True))
@@ -1816,9 +1846,11 @@ class Cluster3ValidationRuntime:
                     )
                     repetition_work["gdn_state_restores"] += restore_calls
 
-                    reference_top1 = reference_trace["top1"]
-                    for position in diffusion_positions:
-                        edited_tokens[position] = int(reference_top1[position])
+                    _apply_reference_top1_at_absolute_positions(
+                        edited_tokens,
+                        diffusion_positions,
+                        reference_trace,
+                    )
 
                 if collect:
                     for name, value in repetition_timings.items():

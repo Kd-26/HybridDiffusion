@@ -263,6 +263,38 @@ def test_bootstrap_timing_statistics_are_deterministic_and_fail_closed():
         MODULE._timing_evidence(values[:9], seed=17, require_statistics=True)
 
 
+def test_compact_top1_rows_scatter_to_absolute_suffix_positions():
+    edited_tokens = [0] * 256
+    query_positions = tuple(range(145, 256))
+    reference_top1 = list(range(1000, 1000 + len(query_positions)))
+
+    MODULE._apply_reference_top1_at_absolute_positions(
+        edited_tokens,
+        (145, 200, 255),
+        {"positions": query_positions, "top1": reference_top1},
+    )
+
+    assert edited_tokens[145] == 1000
+    assert edited_tokens[200] == 1055
+    assert edited_tokens[255] == 1110
+    assert edited_tokens[144] == 0
+
+
+def test_compact_top1_scatter_fails_closed_on_inconsistent_trace():
+    with pytest.raises(RuntimeError, match="do not match"):
+        MODULE._apply_reference_top1_at_absolute_positions(
+            [0] * 8,
+            (4,),
+            {"positions": (4, 5), "top1": [7]},
+        )
+    with pytest.raises(RuntimeError, match="absent"):
+        MODULE._apply_reference_top1_at_absolute_positions(
+            [0] * 8,
+            (3,),
+            {"positions": (4, 5), "top1": [7, 8]},
+        )
+
+
 def test_complete_synthetic_record_passes_strict_validation():
     case = MODULE.build_manifest("one1")[0]
     assert MODULE.validate_case_record(make_record(case), case) == []
