@@ -595,6 +595,8 @@ def validate_case_record(record: Mapping[str, Any], case: ValidationCase) -> lis
     timing_names = {
         "reference_full_ms",
         "cached_total_ms",
+        "canonical_frontier_establishment_ms",
+        "warm_cached_suffix_ms",
         "full_attention_ms",
         "gdn_replay_ms",
         "mask_build_ms",

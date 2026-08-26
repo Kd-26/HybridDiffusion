@@ -58,6 +58,8 @@ def make_record(case=None):
             (
                 "reference_full_ms",
                 "cached_total_ms",
+                "canonical_frontier_establishment_ms",
+                "warm_cached_suffix_ms",
                 "full_attention_ms",
                 "gdn_replay_ms",
                 "mask_build_ms",
@@ -264,6 +266,34 @@ def test_bootstrap_timing_statistics_are_deterministic_and_fail_closed():
 def test_complete_synthetic_record_passes_strict_validation():
     case = MODULE.build_manifest("one1")[0]
     assert MODULE.validate_case_record(make_record(case), case) == []
+
+
+def test_timing_schema_requires_canonical_frontier_and_warm_suffix_metrics():
+    case = MODULE.build_manifest("one1")[0]
+    expected = {
+        "reference_full_ms",
+        "cached_total_ms",
+        "canonical_frontier_establishment_ms",
+        "warm_cached_suffix_ms",
+        "full_attention_ms",
+        "gdn_replay_ms",
+        "mask_build_ms",
+        "gather_scatter_ms",
+        "cache_lookup_restore_ms",
+    }
+    record = make_record(case)
+    assert set(record["component_timings_ms"]) == expected
+    assert MODULE.validate_case_record(record, case) == []
+
+    for metric in (
+        "canonical_frontier_establishment_ms",
+        "warm_cached_suffix_ms",
+    ):
+        missing = make_record(case)
+        del missing["component_timings_ms"][metric]
+        assert "component timing evidence is unavailable" in (
+            MODULE.validate_case_record(missing, case)
+        )
 
 
 def test_entirely_active_record_has_no_cache_restore_or_fake_reuse():
