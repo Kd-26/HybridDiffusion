@@ -38,6 +38,43 @@ ROOT = Path(__file__).resolve().parents[2]
 CLUSTER1_PATH = Path(__file__).with_name("cluster1_exact_handoff_trace.py")
 CLUSTER2_PATH = Path(__file__).with_name("cluster2_active_only_validation.py")
 
+
+@contextlib.contextmanager
+def _nvtx_range(torch_module: Any, name: str) -> Iterator[None]:
+    """Emit an NVTX range on CUDA builds and remain inert in CPU unit tests."""
+    pushed = False
+    try:
+        torch_module.cuda.nvtx.range_push(f"cluster3::{name}")
+        pushed = True
+    except RuntimeError:
+        pass
+    try:
+        yield
+    finally:
+        if pushed:
+            torch_module.cuda.nvtx.range_pop()
+
+
+@dataclass(frozen=True)
+class DeferredCudaTiming:
+    """A CUDA event pair resolved only after the enclosing request sync."""
+
+    started: Any
+    finished: Any
+
+    def milliseconds(self) -> float:
+        return float(self.started.elapsed_time(self.finished))
+
+    def __float__(self) -> float:
+        return self.milliseconds()
+
+    def __add__(self, other: Any) -> float:
+        return self.milliseconds() + float(other)
+
+    def __radd__(self, other: Any) -> float:
+        return float(other) + self.milliseconds()
+
+
 REQUIRED_RECORD_FIELDS = frozenset(
     {
         "schema_version",
@@ -142,7 +179,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         required=True,
-        choices=("one1", "smoke16", "paper100", "effectiveness"),
+        choices=(
+            "one1",
+            "smoke16",
+            "paper100",
+            "effectiveness",
+            "efficiency_one",
+        ),
     )
     parser.add_argument("--dtype", default="bfloat16", choices=("bfloat16",))
     parser.add_argument("--tp-size", default=1, type=int)
@@ -413,6 +456,21 @@ def build_manifest(profile: str, seed: int = DEFAULT_SEED) -> list[ValidationCas
         return _paper_cases(seed)
     if profile == "effectiveness":
         return _effectiveness_cases(seed)
+    if profile == "efficiency_one":
+        return [
+            _case(
+                "efficiency_one",
+                1,
+                seed,
+                2112,
+                (
+                    RegionShape("S0", 0, 2048, "stable"),
+                    RegionShape("X0", 2048, 2112, "active", ("S0",)),
+                ),
+                ("X0",),
+                4,
+            )
+        ]
     raise ValueError(f"unsupported profile {profile!r}")
 
 
@@ -629,6 +687,8 @@ def validate_case_record(record: Mapping[str, Any], case: ValidationCase) -> lis
         "warm_cached_suffix_ms",
         "full_attention_ms",
         "gdn_replay_ms",
+        "mlp_forward_ms",
+        "prefix_snapshot_ms",
         "mask_build_ms",
         "gather_scatter_ms",
         "cache_lookup_restore_ms",
@@ -657,7 +717,7 @@ def validate_case_record(record: Mapping[str, Any], case: ValidationCase) -> lis
                 math.isfinite(float(value)) and float(value) >= 0.0 for value in samples
             ):
                 reasons.append(f"{name} has invalid timing samples")
-            if case.profile == "effectiveness":
+            if case.profile in ("effectiveness", "efficiency_one"):
                 if len(samples) < 10:
                     reasons.append(f"{name} has fewer than ten timed repetitions")
                 if not all(
@@ -667,8 +727,9 @@ def validate_case_record(record: Mapping[str, Any], case: ValidationCase) -> lis
     protocol = record["timing_protocol"]
     if not isinstance(protocol, Mapping) or not protocol.get("cuda_events"):
         reasons.append("CUDA timing protocol evidence is missing")
-    elif case.profile == "effectiveness" and (
-        int(protocol.get("warmup_repetitions", 0)) < 1
+    elif case.profile in ("effectiveness", "efficiency_one") and (
+        int(protocol.get("warmup_repetitions", 0))
+        < (3 if case.profile == "efficiency_one" else 1)
         or int(protocol.get("timed_repetitions", 0)) < 10
     ):
         reasons.append("effectiveness timing protocol lacks warm-up/repetitions")
@@ -917,6 +978,8 @@ class ScopedBackendTimers:
             "full_attention": [],
             "gdn_replay": [],
             "cache_lookup_restore": [],
+            "prefix_snapshot": [],
+            "mlp": [],
         }
         try:
             self._install(
@@ -930,6 +993,16 @@ class ScopedBackendTimers:
                 "_restore_region_dag_layer_snapshot",
                 "cache_lookup_restore",
             )
+            self._install(
+                self.gdn_backend,
+                "_put_region_dag_layer_snapshot",
+                "prefix_snapshot",
+            )
+            model = runtime.cluster1.ModelTraceHooks._language_model(
+                runtime.model_runner.model
+            )
+            for layer in model.layers:
+                self._install(layer.mlp, "forward", "mlp")
         except BaseException:
             self.close()
             raise
@@ -945,9 +1018,17 @@ class ScopedBackendTimers:
         def measured(*args: Any, **kwargs: Any) -> Any:
             started = self.torch.cuda.Event(enable_timing=True)
             finished = self.torch.cuda.Event(enable_timing=True)
-            started.record()
-            result = original(*args, **kwargs)
-            finished.record()
+            nvtx_name = {
+                "full_attention": "attention_forward",
+                "gdn_replay": "gdn_forward",
+                "cache_lookup_restore": "gdn_restore",
+                "prefix_snapshot": "prefix_snapshot",
+                "mlp": "mlp_forward",
+            }[kind]
+            with _nvtx_range(self.torch, nvtx_name):
+                started.record()
+                result = original(*args, **kwargs)
+                finished.record()
             self._events[kind].append((started, finished))
             return result
 
@@ -1114,16 +1195,17 @@ class Cluster3ValidationRuntime:
             dllm_config=self.runtime.dllm_config,
         )
 
-    def _cuda_timed(self, operation: Callable[[], Any]) -> tuple[Any, float]:
+    def _cuda_timed(
+        self, operation: Callable[[], Any], *, nvtx_phase: str
+    ) -> tuple[Any, DeferredCudaTiming]:
         torch = __import__("torch")
         started = torch.cuda.Event(enable_timing=True)
         finished = torch.cuda.Event(enable_timing=True)
-        self.runtime._synchronize()
-        started.record()
-        result = operation()
-        finished.record()
-        self.runtime._synchronize()
-        return result, float(started.elapsed_time(finished))
+        with _nvtx_range(torch, nvtx_phase):
+            started.record()
+            result = operation()
+            finished.record()
+        return result, DeferredCudaTiming(started, finished)
 
     def _prepare_reference(
         self,
@@ -1145,11 +1227,14 @@ class Cluster3ValidationRuntime:
         req.fill_ids = list(token_ids)
         req.set_extend_input_len(len(token_ids))
         batch = self._new_batch(req)
-        _, gather_scatter_ms = self._cuda_timed(batch.prepare_for_extend)
+        _, gather_scatter_ms = self._cuda_timed(
+            batch.prepare_for_extend, nvtx_phase="request_setup"
+        )
         self._bind_frontiers(req)
         worker_batch = batch.get_model_worker_batch()
         forward_batch, mask_build_ms = self._cuda_timed(
-            lambda: ForwardBatch.init_new(worker_batch, self.model_runner)
+            lambda: ForwardBatch.init_new(worker_batch, self.model_runner),
+            nvtx_phase="region_mask_build",
         )
         return (
             req,
@@ -1187,7 +1272,9 @@ class Cluster3ValidationRuntime:
         req.fill_ids = list(token_ids[:boundary])
         req.set_extend_input_len(boundary)
         batch = self._new_batch(req)
-        _, gather_scatter_ms = self._cuda_timed(batch.prepare_for_extend)
+        _, gather_scatter_ms = self._cuda_timed(
+            batch.prepare_for_extend, nvtx_phase="request_setup"
+        )
         self._bind_frontiers(req)
         batch.region_dag_execution_specs_cpu = [frontier_spec]
         batch.region_dag_query_positions_cpu = [tuple(range(boundary))]
@@ -1202,7 +1289,8 @@ class Cluster3ValidationRuntime:
         batch.region_dag_reference_cpu = [True]
         worker_batch = batch.get_model_worker_batch()
         forward_batch, mask_build_ms = self._cuda_timed(
-            lambda: ForwardBatch.init_new(worker_batch, self.model_runner)
+            lambda: ForwardBatch.init_new(worker_batch, self.model_runner),
+            nvtx_phase="region_mask_build",
         )
         if tuple(forward_batch.region_dag_query_positions_cpu[0]) != tuple(
             range(boundary)
@@ -1251,13 +1339,17 @@ class Cluster3ValidationRuntime:
         req.region_dag_restore_required = bool(restore)
         self._bind_frontiers(req)
         batch = self._new_batch(req)
-        _, gather_scatter_ms = self._cuda_timed(batch.prepare_for_extend)
+        _, gather_scatter_ms = self._cuda_timed(
+            batch.prepare_for_extend,
+            nvtx_phase="kv_restore" if restore else "request_setup",
+        )
         batch.region_dag_query_positions_cpu = [plan.attention_query_positions]
         batch.region_dag_restore_required_cpu = [bool(restore)]
         batch.region_dag_reference_cpu = [False]
         worker_batch = batch.get_model_worker_batch()
         forward_batch, mask_build_ms = self._cuda_timed(
-            lambda: ForwardBatch.init_new(worker_batch, self.model_runner)
+            lambda: ForwardBatch.init_new(worker_batch, self.model_runner),
+            nvtx_phase="region_mask_build",
         )
         if not restore:
             forward_batch.region_dag_diagnostic_live_prefix_cpu = [True]
@@ -1286,10 +1378,13 @@ class Cluster3ValidationRuntime:
         self._attach_request(req, spec, plan, mode="cached", initialized=True)
         self._bind_frontiers(req)
         batch = self._new_batch(req)
-        _, gather_scatter_ms = self._cuda_timed(batch.prepare_for_region_dag_replay)
+        _, gather_scatter_ms = self._cuda_timed(
+            batch.prepare_for_region_dag_replay, nvtx_phase="kv_restore"
+        )
         worker_batch = batch.get_model_worker_batch()
         forward_batch, mask_build_ms = self._cuda_timed(
-            lambda: ForwardBatch.init_new(worker_batch, self.model_runner)
+            lambda: ForwardBatch.init_new(worker_batch, self.model_runner),
+            nvtx_phase="region_mask_build",
         )
         return forward_batch, {
             "gather_scatter": gather_scatter_ms,
@@ -1300,7 +1395,8 @@ class Cluster3ValidationRuntime:
         self, forward_batch: Any, hooks: Any
     ) -> tuple[dict[str, Any], float, dict[str, Any]]:
         torch = __import__("torch")
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        with _nvtx_range(torch, "flashinfer_plan_build"):
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         mamba_slots = [
             self.backend._current_mamba_slot(int(value))
             for value in forward_batch.req_pool_indices.detach().cpu().tolist()
@@ -1308,14 +1404,16 @@ class Cluster3ValidationRuntime:
         started = torch.cuda.Event(enable_timing=True)
         finished = torch.cuda.Event(enable_timing=True)
         with ScopedBackendTimers(self) as timers:
-            started.record()
-            with hooks.capture(mamba_slots):
-                logits = self.runtime._forward(forward_batch, metadata_prepared=True)
+            with _nvtx_range(torch, "model_forward_total"):
+                started.record()
+                with hooks.capture(mamba_slots):
+                    logits = self.runtime._forward(
+                        forward_batch, metadata_prepared=True
+                    )
             finished.record()
             self.runtime._synchronize()
             model_forward_ms = float(started.elapsed_time(finished))
             backend_timings = timers.snapshot()
-        self.runtime._synchronize()
         if not timers.released:
             raise RuntimeError("temporary backend timers survived model execution")
         trace = hooks.snapshot()
@@ -1526,10 +1624,13 @@ class Cluster3ValidationRuntime:
         )
         if not diffusion_positions:
             raise RuntimeError("Region-DAG edit produced no diffusion positions")
+        performance_profile = case.profile in ("effectiveness", "efficiency_one")
         measurement_repetitions = (
-            self.args.timed_repetitions if case.profile == "effectiveness" else 1
+            self.args.timed_repetitions if performance_profile else 1
         )
-        warmup_repetitions = 1 if case.profile == "effectiveness" else 0
+        warmup_repetitions = (
+            3 if case.profile == "efficiency_one" else 1 if performance_profile else 0
+        )
         paired_hashes: list[dict[str, Any]] = []
         comparisons: list[tuple[float, float, float, bool]] = []
         selected_backends: list[str] = []
@@ -1560,6 +1661,8 @@ class Cluster3ValidationRuntime:
             "warm_cached_suffix_ms": [],
             "full_attention_ms": [],
             "gdn_replay_ms": [],
+            "mlp_forward_ms": [],
+            "prefix_snapshot_ms": [],
             "mask_build_ms": [],
             "gather_scatter_ms": [],
             "cache_lookup_restore_ms": [],
@@ -1782,6 +1885,8 @@ class Cluster3ValidationRuntime:
                     for target, source in (
                         ("full_attention_ms", "full_attention"),
                         ("gdn_replay_ms", "gdn_replay"),
+                        ("mlp_forward_ms", "mlp"),
+                        ("prefix_snapshot_ms", "prefix_snapshot"),
                     ):
                         value = cached_backend_ms[source]
                         if value is None:
@@ -1896,7 +2001,7 @@ class Cluster3ValidationRuntime:
             )
             else -1
         )
-        require_statistics = case.profile == "effectiveness"
+        require_statistics = performance_profile
         component_timings = {
             name: _timing_evidence(
                 values,
@@ -1969,6 +2074,9 @@ class Cluster3ValidationRuntime:
                 "timed_repetitions": measurement_repetitions,
                 "cuda_events": True,
                 "synchronized_measurement_boundaries": True,
+                "cuda_synchronizations_per_measured_forward": 1,
+                "debug_sync_stages": bool(self.args.debug_sync_stages),
+                "timing_scope": "request_exclusive",
                 "host_paired_total_ms": (time.perf_counter() - started) * 1000.0,
             },
             "work_counters": {

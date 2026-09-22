@@ -62,6 +62,8 @@ def make_record(case=None):
                 "warm_cached_suffix_ms",
                 "full_attention_ms",
                 "gdn_replay_ms",
+                "mlp_forward_ms",
+                "prefix_snapshot_ms",
                 "mask_build_ms",
                 "gather_scatter_ms",
                 "cache_lookup_restore_ms",
@@ -163,7 +165,10 @@ def test_cli_help_does_not_load_cuda_or_model():
         capture_output=True,
         text=True,
     )
-    assert "--profile {one1,smoke16,paper100,effectiveness}" in completed.stdout
+    assert (
+        "--profile {one1,smoke16,paper100,effectiveness,efficiency_one}"
+        in completed.stdout
+    )
     assert "--timed-repetitions" in completed.stdout
     assert "--debug-sync-stages" in completed.stdout
 
@@ -233,6 +238,24 @@ def test_effectiveness_manifest_has_requested_nine_shapes():
     }
     assert shapes == {(1, 64), (2, 64), (4, 64)}
     assert all(case.sequence_length == 1024 for case in cases)
+
+
+def test_efficiency_one_is_the_primary_long_prefix_profile():
+    cases = MODULE.build_manifest("efficiency_one")
+    assert len(cases) == 1
+    case = cases[0]
+    assert case.sequence_length == 2112
+    assert case.diffusion_steps == 4
+    assert case.regions == (
+        MODULE.RegionShape("S0", 0, 2048, "stable"),
+        MODULE.RegionShape("X0", 2048, 2112, "active", ("S0",)),
+    )
+    spec = MODULE.build_execution_spec(
+        case, list(range(case.sequence_length)), edited=True
+    )
+    plan = MODULE.expected_plan(spec, case.edited_regions)
+    assert plan.gdn_replay_start == 2048
+    assert plan.query_count == 64
 
 
 def test_unedited_independent_active_region_keeps_its_version():
@@ -309,6 +332,8 @@ def test_timing_schema_requires_canonical_frontier_and_warm_suffix_metrics():
         "warm_cached_suffix_ms",
         "full_attention_ms",
         "gdn_replay_ms",
+        "mlp_forward_ms",
+        "prefix_snapshot_ms",
         "mask_build_ms",
         "gather_scatter_ms",
         "cache_lookup_restore_ms",
@@ -398,12 +423,18 @@ def fake_timer_runtime():
     gdn = SimpleNamespace(
         forward_extend=lambda value: value + 2,
         _restore_region_dag_layer_snapshot=lambda **_kwargs: "restored",
+        _put_region_dag_layer_snapshot=lambda **_kwargs: "snapshotted",
     )
+    mlp = SimpleNamespace(forward=lambda value: value + 3)
+    language_model = SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)])
+    trace_hooks = SimpleNamespace(_language_model=lambda _model: language_model)
     return SimpleNamespace(
         model_runner=SimpleNamespace(
-            attn_backend=SimpleNamespace(full_attn_backend=full)
+            attn_backend=SimpleNamespace(full_attn_backend=full),
+            model=object(),
         ),
         backend=gdn,
+        cluster1=SimpleNamespace(ModelTraceHooks=trace_hooks),
     )
 
 
@@ -418,11 +449,14 @@ def test_backend_timing_probes_capture_calls_and_cleanup(monkeypatch):
         )
         assert runtime.backend.forward_extend(1) == 3
         assert runtime.backend._restore_region_dag_layer_snapshot() == "restored"
+        assert runtime.backend._put_region_dag_layer_snapshot() == "snapshotted"
+        assert runtime.model_runner.model is not None
         evidence = timers.snapshot()
         assert evidence["full_attention"] == 1.25
         assert evidence["gdn_replay"] == 1.25
         assert evidence["cache_lookup_restore"] == 1.25
         assert evidence["cache_lookup_restore_calls"] == 1
+        assert evidence["prefix_snapshot"] == 1.25
     assert timers.released
     assert (
         runtime.model_runner.attn_backend.full_attn_backend.forward_extend
