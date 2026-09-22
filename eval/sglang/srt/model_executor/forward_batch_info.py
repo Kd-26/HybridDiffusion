@@ -445,6 +445,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     region_dag_restore_required_cpu: Optional[List[bool]] = None
     region_dag_reference_cpu: Optional[List[bool]] = None
     region_dag_allow_full_replay_cpu: Optional[List[bool]] = None
+    region_dag_profilers_cpu: Optional[List[Tuple[Any, ...]]] = None
     region_dag_custom_mask: Optional[torch.Tensor] = None
 
     # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
@@ -589,6 +590,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 "region_dag_restore_required_cpu",
                 "region_dag_reference_cpu",
                 "region_dag_allow_full_replay_cpu",
+                "region_dag_profilers_cpu",
             ):
                 setattr(ret, field_name, getattr(batch, field_name, None))
 
@@ -645,7 +647,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         region_dag_specs = getattr(ret, "region_dag_execution_specs_cpu", None)
         if region_dag_specs is not None:
             query_positions_cpu = ret.region_dag_query_positions_cpu
-            if query_positions_cpu is None or len(query_positions_cpu) != ret.batch_size:
+            if (
+                query_positions_cpu is None
+                or len(query_positions_cpu) != ret.batch_size
+            ):
                 raise RuntimeError(
                     "Region-DAG query-position metadata is missing or misbatched"
                 )
@@ -664,16 +669,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 build_region_dag_paged_custom_mask,
                 select_region_dag_mask_backend,
             )
-
-            ret.region_dag_custom_mask = build_region_dag_paged_custom_mask(
-                region_dag_specs, query_position_tensors, device=device
+            from sglang.srt.dllm.region.profiling import (
+                profile_many_phase,
+                profilers_from_forward_batch,
             )
+
+            with profile_many_phase(
+                profilers_from_forward_batch(ret),
+                "region_mask_build",
+                cuda=True,
+            ):
+                ret.region_dag_custom_mask = build_region_dag_paged_custom_mask(
+                    region_dag_specs, query_position_tensors, device=device
+                )
             ret.dllm_selected_mask_backend = select_region_dag_mask_backend(
                 region_dag_specs[0].attention_contract_id
             )
             if any(
-                spec.attention_contract_id
-                != region_dag_specs[0].attention_contract_id
+                spec.attention_contract_id != region_dag_specs[0].attention_contract_id
                 for spec in region_dag_specs
             ):
                 raise RuntimeError(
@@ -681,9 +694,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
             ret.dllm_request_token_counts = query_counts
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-            ret.positions = torch.cat(query_position_tensors).to(
-                dtype=positions_dtype
-            )
+            ret.positions = torch.cat(query_position_tensors).to(dtype=positions_dtype)
         elif (
             batch.dllm_config is not None
             and dllm_mask_types_cpu is not None
@@ -703,9 +714,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         batch.dllm_block_offsets,
                     )
                     for pos in range(
-                        prefix_len
-                        if mask_type == DLLM_ATTN_MASK_CAUSAL_PREFILL
-                        else block_offset,
+                        (
+                            prefix_len
+                            if mask_type == DLLM_ATTN_MASK_CAUSAL_PREFILL
+                            else block_offset
+                        ),
                         (
                             prefix_len
                             if mask_type == DLLM_ATTN_MASK_CAUSAL_PREFILL
@@ -802,9 +815,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if getattr(batch, "dllm_mamba_track_steps_cpu", None) is not None:
             ret.dllm_mamba_track_indices_cpu = batch.dllm_mamba_track_indices_cpu
             ret.dllm_mamba_track_steps_cpu = batch.dllm_mamba_track_steps_cpu
-            ret.dllm_mamba_track_boundaries_cpu = (
-                batch.dllm_mamba_track_boundaries_cpu
-            )
+            ret.dllm_mamba_track_boundaries_cpu = batch.dllm_mamba_track_boundaries_cpu
 
         return ret
 

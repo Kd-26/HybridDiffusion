@@ -2,8 +2,8 @@
 
 ## Scope and current status
 
-This branch starts at the frozen Cluster 1–3 reference
-`cf5e14c2f5a4e4700fb66b3183dd021bbe722fe4`. The profiling stage does not add
+This repair starts at the validated fingerprint commit
+`c7efe379d2cbffc8c9e813b174a776515965f8d2`. The profiling stage does not add
 generation capability or implement an optimization cluster. Model weights,
 BF16 behavior, sampling, attention contracts, absolute positions, Region-DAG
 rules, GDN replay, training, and TorchTitan behavior are unchanged.
@@ -16,6 +16,35 @@ expected skips before profiling changes.
 
 No optimization may be selected from this document until the retained A30
 `efficiency_one` record and Nsight Systems trace identify a meaningful overhead.
+
+## Pre-repair coverage audit
+
+The first A30 `efficiency_one` profile passed correctness, but attributed only
+63.01% of warm latency. The remaining 36.99% was one residual produced by
+subtracting medians from older component timers. That calculation was not a
+request-scoped phase decomposition: `RequestScopedProfiler` was defined but
+never instantiated, propagated, finalized, or emitted.
+
+The execution audit found three distinct route lifecycles. Full replay builds
+the identity/specification and dependency plan, prepares an uncached batch,
+builds the mask and FlashInfer plan, executes the complete segmented reference,
+then verifies and scatters outputs. Cold handoff establishes the canonical
+prefix and publishes GDN frontiers before executing the suffix. Warm handoff
+assembles the existing KV layout, restores the committed GDN frontier, and
+executes only the conservative suffix before verification/output processing.
+
+The old preparation and backend measurements are CUDA-event timers. Backend
+GDN time is inclusive of nested restore and snapshot calls; the route total is
+also an envelope. The report treated the remaining difference as one additive
+component and combined independently summarized medians. Host orchestration
+was not measured separately from CUDA work.
+
+`prefix_snapshot` in the warm ranking is genuine runtime work. The conservative
+GDN implementation republishes the replay-start and final frontier snapshots
+for every GDN layer during a warm suffix so later exact frontiers remain
+available. This profiling repair preserves that behavior and records the
+explicit contract `expected_zero=false`; it does not optimize or remove the
+snapshot.
 
 ## Instrumentation
 
@@ -39,12 +68,33 @@ The controlled production-path exporter adds an `efficiency_one` case:
 - native BF16 and TP=1;
 - debug synchronization disabled.
 
-Preparation CUDA events are deferred until the measured forward's single
-terminal synchronization. NVTX ranges cover request setup, mask construction,
-KV restore/batch assembly, FlashInfer planning, attention, GDN, MLP, GDN
-restore, prefix snapshots, and total model forward. The exporter retains exact
-output, hidden-state, GDN-state, stable-state, position, invalidation, recovery,
-work, and peak-memory checks from frozen Cluster 3.
+Every measured repetition emits one finalized schema-v2 snapshot for each of
+`full_replay`, `cold_handoff_build`, and `warm_cached_suffix`. Envelopes are
+`request_total`, `model_forward_total`, and `active_suffix_forward`; component
+leaves cannot overlap. CUDA events are resolved with one terminal profiler
+synchronization. The JSON report computes every residual per repetition before
+aggregation and never adds host and CUDA milliseconds.
+
+The record shape is:
+
+```json
+{
+  "request_phase_profiles": {
+    "full_replay": [{"schema_version": 2, "finalized": true, "phases": {}}],
+    "cold_handoff_build": [{"schema_version": 2, "finalized": true, "phases": {}}],
+    "warm_cached_suffix": [{"schema_version": 2, "finalized": true, "phases": {}}]
+  },
+  "warm_snapshot_behavior": {
+    "calls": 1,
+    "expected_zero": false,
+    "pass": true,
+    "reason": "conservative replay republishes traversed GDN frontiers"
+  }
+}
+```
+
+Each route list contains exactly ten entries for `efficiency_one`; the example
+above abbreviates the repeated entries and phase fields.
 
 `eval/scripts/cluster3_efficiency_preflight.py` fails closed unless the exact
 five checkpoint files exist, their SHA-256 values match frozen evidence, the
@@ -52,10 +102,12 @@ architecture is exactly `Qwen3_5DLLMForConditionalGeneration`, the 2B config
 fingerprint matches, and every safetensors tensor entry is BF16. It never
 downloads or replaces a checkpoint.
 
-`eval/scripts/cluster3_efficiency_profile_report.py` accepts only a passing
-`efficiency_one` record with three warmups, ten samples, BF16, TP=1, and debug
-synchronization disabled. GDN restore and snapshot time are subtracted from the
-inclusive GDN backend interval before ranking, preventing double counting.
+`eval/scripts/cluster3_efficiency_profile_report.py` accepts only finalized
+request-scoped evidence from a passing `efficiency_one` record with three
+warmups, ten samples, BF16, TP=1, request-exclusive scope, exactly one profiler
+resolution synchronization, and debug synchronization disabled. Legacy
+component medians are retained in the record but are never substituted for
+missing phase evidence.
 
 ## Initial bottleneck profile
 
@@ -66,12 +118,10 @@ unpopulated rather than estimated from CPU time or prior runs.
 |---|---:|---:|---:|---:|---:|
 | Pending retained A30 run | unavailable | unavailable | unavailable | unavailable | unavailable |
 
-The report generator will rank attention, exclusive GDN work, MLP, prefix
-snapshot, GDN restore, mask construction, KV restore/batch assembly, and
-unattributed scheduler/model work. Cold handoff build, warm cached suffix, and
-full replay are reported separately. The frozen exporter does not provide a
-non-overlapping per-phase decomposition of cold prefix construction, so that
-field remains explicitly unavailable.
+The report generator produces separate host/orchestration and GPU/model
+critical-path rankings, route totals, phase call counts, cache/recovery/snapshot
+counters, synchronization counts, per-repetition residual distributions, and a
+warm coverage gate. Missing evidence fails closed.
 
 ## A30 execution
 
@@ -87,11 +137,14 @@ export MODEL_PATH=/persistent/hybrid-diffusion-cache/models/HybridDiffusion-2B
 export CACHE_ROOT=/persistent/hybrid-diffusion-cache
 export RESULT_ROOT=/persistent/hybrid-diffusion-cache/results/cluster3-production-efficiency
 export PY=/persistent/hybrid-diffusion-cache/venvs/hybrid-diffusion-eval/bin/python
-export BASE_SHA=cf5e14c2f5a4e4700fb66b3183dd021bbe722fe4
+export PARENT_SHA=c7efe379d2cbffc8c9e813b174a776515965f8d2
+export FROZEN_SHA=cf5e14c2f5a4e4700fb66b3183dd021bbe722fe4
+
+test "$(git rev-parse HEAD^)" = "$PARENT_SHA"
 
 mkdir -p "$RESULT_ROOT/profile-one"
 mapfile -t FROZEN_PROVENANCE < <(
-  rg -l "$BASE_SHA" "$CACHE_ROOT/results" -g '*.json' | sort
+  rg -l "$FROZEN_SHA" "$CACHE_ROOT/results" -g '*.json' | sort
 )
 test "${#FROZEN_PROVENANCE[@]}" -gt 0
 PROVENANCE_ARGS=()
@@ -123,13 +176,14 @@ nsys profile \
 
 "$PY" "$REPO/eval/scripts/cluster3_efficiency_profile_report.py" \
   --record "$RESULT_ROOT/profile-one/records.jsonl" \
-  --output-json "$RESULT_ROOT/profile-one/bottlenecks.json" \
-  --output-markdown "$RESULT_ROOT/profile-one/bottlenecks.md"
+  --output-json "$RESULT_ROOT/profile-one/detailed-profiling.json" \
+  --output-markdown "$RESULT_ROOT/profile-one/detailed-profiling.md"
 ```
 
 Do not set `CUDA_LAUNCH_BLOCKING` or pass `--debug-sync-stages` for this run.
-Retain `preflight.json`, `records.jsonl`, `summary.json`, `bottlenecks.json`,
-`bottlenecks.md`, and the `.nsys-rep` file together.
+Retain `preflight.json`, `records.jsonl`, `summary.json`,
+`detailed-profiling.json`, `detailed-profiling.md`, logs, and the optional
+`.nsys-rep` file together.
 
 ## Correctness invariants
 

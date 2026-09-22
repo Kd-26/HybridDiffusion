@@ -13,10 +13,11 @@ import dataclasses
 import inspect
 import time
 from collections import Counter
+from contextlib import ExitStack
 from typing import Any, Iterator, Mapping, Optional
 
 
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
 
 PROFILE_PHASES = (
     "request_setup",
@@ -43,7 +44,33 @@ PROFILE_PHASES = (
 
 # Totals are envelopes.  Every other phase is exclusive so the overhead table
 # can sum its rows without double counting.
-ENVELOPE_PHASES = frozenset(("model_forward_total", "request_total"))
+ENVELOPE_PHASES = frozenset(
+    ("active_suffix_forward", "model_forward_total", "request_total")
+)
+
+
+class FrozenDict(dict):
+    """JSON-serializable immutable mapping used for finalized evidence."""
+
+    def _immutable(self, *_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("finalized profiling snapshots are immutable")
+
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    __setitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return FrozenDict({str(key): _freeze(child) for key, child in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(child) for child in value)
+    return value
 
 
 @dataclasses.dataclass
@@ -87,13 +114,25 @@ class RequestScopedProfiler:
         self.debug_sync = bool(debug_sync)
         self.timing_scope = timing_scope
         self.metadata = dict(metadata or {})
-        self.counters: Counter[str] = Counter()
+        self.counters: Counter[str] = Counter(
+            {
+                "cache_hit_count": 0,
+                "cache_miss_count": 0,
+                "gdn_state_restore_count": 0,
+                "recovery_replay_count": 0,
+                "snapshot_count": 0,
+            }
+        )
         self.synchronizations: list[dict[str, Any]] = []
         self._samples: list[_PhaseSample] = []
         self._active_leaf: Optional[str] = None
         self._active_envelopes: list[str] = []
+        self._phase_stack: list[str] = []
+        self._unavailable: dict[str, str] = {}
+        self._peak_allocated = 0
+        self._peak_reserved = 0
         self._finalized = False
-        self._snapshot: Optional[dict[str, Any]] = None
+        self._snapshot: Optional[FrozenDict] = None
         self._torch = torch_module
         if self.cuda_enabled:
             if self._torch is None:
@@ -110,6 +149,29 @@ class RequestScopedProfiler:
         if self._finalized:
             raise RuntimeError("cannot update a finalized profile")
         self.counters[str(name)] += int(value)
+
+    def mark_unavailable(self, phase: str, reason: str) -> None:
+        if self._finalized:
+            raise RuntimeError("cannot update a finalized profile")
+        if phase not in PROFILE_PHASES:
+            raise ValueError(f"unknown profiling phase {phase!r}")
+        if not reason:
+            raise ValueError("profiling availability reason must be nonempty")
+        self._unavailable[phase] = str(reason)
+
+    def observe_peak_memory(self) -> None:
+        if self._finalized:
+            raise RuntimeError("cannot update a finalized profile")
+        if not self.cuda_enabled:
+            return
+        self._peak_allocated = max(
+            self._peak_allocated,
+            int(self._torch.cuda.max_memory_allocated(self.device)),
+        )
+        self._peak_reserved = max(
+            self._peak_reserved,
+            int(self._torch.cuda.max_memory_reserved(self.device)),
+        )
 
     def _event(self) -> Any:
         return self._torch.cuda.Event(enable_timing=True)
@@ -158,6 +220,7 @@ class RequestScopedProfiler:
             )
         else:
             self._active_leaf = name
+        self._phase_stack.append(name)
 
         use_cuda = bool(cuda and self.cuda_enabled)
         started_event = self._event() if use_cuda else None
@@ -169,6 +232,12 @@ class RequestScopedProfiler:
         try:
             yield
         finally:
+            if not self._phase_stack or self._phase_stack[-1] != name:
+                self._phase_stack.clear()
+                self._active_envelopes.clear()
+                self._active_leaf = None
+                self._nvtx_pop(pushed)
+                raise RuntimeError("profiling phases closed out of stack order")
             if finished_event is not None:
                 self._record_event(finished_event)
             host_finished_ns = time.perf_counter_ns()
@@ -193,12 +262,13 @@ class RequestScopedProfiler:
                     raise RuntimeError("profiling envelope phases closed out of order")
             else:
                 self._active_leaf = None
+            self._phase_stack.pop()
 
-    def finalize(self) -> dict[str, Any]:
+    def finalize(self) -> FrozenDict:
         """Resolve all events after one terminal stream synchronization."""
         if self._snapshot is not None:
             return self._snapshot
-        if self._active_leaf is not None or self._active_envelopes:
+        if self._active_leaf is not None or self._active_envelopes or self._phase_stack:
             raise RuntimeError("cannot finalize while a profiling phase is active")
         if self.cuda_enabled and any(
             sample.cuda_finished is not None for sample in self._samples
@@ -225,29 +295,39 @@ class RequestScopedProfiler:
                 "host_ms": host_ms,
                 "cuda_ms": sum(gpu_samples) if gpu_samples else None,
                 "timing_domain": "cuda" if gpu_samples else "host",
+                "timing_scope": self.timing_scope,
                 "envelope": name in ENVELOPE_PHASES,
+                "available": name not in self._unavailable,
+                "availability_reason": self._unavailable.get(
+                    name,
+                    "not_executed_for_route" if not samples else None,
+                ),
             }
 
         peak_allocated = None
         peak_reserved = None
         if self.cuda_enabled:
-            peak_allocated = int(self._torch.cuda.max_memory_allocated(self.device))
-            peak_reserved = int(self._torch.cuda.max_memory_reserved(self.device))
+            self.observe_peak_memory()
+            peak_allocated = self._peak_allocated
+            peak_reserved = self._peak_reserved
 
         self._finalized = True
-        self._snapshot = {
-            "schema_version": PROFILE_SCHEMA_VERSION,
-            "request_id": self.request_id,
-            "timing_scope": self.timing_scope,
-            "debug_sync": self.debug_sync,
-            "metadata": dict(self.metadata),
-            "phases": phase_values,
-            "counters": dict(sorted(self.counters.items())),
-            "synchronization_count": len(self.synchronizations),
-            "synchronizations": list(self.synchronizations),
-            "peak_allocated_bytes": peak_allocated,
-            "peak_reserved_bytes": peak_reserved,
-        }
+        self._snapshot = _freeze(
+            {
+                "schema_version": PROFILE_SCHEMA_VERSION,
+                "finalized": True,
+                "request_id": self.request_id,
+                "timing_scope": self.timing_scope,
+                "debug_sync": self.debug_sync,
+                "metadata": dict(self.metadata),
+                "phases": phase_values,
+                "counters": dict(sorted(self.counters.items())),
+                "synchronization_count": len(self.synchronizations),
+                "synchronizations": list(self.synchronizations),
+                "peak_allocated_bytes": peak_allocated,
+                "peak_reserved_bytes": peak_reserved,
+            }
+        )
         return self._snapshot
 
 
@@ -264,3 +344,44 @@ def optional_profile_phase(
         return
     with profiler.phase(name, cuda=cuda):
         yield
+
+
+@contextlib.contextmanager
+def profile_many_phase(
+    profilers: Any,
+    name: str,
+    *,
+    cuda: bool = False,
+) -> Iterator[None]:
+    """Enter the same real operation for each attached route profiler."""
+    selected = tuple(profiler for profiler in (profilers or ()) if profiler is not None)
+    if len({id(profiler) for profiler in selected}) != len(selected):
+        raise RuntimeError("duplicate request profiler attachment")
+    with ExitStack() as stack:
+        for profiler in selected:
+            stack.enter_context(optional_profile_phase(profiler, name, cuda=cuda))
+        yield
+
+
+def profilers_from_forward_batch(
+    forward_batch: Any, bid: Optional[int] = None
+) -> tuple:
+    """Return request-owned profilers without creating state for unprofiled work."""
+    by_request = getattr(forward_batch, "region_dag_profilers_cpu", None)
+    if not by_request:
+        return ()
+    if len(by_request) > 1:
+        attached = tuple(
+            profiler
+            for request_profilers in by_request
+            for profiler in request_profilers
+        )
+        if any(profiler.timing_scope != "shared_batch" for profiler in attached):
+            raise RuntimeError(
+                "multi-request profiling must be labeled with shared_batch timing"
+            )
+    if bid is not None:
+        return tuple(by_request[int(bid)] or ())
+    return tuple(
+        profiler for request_profilers in by_request for profiler in request_profilers
+    )

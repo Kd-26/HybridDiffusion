@@ -81,11 +81,11 @@ class GDNDllmBackend:
         self.req_to_token_pool = gdn_backend.req_to_token_pool
 
         # Determine which layers are GDN (complement of full_attention_layer_ids)
-        full_attn_ids = set(getattr(model_config, 'full_attention_layer_ids', []))
-        num_layers = getattr(model_config, 'num_hidden_layers', 0)
-        if hasattr(model_config, 'get_text_config'):
+        full_attn_ids = set(getattr(model_config, "full_attention_layer_ids", []))
+        num_layers = getattr(model_config, "num_hidden_layers", 0)
+        if hasattr(model_config, "get_text_config"):
             text_cfg = model_config.get_text_config()
-            num_layers = getattr(text_cfg, 'num_hidden_layers', num_layers)
+            num_layers = getattr(text_cfg, "num_hidden_layers", num_layers)
         self.gdn_layer_ids = [i for i in range(num_layers) if i not in full_attn_ids]
 
         # Per-request saved projections for HybridDiffusion self-spec commit
@@ -245,8 +245,12 @@ class GDNDllmBackend:
 
     def forward_decode(self, layer, forward_batch, mixed_qkv, a, b, **kwargs):
         return self.gdn_backend.forward_decode(
-            layer=layer, forward_batch=forward_batch,
-            mixed_qkv=mixed_qkv, a=a, b=b, **kwargs,
+            layer=layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            **kwargs,
         )
 
     @staticmethod
@@ -334,9 +338,7 @@ class GDNDllmBackend:
         cache_indices = forward_metadata.mamba_cache_indices
         mask_types = forward_batch.dllm_attn_mask_types_cpu
         seq_lens_cpu = list(forward_batch.extend_seq_lens_cpu)
-        prefix_lens_cpu = [
-            int(x) for x in forward_batch.extend_prefix_lens_cpu
-        ]
+        prefix_lens_cpu = [int(x) for x in forward_batch.extend_prefix_lens_cpu]
         expected_num_tokens = sum(seq_lens_cpu)
         actual_num_tokens = int(forward_batch.input_ids.shape[0])
         if expected_num_tokens != actual_num_tokens:
@@ -411,13 +413,16 @@ class GDNDllmBackend:
             decode_cache_indices = cache_indices[
                 torch.tensor(decode_bids, dtype=torch.long, device=cache_indices.device)
             ]
-            decode_has_initial = forward_batch.extend_prefix_lens[
-                torch.tensor(
-                    decode_bids,
-                    dtype=torch.long,
-                    device=forward_batch.extend_prefix_lens.device,
-                )
-            ] > 0
+            decode_has_initial = (
+                forward_batch.extend_prefix_lens[
+                    torch.tensor(
+                        decode_bids,
+                        dtype=torch.long,
+                        device=forward_batch.extend_prefix_lens.device,
+                    )
+                ]
+                > 0
+            )
             decode_query_start = torch.empty(
                 len(decode_bids) + 1, dtype=torch.int32, device=mixed_qkv.device
             )
@@ -458,7 +463,10 @@ class GDNDllmBackend:
             key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
             g, beta_val = fused_gdn_gating(
-                layer.A_log, a[decode_token_indices], b[decode_token_indices], layer.dt_bias
+                layer.A_log,
+                a[decode_token_indices],
+                b[decode_token_indices],
+                layer.dt_bias,
             )
 
             if layer.num_v_heads // layer.num_k_heads > 1:
@@ -466,7 +474,9 @@ class GDNDllmBackend:
                 query = query.repeat_interleave(repeat_factor, dim=2)
                 key = key.repeat_interleave(repeat_factor, dim=2)
 
-            initial_state = ssm_states[decode_cache_indices] if decode_has_initial.any() else None
+            initial_state = (
+                ssm_states[decode_cache_indices] if decode_has_initial.any() else None
+            )
             if causal_mode == 1:
                 decode_out, _ = fused_recurrent_gated_delta_rule(
                     q=query,
@@ -525,21 +535,28 @@ class GDNDllmBackend:
         layer_id: int,
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
+        profilers=(),
     ) -> None:
+        from sglang.srt.dllm.region.profiling import profile_many_phase
+
         cache_key = (frontier_key, int(layer_id))
-        snapshot = RegionDAGLayerSnapshot(
-            frontier_key=frontier_key,
-            layer_id=int(layer_id),
-            conv_state=conv_state.detach().clone(),
-            recurrent_state=recurrent_state.detach().clone(),
-        )
-        self._region_dag_layer_snapshots[cache_key] = snapshot
-        self._region_dag_layer_snapshots.move_to_end(cache_key)
-        while (
-            len(self._region_dag_layer_snapshots)
-            > self._region_dag_layer_snapshot_limit
-        ):
-            self._region_dag_layer_snapshots.popitem(last=False)
+        with profile_many_phase(profilers, "prefix_snapshot", cuda=True):
+            snapshot = RegionDAGLayerSnapshot(
+                frontier_key=frontier_key,
+                layer_id=int(layer_id),
+                conv_state=conv_state.detach().clone(),
+                recurrent_state=recurrent_state.detach().clone(),
+            )
+        for profiler in profilers:
+            profiler.increment("snapshot_count")
+        with profile_many_phase(profilers, "cache_commit"):
+            self._region_dag_layer_snapshots[cache_key] = snapshot
+            self._region_dag_layer_snapshots.move_to_end(cache_key)
+            while (
+                len(self._region_dag_layer_snapshots)
+                > self._region_dag_layer_snapshot_limit
+            ):
+                self._region_dag_layer_snapshots.popitem(last=False)
 
     def _restore_region_dag_layer_snapshot(
         self,
@@ -548,9 +565,13 @@ class GDNDllmBackend:
         layer_id: int,
         conv_destination: torch.Tensor,
         recurrent_destination: torch.Tensor,
+        profilers=(),
     ) -> None:
+        from sglang.srt.dllm.region.profiling import profile_many_phase
+
         cache_key = (frontier_key, int(layer_id))
-        snapshot = self._region_dag_layer_snapshots.get(cache_key)
+        with profile_many_phase(profilers, "region_cache_lookup"):
+            snapshot = self._region_dag_layer_snapshots.get(cache_key)
         if snapshot is None:
             related = [
                 {
@@ -596,8 +617,9 @@ class GDNDllmBackend:
             raise RuntimeError(
                 "Region-DAG recurrent snapshot device/dtype/shape mismatch"
             )
-        conv_destination.copy_(snapshot.conv_state)
-        recurrent_destination.copy_(snapshot.recurrent_state)
+        with profile_many_phase(profilers, "gdn_restore", cuda=True):
+            conv_destination.copy_(snapshot.conv_state)
+            recurrent_destination.copy_(snapshot.recurrent_state)
         self._region_dag_layer_snapshots.move_to_end(cache_key)
 
     def validate_region_dag_frontiers(self, frontier_keys) -> None:
@@ -673,6 +695,12 @@ class GDNDllmBackend:
         outputs = []
         row_offset = 0
         for bid, spec in enumerate(specs):
+            from sglang.srt.dllm.region.profiling import (
+                profile_many_phase,
+                profilers_from_forward_batch,
+            )
+
+            profilers = profilers_from_forward_batch(forward_batch, bid)
             positions = tuple(int(position) for position in query_positions[bid])
             if not positions:
                 raise RuntimeError("Region-DAG GDN query rows must be nonempty")
@@ -712,6 +740,7 @@ class GDNDllmBackend:
                     layer_id=layer.layer_id,
                     conv_destination=conv_destination,
                     recurrent_destination=recurrent_destination,
+                    profilers=profilers,
                 )
             elif diagnostic_live_prefix:
                 if replay_start <= 0 or bool(restore_required[bid]):
@@ -753,12 +782,11 @@ class GDNDllmBackend:
                     layer_id=layer.layer_id,
                     conv_state=conv_destination,
                     recurrent_state=recurrent_destination,
+                    profilers=profilers,
                 )
                 relative_start = start - replay_start
                 relative_end = end - replay_start
-                segment_mixed_qkv = request_mixed_qkv[
-                    relative_start:relative_end
-                ]
+                segment_mixed_qkv = request_mixed_qkv[relative_start:relative_end]
                 segment_a = request_a[relative_start:relative_end]
                 segment_b = request_b[relative_start:relative_end]
                 segment_len = end - start
@@ -770,56 +798,57 @@ class GDNDllmBackend:
                 query_start_loc = torch.tensor(
                     [0, segment_len], dtype=torch.int32, device=mixed_qkv.device
                 )
-                segment_post_conv = causal_conv1d_fn(
-                    segment_mixed_qkv.transpose(0, 1),
-                    layer.conv_weights,
-                    layer.bias,
-                    activation=layer.activation,
-                    conv_states=conv_states,
-                    has_initial_state=torch.ones(
-                        1, dtype=torch.bool, device=mixed_qkv.device
-                    ),
-                    cache_indices=cache_index_tensor,
-                    query_start_loc=query_start_loc,
-                    seq_lens_cpu=[segment_len],
-                ).transpose(0, 1)[:segment_len]
-                query, key, value = torch.split(
-                    segment_post_conv,
-                    [layer.q_dim, layer.k_dim, layer.v_dim],
-                    dim=-1,
-                )
-                query = query.view(
-                    1, segment_len, layer.num_q_heads, layer.head_q_dim
-                )
-                key = key.view(1, segment_len, layer.num_k_heads, layer.head_k_dim)
-                value = value.view(
-                    1, segment_len, layer.num_v_heads, layer.head_v_dim
-                )
-                g, beta_val = fused_gdn_gating(
-                    layer.A_log, segment_a, segment_b, layer.dt_bias
-                )
-                if layer.num_v_heads // layer.num_k_heads > 1:
-                    repeat_factor = layer.num_v_heads // layer.num_k_heads
-                    query = query.repeat_interleave(repeat_factor, dim=2)
-                    key = key.repeat_interleave(repeat_factor, dim=2)
-                output, final_state = fused_recurrent_gated_delta_rule(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta_val,
-                    initial_state=recurrent_destination.unsqueeze(0),
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=query_start_loc.to(dtype=torch.long),
-                )
-                if final_state is None:
-                    raise RuntimeError(
-                        "Region-DAG GDN kernel did not return a recurrent state"
+                with profile_many_phase(profilers, "gdn_forward", cuda=True):
+                    segment_post_conv = causal_conv1d_fn(
+                        segment_mixed_qkv.transpose(0, 1),
+                        layer.conv_weights,
+                        layer.bias,
+                        activation=layer.activation,
+                        conv_states=conv_states,
+                        has_initial_state=torch.ones(
+                            1, dtype=torch.bool, device=mixed_qkv.device
+                        ),
+                        cache_indices=cache_index_tensor,
+                        query_start_loc=query_start_loc,
+                        seq_lens_cpu=[segment_len],
+                    ).transpose(0, 1)[:segment_len]
+                    query, key, value = torch.split(
+                        segment_post_conv,
+                        [layer.q_dim, layer.k_dim, layer.v_dim],
+                        dim=-1,
                     )
-                recurrent_destination.copy_(
-                    final_state.squeeze(0).to(recurrent_destination.dtype)
-                )
+                    query = query.view(
+                        1, segment_len, layer.num_q_heads, layer.head_q_dim
+                    )
+                    key = key.view(1, segment_len, layer.num_k_heads, layer.head_k_dim)
+                    value = value.view(
+                        1, segment_len, layer.num_v_heads, layer.head_v_dim
+                    )
+                    g, beta_val = fused_gdn_gating(
+                        layer.A_log, segment_a, segment_b, layer.dt_bias
+                    )
+                    if layer.num_v_heads // layer.num_k_heads > 1:
+                        repeat_factor = layer.num_v_heads // layer.num_k_heads
+                        query = query.repeat_interleave(repeat_factor, dim=2)
+                        key = key.repeat_interleave(repeat_factor, dim=2)
+                    output, final_state = fused_recurrent_gated_delta_rule(
+                        q=query,
+                        k=key,
+                        v=value,
+                        g=g,
+                        beta=beta_val,
+                        initial_state=recurrent_destination.unsqueeze(0),
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=query_start_loc.to(dtype=torch.long),
+                    )
+                    if final_state is None:
+                        raise RuntimeError(
+                            "Region-DAG GDN kernel did not return a recurrent state"
+                        )
+                    recurrent_destination.copy_(
+                        final_state.squeeze(0).to(recurrent_destination.dtype)
+                    )
                 request_outputs.append(output)
 
             final_key = frontier_keys[bid].get(spec.sequence_length)
@@ -830,6 +859,7 @@ class GDNDllmBackend:
                 layer_id=layer.layer_id,
                 conv_state=conv_destination,
                 recurrent_state=recurrent_destination,
+                profilers=profilers,
             )
             outputs.append(torch.cat(request_outputs, dim=1))
             row_offset = row_end
@@ -854,28 +884,30 @@ class GDNDllmBackend:
         **kwargs,
     ) -> torch.Tensor:
         if getattr(forward_batch, "region_dag_execution_specs_cpu", None) is not None:
-            return self._forward_region_dag(
-                layer, forward_batch, mixed_qkv, a, b
-            )
+            return self._forward_region_dag(layer, forward_batch, mixed_qkv, a, b)
         # Check if this is a dLLM forward (flags set by the algorithm)
-        persist_state = getattr(forward_batch, 'dllm_gdn_persist_state', None)
+        persist_state = getattr(forward_batch, "dllm_gdn_persist_state", None)
         if persist_state is None:
             # Not a dLLM forward — delegate to original backend
             return self.gdn_backend.forward_extend(
-                layer=layer, forward_batch=forward_batch,
-                mixed_qkv=mixed_qkv, a=a, b=b, **kwargs,
+                layer=layer,
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                **kwargs,
             )
 
-        causal_mode = getattr(forward_batch, 'dllm_gdn_causal_mode', 1)
-        num_clean = getattr(forward_batch, 'dllm_gdn_num_clean', 0)
-        save_for_commit = getattr(forward_batch, 'dllm_gdn_save_for_commit', False)
+        causal_mode = getattr(forward_batch, "dllm_gdn_causal_mode", 1)
+        num_clean = getattr(forward_batch, "dllm_gdn_num_clean", 0)
+        save_for_commit = getattr(forward_batch, "dllm_gdn_save_for_commit", False)
         use_graph_save_buffer = getattr(
             forward_batch, "dllm_gdn_use_graph_save_buffer", False
         )
         cache_intermediate_for_commit = getattr(
             forward_batch, "dllm_gdn_cache_intermediate_for_commit", False
         )
-        block_size = getattr(forward_batch, 'dllm_gdn_block_size', 4)
+        block_size = getattr(forward_batch, "dllm_gdn_block_size", 4)
         assert isinstance(mixed_qkv, torch.Tensor)
         mask_types = getattr(forward_batch, "dllm_attn_mask_types_cpu", None)
         if mask_types is not None and any(
@@ -948,16 +980,22 @@ class GDNDllmBackend:
             intermediate_state_indices = (
                 self.gdn_backend.verify_intermediate_state_indices[:batch_size]
             )
-            mixed_qkv_post_conv = causal_conv1d_update(
-                mixed_qkv.view(batch_size, block_size, -1).transpose(1, 2),
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices,
-                intermediate_conv_window=mamba_cache_params.intermediate_conv_window[0],
-                intermediate_state_indices=intermediate_state_indices,
-            ).transpose(1, 2).reshape(seq_len, -1)
+            mixed_qkv_post_conv = (
+                causal_conv1d_update(
+                    mixed_qkv.view(batch_size, block_size, -1).transpose(1, 2),
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices,
+                    intermediate_conv_window=mamba_cache_params.intermediate_conv_window[
+                        0
+                    ],
+                    intermediate_state_indices=intermediate_state_indices,
+                )
+                .transpose(1, 2)
+                .reshape(seq_len, -1)
+            )
         else:
             mixed_qkv_transposed = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
@@ -995,24 +1033,22 @@ class GDNDllmBackend:
                 raise RuntimeError(
                     "dLLM GDN intermediate commit requires MambaPool.SpeculativeState"
                 )
-            output, final_state = (
-                fused_recurrent_block_causal_gated_delta_rule_packed(
-                    mixed_qkv=mixed_qkv_post_conv,
-                    a=a,
-                    b=b,
-                    A_log=layer.A_log,
-                    dt_bias=layer.dt_bias,
-                    ssm_states=ssm_states,
-                    cache_indices=cache_indices,
-                    block_size=block_size,
-                    causal_mode=causal_mode,
-                    num_clean=num_clean,
-                    output_final_state=persist_state,
-                    intermediate_states_buffer=mamba_cache_params.intermediate_ssm,
-                    intermediate_state_indices=intermediate_state_indices,
-                    cache_steps=block_size,
-                    use_qk_l2norm_in_kernel=True,
-                )
+            output, final_state = fused_recurrent_block_causal_gated_delta_rule_packed(
+                mixed_qkv=mixed_qkv_post_conv,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                block_size=block_size,
+                causal_mode=causal_mode,
+                num_clean=num_clean,
+                output_final_state=persist_state,
+                intermediate_states_buffer=mamba_cache_params.intermediate_ssm,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=block_size,
+                use_qk_l2norm_in_kernel=True,
             )
             if persist_state and final_state is not None:
                 ssm_states[cache_indices] = final_state.to(ssm_states.dtype)
@@ -1107,7 +1143,11 @@ class GDNDllmBackend:
             ssm_states[cache_indices] = final_state.to(ssm_states.dtype)
 
         # ── Save projections for commit ──
-        if save_for_commit and not use_graph_save_buffer and not cache_intermediate_for_commit:
+        if (
+            save_for_commit
+            and not use_graph_save_buffer
+            and not cache_intermediate_for_commit
+        ):
             # Store per-request data keyed by cache_indices
             indices_list = cache_indices.tolist()
             for i, rpx in enumerate(indices_list):
@@ -1187,9 +1227,13 @@ class GDNDllmBackend:
         # [dim, total_tokens] plus query_start_loc for sequence boundaries.
         pre_conv_for_conv = pre_conv_acc.transpose(0, 1)  # [dim, num_accepted]
 
-        cache_idx_tensor = torch.tensor([mamba_cache_idx], device=conv_states.device, dtype=torch.int32)
+        cache_idx_tensor = torch.tensor(
+            [mamba_cache_idx], device=conv_states.device, dtype=torch.int32
+        )
         has_initial = torch.tensor([True], device=conv_states.device)
-        query_start_loc = torch.tensor([0, num_accepted], device=conv_states.device, dtype=torch.long)
+        query_start_loc = torch.tensor(
+            [0, num_accepted], device=conv_states.device, dtype=torch.long
+        )
 
         post_conv = causal_conv1d_fn(
             pre_conv_for_conv,
@@ -1201,7 +1245,9 @@ class GDNDllmBackend:
             cache_indices=cache_idx_tensor,
             query_start_loc=query_start_loc,
             seq_lens_cpu=torch.tensor([num_accepted]),
-        ).transpose(0, 1)  # [num_accepted, dim]
+        ).transpose(
+            0, 1
+        )  # [num_accepted, dim]
 
         # Split + gating
         query, key, value = torch.split(
@@ -1364,9 +1410,7 @@ class GDNDllmBackend:
                 "with source rows matching batch order"
             )
 
-        mamba_caches = (
-            self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        )
+        mamba_caches = self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         device = mamba_caches.temporal.device
         if isinstance(mamba_cache_indices, torch.Tensor):
             cache_idx_t = mamba_cache_indices.to(device=device, dtype=torch.int32)
@@ -1410,7 +1454,9 @@ class GDNDllmBackend:
                     mamba_track_indices, device=device, dtype=torch.int32
                 )
             if isinstance(mamba_steps_to_track, torch.Tensor):
-                track_steps_t = mamba_steps_to_track.to(device=device, dtype=torch.int32)
+                track_steps_t = mamba_steps_to_track.to(
+                    device=device, dtype=torch.int32
+                )
             else:
                 track_steps_t = torch.tensor(
                     mamba_steps_to_track, device=device, dtype=torch.int32
@@ -1439,9 +1485,13 @@ class GDNDllmBackend:
     def _validate_kv_reference(self, reference: KVPrefixReference) -> bool:
         if reference.pool_identity != id(self.req_to_token_pool):
             return False
-        current = self.req_to_token_pool.req_to_token[
-            reference.request_pool_idx, : reference.valid_length
-        ].to(dtype=torch.int64, copy=True).contiguous()
+        current = (
+            self.req_to_token_pool.req_to_token[
+                reference.request_pool_idx, : reference.valid_length
+            ]
+            .to(dtype=torch.int64, copy=True)
+            .contiguous()
+        )
         expected = reference.locations
         return (
             tuple(current.shape) == tuple(expected.shape)
@@ -1459,12 +1509,12 @@ class GDNDllmBackend:
         kv_prefix: KVPrefixReference,
     ) -> RegionState:
         """Clone every mutable GDN state at one exact canonical boundary."""
-        if self._current_mamba_slot(state_key.request_pool_idx) != int(
-            mamba_cache_idx
-        ):
+        if self._current_mamba_slot(state_key.request_pool_idx) != int(mamba_cache_idx):
             raise RuntimeError("request/MambaPool slot mismatch while sealing boundary")
         if not self._validate_kv_reference(kv_prefix):
-            raise RuntimeError("full-attention KV ownership changed while sealing boundary")
+            raise RuntimeError(
+                "full-attention KV ownership changed while sealing boundary"
+            )
         mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
         # Publish only after every tensor is cloned: readers cannot observe
         # convolution and recurrent state from different boundaries.
@@ -1500,9 +1550,7 @@ class GDNDllmBackend:
             return lookup
         state = lookup.state
         assert state is not None
-        if self._current_mamba_slot(state_key.request_pool_idx) != int(
-            mamba_cache_idx
-        ):
+        if self._current_mamba_slot(state_key.request_pool_idx) != int(mamba_cache_idx):
             return RegionStateLookup(
                 state=None,
                 miss_reason=RegionStateMissReason.RECYCLED_REQUEST_SLOT,
@@ -1513,15 +1561,16 @@ class GDNDllmBackend:
                 miss_reason=RegionStateMissReason.POSITION_MISMATCH,
             )
         mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
-        for destination, source in zip(
-            mamba_cache.conv, state.gdn_conv_states
-        ):
+        for destination, source in zip(mamba_cache.conv, state.gdn_conv_states):
             if destination.device != source.device or destination.dtype != source.dtype:
                 raise RuntimeError("GDN convolution snapshot device/dtype mismatch")
             destination[:, int(mamba_cache_idx)].copy_(source)
         recurrent = state.gdn_recurrent_states
         destination = mamba_cache.temporal[:, int(mamba_cache_idx)]
-        if destination.device != recurrent.device or destination.dtype != recurrent.dtype:
+        if (
+            destination.device != recurrent.device
+            or destination.dtype != recurrent.dtype
+        ):
             raise RuntimeError("GDN recurrent snapshot device/dtype mismatch")
         destination.copy_(recurrent)
         return lookup

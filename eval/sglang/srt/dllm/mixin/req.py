@@ -85,6 +85,10 @@ class ReqDllmMixin:
         self.region_dag_model_identity = ""
         self.region_dag_model_revision = ""
         self.region_dag_adapter_revision = ""
+        # Request-owned profiling state is never inherited across slot reuse.
+        # The controlled profiler attaches explicit route instances after
+        # request construction; ordinary production requests keep an empty tuple.
+        self.region_dag_profilers = ()
 
         sampling_params = getattr(self, "sampling_params", None)
         custom_params = getattr(sampling_params, "custom_params", None)
@@ -179,10 +183,7 @@ class ReqDllmMixin:
         # prefix has been materialized and published by the model.  In
         # particular, the diffusion MASK block appended to ``dllm_ids`` must
         # not override the initial prefill phase for short prompts.
-        if (
-            self.hybrid_execution_spec is not None
-            and not self.hybrid_prefix_sealed
-        ):
+        if self.hybrid_execution_spec is not None and not self.hybrid_prefix_sealed:
             if not self.is_dllm_prefill():
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
             return
@@ -225,10 +226,7 @@ class ReqDllmMixin:
             self.dllm_block_offset += advance
             self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
 
-        if (
-            self.hybrid_execution_spec is not None
-            and not self.hybrid_prefix_sealed
-        ):
+        if self.hybrid_execution_spec is not None and not self.hybrid_prefix_sealed:
             # The first exact-handoff forward is a causal seal of the original
             # prompt only. Keep speculative MASKs in dllm_ids for the later
             # decode round, but never schedule them in this prefill.

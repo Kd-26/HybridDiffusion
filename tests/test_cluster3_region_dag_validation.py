@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import json
 import subprocess
 import sys
@@ -256,6 +257,29 @@ def test_efficiency_one_is_the_primary_long_prefix_profile():
     plan = MODULE.expected_plan(spec, case.edited_regions)
     assert plan.gdn_replay_start == 2048
     assert plan.query_count == 64
+
+
+def test_efficiency_one_instantiates_separate_measured_route_profilers():
+    source = inspect.getsource(MODULE.Cluster3ValidationRuntime.run_case)
+    assert 'case.profile == "efficiency_one" and collect' in source
+    assert "RequestScopedProfiler(" in source
+    for route in (
+        "full_replay",
+        "cold_handoff_build",
+        "warm_cached_suffix",
+    ):
+        assert f'"{route}": []' in source
+
+
+def test_exception_cleanup_detaches_request_owned_profilers():
+    runtime = object.__new__(MODULE.Cluster3ValidationRuntime)
+    req = SimpleNamespace(region_dag_profilers=(object(),))
+    runtime._profiled_requests = [req]
+    with pytest.raises(RuntimeError, match="abort"):
+        with runtime._profiling_request_cleanup():
+            raise RuntimeError("abort")
+    assert req.region_dag_profilers == ()
+    assert runtime._profiled_requests == []
 
 
 def test_unedited_independent_active_region_keeps_its_version():

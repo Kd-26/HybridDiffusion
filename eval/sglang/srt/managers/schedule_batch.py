@@ -1923,7 +1923,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return cached
         if req.mamba_ping_pong_track_buffer is None:
             return []
-        cached = [int(x) for x in req.mamba_ping_pong_track_buffer.detach().cpu().tolist()]
+        cached = [
+            int(x) for x in req.mamba_ping_pong_track_buffer.detach().cpu().tolist()
+        ]
         req.mamba_ping_pong_track_buffer_cpu = cached
         return cached
 
@@ -2277,7 +2279,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_lens = [0] * bs
         prefill_flags = [False] * bs
         for i, req in enumerate(self.reqs):
-            if getattr(req, '_inline_prefill', False):
+            if getattr(req, "_inline_prefill", False):
                 prefix_len = len(req.prefix_indices)
                 origin_remaining = len(req.origin_input_ids) - prefix_len
                 if origin_remaining <= 0:
@@ -2321,9 +2323,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 prefix_lens_cpu = torch.tensor(alloc_prefix_lens, dtype=torch.int64)
                 seq_lens_cpu_alloc = torch.tensor(alloc_seq_lens, dtype=torch.int64)
                 prefix_lens_device = prefix_lens_cpu.to(self.device, non_blocking=True)
-                seq_lens_device = seq_lens_cpu_alloc.to(
-                    self.device, non_blocking=True
-                )
+                seq_lens_device = seq_lens_cpu_alloc.to(self.device, non_blocking=True)
                 req_pool_indices_device = torch.tensor(
                     [req.req_pool_idx for req in self.reqs],
                     dtype=torch.int64,
@@ -2361,7 +2361,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         dllm_mamba_track_boundaries_cpu = []
 
         for i, req in enumerate(self.reqs):
-            is_prefill = getattr(req, '_inline_prefill', False)
+            is_prefill = getattr(req, "_inline_prefill", False)
 
             if is_prefill:
                 prefix_len = len(req.prefix_indices)
@@ -2380,7 +2380,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # prompt. Rebuild the slice from that canonical source:
                     # fill_ids can be a previously truncated scheduling view
                     # when a waiting request is absorbed into a decode batch.
-                    req.fill_ids = req.origin_input_ids[:prefix_len + ext_len]
+                    req.fill_ids = req.origin_input_ids[: prefix_len + ext_len]
                     if attn_mask_types is not None:
                         attn_mask_types[i] = DLLM_ATTN_MASK_CAUSAL_PREFILL
             if not is_prefill:
@@ -2398,8 +2398,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else:
                     req.init_next_round_input()
                     req.extend_input_len = min(req.extend_input_len, block_size)
-                    prefix_len = getattr(req, 'kv_committed_len', None) or len(req.prefix_indices)
-                    req.fill_ids = req.fill_ids[:prefix_len + req.extend_input_len]
+                    prefix_len = getattr(req, "kv_committed_len", None) or len(
+                        req.prefix_indices
+                    )
+                    req.fill_ids = req.fill_ids[: prefix_len + req.extend_input_len]
 
             if not _pure_decode:
                 input_ids_list.extend(req.fill_ids[prefix_len:])
@@ -2425,11 +2427,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     chunk = get_global_server_args().mamba_track_interval
                     next_boundary = (prefix_len // chunk + 1) * chunk
                     if next_boundary <= prefix_len + extend_lens[i]:
-                        track_buffer_cpu = self._get_mamba_ping_pong_track_buffer_cpu(req)
+                        track_buffer_cpu = self._get_mamba_ping_pong_track_buffer_cpu(
+                            req
+                        )
                         dllm_mamba_track_indices_cpu.append(
                             track_buffer_cpu[req.mamba_next_track_idx]
                         )
-                        dllm_mamba_track_steps_cpu.append(next_boundary - prefix_len - 1)
+                        dllm_mamba_track_steps_cpu.append(
+                            next_boundary - prefix_len - 1
+                        )
                         dllm_mamba_track_boundaries_cpu.append(next_boundary)
                         if _EXTRA_BUFFER_TRACE:
                             logger.warning(
@@ -2480,33 +2486,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ForwardMode.DLLM_EXTEND if _pure_decode else ForwardMode.DLLM_MIXED
         )
 
-        _rpx_cache = getattr(self, '_dllm_rpx_cache', None)
+        _rpx_cache = getattr(self, "_dllm_rpx_cache", None)
         if _pure_decode and _rpx_cache is not None and _rpx_cache[0] == rpx_list:
             self.req_pool_indices = _rpx_cache[1]
         else:
             self.req_pool_indices = torch.tensor(
-                rpx_list, dtype=torch.int64, device=self.device,
+                rpx_list,
+                dtype=torch.int64,
+                device=self.device,
             )
             if _pure_decode:
                 self._dllm_rpx_cache = (rpx_list[:], self.req_pool_indices)
 
-        _buf = getattr(self, '_dllm_input_ids_buf', None)
+        _buf = getattr(self, "_dllm_input_ids_buf", None)
         if _pure_decode and _buf is not None and _buf.shape[0] == num_tokens:
             _buf.fill_(self.dllm_config.mask_id)
             self.input_ids = _buf
         elif _pure_decode:
             self.input_ids = torch.full(
-                (num_tokens,), self.dllm_config.mask_id,
-                dtype=torch.int64, device=self.device,
+                (num_tokens,),
+                self.dllm_config.mask_id,
+                dtype=torch.int64,
+                device=self.device,
             )
             self._dllm_input_ids_buf = self.input_ids
         else:
             self.input_ids = torch.tensor(
-                input_ids_list, dtype=torch.int64, device=self.device,
+                input_ids_list,
+                dtype=torch.int64,
+                device=self.device,
             )
 
         _sl_t = torch.tensor(seq_lens, dtype=torch.int64)
-        _sl_gpu = getattr(self, '_dllm_seq_lens_gpu', None)
+        _sl_gpu = getattr(self, "_dllm_seq_lens_gpu", None)
         if _pure_decode and _sl_gpu is not None and _sl_gpu.shape[0] == bs:
             _sl_gpu.copy_(_sl_t)
             self.seq_lens = _sl_gpu
@@ -2527,7 +2539,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.lora_ids = [req.lora_id for req in self.reqs]
         if get_global_server_args().enable_mamba_extra_buffer():
             if _pure_decode and not any(mamba_track_mask_cpu):
-                _inactive_track_cache = getattr(self, "_dllm_inactive_track_cache", None)
+                _inactive_track_cache = getattr(
+                    self, "_dllm_inactive_track_cache", None
+                )
                 _inactive_key = (bs, self.device)
                 if (
                     _inactive_track_cache is None
@@ -2539,9 +2553,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         torch.zeros((bs,), dtype=torch.bool, device=self.device),
                         torch.full((bs,), -1, dtype=torch.int64, device=self.device),
                     )
-                _, self.mamba_track_indices, self.mamba_track_mask, self.mamba_track_seqlens = (
-                    self._dllm_inactive_track_cache
-                )
+                (
+                    _,
+                    self.mamba_track_indices,
+                    self.mamba_track_mask,
+                    self.mamba_track_seqlens,
+                ) = self._dllm_inactive_track_cache
             else:
                 self.mamba_track_indices = torch.tensor(
                     mamba_track_indices_cpu,
@@ -2565,7 +2582,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # 5. Write KV slots via batched scatter
         if all(el == block_size for el in extend_lens):
-            _scatter_cache = getattr(self, '_dllm_scatter_cache', None)
+            _scatter_cache = getattr(self, "_dllm_scatter_cache", None)
             _cache_key = (bs, block_size, tuple(rpx_list))
             if _scatter_cache is not None and _scatter_cache[0] == _cache_key:
                 rpx_indices, pos_offsets = _scatter_cache[1], _scatter_cache[2]
@@ -2579,8 +2596,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             pl_t = torch.tensor(prefix_lens, dtype=torch.long, device=self.device)
             pos_base = pl_t.repeat_interleave(block_size)
             pos_indices = pos_base + pos_offsets
-            self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = out_cache_loc.to(
-                self.req_to_token_pool.req_to_token.dtype
+            self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = (
+                out_cache_loc.to(self.req_to_token_pool.req_to_token.dtype)
             )
         else:
             rpx_indices = [0] * num_tokens
@@ -2594,8 +2611,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     rpx_indices[offset] = rpx
                     pos_indices[offset] = pl + t
                     offset += 1
-            self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = out_cache_loc.to(
-                self.req_to_token_pool.req_to_token.dtype
+            self.req_to_token_pool.req_to_token[rpx_indices, pos_indices] = (
+                out_cache_loc.to(self.req_to_token_pool.req_to_token.dtype)
             )
         self.out_cache_loc = out_cache_loc
 
@@ -2613,7 +2630,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_allocated_len = seq_lens[i]
         return True
 
-    def prepare_for_region_dag_replay(self):
+    def _prepare_for_region_dag_replay(self):
         """Prepare explicit absolute replay rows without allocating new KV pages.
 
         A Region-DAG cached pass may overwrite only the physical KV locations
@@ -2743,6 +2760,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if metrics is not None:
                 metrics.gather_scatter_time = elapsed
         return True
+
+    def prepare_for_region_dag_replay(self):
+        """Profile the real replay/KV assembly without affecting other routes."""
+        profilers = tuple(
+            profiler
+            for req in self.reqs
+            for profiler in getattr(req, "region_dag_profilers", ())
+        )
+        if len(self.reqs) > 1 and any(
+            profiler.timing_scope != "shared_batch" for profiler in profilers
+        ):
+            raise RuntimeError(
+                "multi-request replay profiling must be labeled shared_batch"
+            )
+        if not profilers:
+            return self._prepare_for_region_dag_replay()
+        from sglang.srt.dllm.region.profiling import profile_many_phase
+
+        with profile_many_phase(profilers, "kv_restore", cuda=True):
+            return self._prepare_for_region_dag_replay()
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
@@ -3097,21 +3134,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self, "dllm_mamba_track_boundaries_cpu", None
             ),
             hybrid_ar_boundaries_cpu=[
-                req.hybrid_execution_spec.ar_boundary
-                if getattr(req, "hybrid_execution_spec", None) is not None
-                else -1
+                (
+                    req.hybrid_execution_spec.ar_boundary
+                    if getattr(req, "hybrid_execution_spec", None) is not None
+                    else -1
+                )
                 for req in self.reqs
             ],
             hybrid_attention_contract_ids_cpu=[
-                req.hybrid_execution_spec.attention_contract_id
-                if getattr(req, "hybrid_execution_spec", None) is not None
-                else ""
+                (
+                    req.hybrid_execution_spec.attention_contract_id
+                    if getattr(req, "hybrid_execution_spec", None) is not None
+                    else ""
+                )
                 for req in self.reqs
             ],
             hybrid_region_versions_cpu=[
-                req.hybrid_execution_spec.region_versions[0]
-                if getattr(req, "hybrid_execution_spec", None) is not None
-                else -1
+                (
+                    req.hybrid_execution_spec.region_versions[0]
+                    if getattr(req, "hybrid_execution_spec", None) is not None
+                    else -1
+                )
                 for req in self.reqs
             ],
             hybrid_restore_gdn_state=[
@@ -3119,12 +3162,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for req in self.reqs
             ],
             hybrid_prefix_sealed_cpu=[
-                bool(getattr(req, "hybrid_prefix_sealed", False))
-                for req in self.reqs
+                bool(getattr(req, "hybrid_prefix_sealed", False)) for req in self.reqs
             ],
             hybrid_commit_gdn_state=[
-                bool(getattr(req, "hybrid_commit_required", False))
-                for req in self.reqs
+                bool(getattr(req, "hybrid_commit_required", False)) for req in self.reqs
             ],
             hybrid_request_slot_generations_cpu=[
                 int(getattr(req, "hybrid_request_slot_generation", 0))
@@ -3146,15 +3187,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 str(getattr(req, "lora_id", "") or "") for req in self.reqs
             ],
             hybrid_adapter_revisions_cpu=[
-                str(getattr(req, "hybrid_adapter_revision", ""))
-                for req in self.reqs
+                str(getattr(req, "hybrid_adapter_revision", "")) for req in self.reqs
             ],
             hybrid_stable_token_ids_cpu=[
-                (req.origin_input_ids + req.output_ids)[
-                    : req.hybrid_execution_spec.ar_boundary
-                ]
-                if getattr(req, "hybrid_execution_spec", None) is not None
-                else []
+                (
+                    (req.origin_input_ids + req.output_ids)[
+                        : req.hybrid_execution_spec.ar_boundary
+                    ]
+                    if getattr(req, "hybrid_execution_spec", None) is not None
+                    else []
+                )
                 for req in self.reqs
             ],
             region_dag_execution_specs_cpu=(
@@ -3223,6 +3265,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             region_dag_allow_full_replay_cpu=(
                 [bool(req.region_dag_allow_full_replay) for req in self.reqs]
+                if self.reqs
+                and all(
+                    getattr(req, "region_dag_execution_spec", None) is not None
+                    for req in self.reqs
+                )
+                else None
+            ),
+            region_dag_profilers_cpu=(
+                [tuple(getattr(req, "region_dag_profilers", ())) for req in self.reqs]
                 if self.reqs
                 and all(
                     getattr(req, "region_dag_execution_spec", None) is not None
@@ -3465,6 +3516,7 @@ class ModelWorkerBatch:
     region_dag_restore_required_cpu: Optional[List[bool]] = None
     region_dag_reference_cpu: Optional[List[bool]] = None
     region_dag_allow_full_replay_cpu: Optional[List[bool]] = None
+    region_dag_profilers_cpu: Optional[List[Tuple[Any, ...]]] = None
     _dllm_overlap_fn: Optional[Any] = None
 
     # For constrained decoding

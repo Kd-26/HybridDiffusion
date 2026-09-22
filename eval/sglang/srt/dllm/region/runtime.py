@@ -209,7 +209,7 @@ class RegionDAGRuntimePlan:
         )
 
 
-def build_region_dag_runtime_plan(
+def _build_region_dag_runtime_plan(
     spec: RegionDAGExecutionSpec,
     edited_regions: Iterable[str],
     *,
@@ -257,6 +257,30 @@ def build_region_dag_runtime_plan(
         invalidated_ranges=invalidated_ranges,
         full_replay=bool(force_full_replay),
     )
+
+
+def build_region_dag_runtime_plan(
+    spec: RegionDAGExecutionSpec,
+    edited_regions: Iterable[str],
+    *,
+    force_full_replay: bool = False,
+    profilers: Any = (),
+) -> RegionDAGRuntimePlan:
+    """Build a plan and optionally attribute its actual validation work."""
+    if not profilers:
+        return _build_region_dag_runtime_plan(
+            spec,
+            edited_regions,
+            force_full_replay=force_full_replay,
+        )
+    from sglang.srt.dllm.region.profiling import profile_many_phase
+
+    with profile_many_phase(profilers, "dependency_validation"):
+        return _build_region_dag_runtime_plan(
+            spec,
+            edited_regions,
+            force_full_replay=force_full_replay,
+        )
 
 
 @dataclass(frozen=True)

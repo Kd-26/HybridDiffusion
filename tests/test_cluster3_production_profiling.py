@@ -173,6 +173,40 @@ def test_leaf_phases_cannot_overlap_but_totals_can_enclose_them():
                     pass
 
 
+def test_legal_envelope_nesting_and_active_suffix_metadata():
+    profiler = MODULE.RequestScopedProfiler(request_id="nested", cuda_enabled=False)
+    with profiler.phase("request_total"):
+        with profiler.phase("active_suffix_forward"):
+            with profiler.phase("model_forward_total"):
+                with profiler.phase("mlp_forward"):
+                    pass
+    record = profiler.finalize()
+    assert record["phases"]["active_suffix_forward"]["envelope"] is True
+    assert record["phases"]["mlp_forward"]["envelope"] is False
+
+
+def test_envelopes_must_close_in_stack_order():
+    profiler = MODULE.RequestScopedProfiler(request_id="order", cuda_enabled=False)
+    outer = profiler.phase("request_total")
+    inner = profiler.phase("model_forward_total")
+    outer.__enter__()
+    inner.__enter__()
+    with pytest.raises(RuntimeError, match="stack order"):
+        outer.__exit__(None, None, None)
+    with pytest.raises(RuntimeError, match="stack order"):
+        inner.__exit__(None, None, None)
+
+
+def test_exception_cleanup_and_active_finalization_guard():
+    profiler = MODULE.RequestScopedProfiler(request_id="cleanup", cuda_enabled=False)
+    with pytest.raises(ValueError, match="boom"):
+        with profiler.phase("request_total"):
+            with pytest.raises(RuntimeError, match="active"):
+                profiler.finalize()
+            raise ValueError("boom")
+    assert profiler.finalize()["finalized"] is True
+
+
 def test_cpu_profile_has_no_synchronization_and_reports_missing_phases():
     profiler = MODULE.RequestScopedProfiler(
         request_id="cpu-request",
@@ -190,6 +224,8 @@ def test_cpu_profile_has_no_synchronization_and_reports_missing_phases():
     assert record["phases"]["kv_restore"]["calls"] == 0
     assert record["peak_allocated_bytes"] is None
     assert profiler.finalize() is record
+    with pytest.raises(TypeError, match="immutable"):
+        record["metadata"]["changed"] = True
 
 
 def test_unknown_phase_and_post_finalize_mutation_fail_closed():
@@ -200,3 +236,54 @@ def test_unknown_phase_and_post_finalize_mutation_fail_closed():
     profiler.finalize()
     with pytest.raises(RuntimeError, match="finalized"):
         profiler.increment("cache_hit")
+
+
+def test_unprofiled_forward_batch_has_no_profiler_state_or_events():
+    batch = type("Batch", (), {"region_dag_profilers_cpu": None})()
+    assert MODULE.profilers_from_forward_batch(batch) == ()
+
+
+def test_multi_request_profile_requires_shared_batch_label():
+    first = MODULE.RequestScopedProfiler(request_id="first", cuda_enabled=False)
+    second = MODULE.RequestScopedProfiler(request_id="second", cuda_enabled=False)
+    batch = type(
+        "Batch",
+        (),
+        {"region_dag_profilers_cpu": [(first,), (second,)]},
+    )()
+    with pytest.raises(RuntimeError, match="shared_batch"):
+        MODULE.profilers_from_forward_batch(batch)
+
+
+def test_shared_batch_profile_is_explicitly_preserved():
+    first = MODULE.RequestScopedProfiler(
+        request_id="first", cuda_enabled=False, timing_scope="shared_batch"
+    )
+    second = MODULE.RequestScopedProfiler(
+        request_id="second", cuda_enabled=False, timing_scope="shared_batch"
+    )
+    batch = type(
+        "Batch",
+        (),
+        {"region_dag_profilers_cpu": [(first,), (second,)]},
+    )()
+    assert MODULE.profilers_from_forward_batch(batch) == (first, second)
+
+
+def test_request_initialization_clears_profiler_state_for_slot_reuse():
+    source = (ROOT / "eval/sglang/srt/dllm/mixin/req.py").read_text(encoding="utf-8")
+    assert "self.region_dag_profilers = ()" in source
+
+
+def test_optional_profiling_preserves_operation_result_and_call_count():
+    calls = []
+
+    def operation(profiler):
+        with MODULE.optional_profile_phase(profiler, "verification"):
+            calls.append(1)
+            return sum(range(8))
+
+    profiler = MODULE.RequestScopedProfiler(request_id="enabled", cuda_enabled=False)
+    assert operation(None) == operation(profiler) == 28
+    assert len(calls) == 2
+    assert profiler.finalize()["phases"]["verification"]["calls"] == 1

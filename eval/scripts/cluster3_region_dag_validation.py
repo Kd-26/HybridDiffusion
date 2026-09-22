@@ -55,6 +55,18 @@ def _nvtx_range(torch_module: Any, name: str) -> Iterator[None]:
             torch_module.cuda.nvtx.range_pop()
 
 
+@contextlib.contextmanager
+def _profile_many_phase(profilers: Any, name: str, *, cuda: bool = False):
+    """Avoid importing runtime profiling support on an unprofiled CPU path."""
+    if not profilers:
+        yield
+        return
+    from sglang.srt.dllm.region.profiling import profile_many_phase
+
+    with profile_many_phase(profilers, name, cuda=cuda):
+        yield
+
+
 @dataclass(frozen=True)
 class DeferredCudaTiming:
     """A CUDA event pair resolved only after the enclosing request sync."""
@@ -528,6 +540,7 @@ def build_execution_spec(
     token_ids: Sequence[int],
     *,
     edited: bool,
+    profilers: Any = (),
 ) -> Any:
     from sglang.srt.dllm.region.dependency_graph import DependencyGraph
     from sglang.srt.dllm.region.execution_spec import (
@@ -541,10 +554,13 @@ def build_execution_spec(
     initial_versions = {region.region_id: 0 for region in case.regions}
 
     def provisional(versions: Mapping[str, int]) -> Any:
-        return RegionDAGExecutionSpec(
-            sequence_length=case.sequence_length,
-            diffusion_steps=case.diffusion_steps,
-            regions=tuple(
+        built_regions = []
+        for region in case.regions:
+            with _profile_many_phase(profilers, "identity_token_hash"):
+                token_hash = _token_hash(token_ids[region.start : region.end])
+            with _profile_many_phase(profilers, "identity_position_hash"):
+                position_hash = _position_hash(region.start, region.end)
+            built_regions.append(
                 RegionDAGRegion(
                     region_id=region.region_id,
                     region_version=versions[region.region_id],
@@ -555,27 +571,31 @@ def build_execution_spec(
                     recorded_parent_versions=tuple(
                         (parent, versions[parent]) for parent in region.parents
                     ),
-                    token_hash=_token_hash(token_ids[region.start : region.end]),
-                    position_hash=_position_hash(region.start, region.end),
+                    token_hash=token_hash,
+                    position_hash=position_hash,
                 )
-                for region in case.regions
-            ),
+            )
+        return RegionDAGExecutionSpec(
+            sequence_length=case.sequence_length,
+            diffusion_steps=case.diffusion_steps,
+            regions=tuple(built_regions),
         )
 
     base = provisional(initial_versions)
     if not edited:
         return base
-    invalidated = DependencyGraph(base).invalidation_closure(case.edited_regions)
+    with _profile_many_phase(profilers, "dependency_validation"):
+        invalidated = DependencyGraph(base).invalidation_closure(case.edited_regions)
     versions = {
         region_id: int(region_id in invalidated) for region_id in initial_versions
     }
     return provisional(versions)
 
 
-def expected_plan(spec: Any, edited_regions: Sequence[str]) -> Any:
+def expected_plan(spec: Any, edited_regions: Sequence[str], profilers: Any = ()) -> Any:
     from sglang.srt.dllm.region.runtime import build_region_dag_runtime_plan
 
-    return build_region_dag_runtime_plan(spec, edited_regions)
+    return build_region_dag_runtime_plan(spec, edited_regions, profilers=profilers)
 
 
 def validate_case_record(record: Mapping[str, Any], case: ValidationCase) -> list[str]:
@@ -966,8 +986,11 @@ class ScopedBackendTimers:
     without changing production code or relying on Python-method row hooks.
     """
 
-    def __init__(self, runtime: "Cluster3ValidationRuntime") -> None:
+    def __init__(
+        self, runtime: "Cluster3ValidationRuntime", profilers: Any = ()
+    ) -> None:
         self.torch = __import__("torch")
+        self.profilers = tuple(profilers)
         attention_backend = runtime.model_runner.attn_backend
         self.full_backend = getattr(
             attention_backend, "full_attn_backend", attention_backend
@@ -1027,7 +1050,12 @@ class ScopedBackendTimers:
             }[kind]
             with _nvtx_range(self.torch, nvtx_name):
                 started.record()
-                result = original(*args, **kwargs)
+                with _profile_many_phase(
+                    self.profilers if kind == "mlp" else (),
+                    "mlp_forward",
+                    cuda=True,
+                ):
+                    result = original(*args, **kwargs)
                 finished.record()
             self._events[kind].append((started, finished))
             return result
@@ -1100,8 +1128,22 @@ class Cluster3ValidationRuntime:
         self.device = self.runtime.device
         self.revision = _git_revision()
         self.model_scale = self.cluster2.infer_model_scale(self.model_runner)
+        self._profiled_requests: list[Any] = []
+
+    def _detach_profiled_requests(self) -> None:
+        for req in self._profiled_requests:
+            req.region_dag_profilers = ()
+        self._profiled_requests.clear()
+
+    @contextlib.contextmanager
+    def _profiling_request_cleanup(self):
+        try:
+            yield
+        finally:
+            self._detach_profiled_requests()
 
     def _clear(self) -> None:
+        self._detach_profiled_requests()
         self.runtime._clear_pools()
         self.backend._region_dag_layer_snapshots.clear()
 
@@ -1128,6 +1170,7 @@ class Cluster3ValidationRuntime:
         *,
         mode: str,
         initialized: bool,
+        profilers: Any = (),
     ) -> None:
         from sglang.srt.dllm.region.runtime import RegionDAGInstrumentation
 
@@ -1145,6 +1188,9 @@ class Cluster3ValidationRuntime:
         )
         req.region_dag_adapter_revision = ""
         req.region_dag_frontier_keys = {}
+        req.region_dag_profilers = tuple(profilers)
+        if profilers:
+            self._profiled_requests.append(req)
 
     def _bind_frontiers(self, req: Any) -> None:
         from sglang.srt.dllm.region.runtime import build_region_dag_frontier_key
@@ -1213,6 +1259,7 @@ class Cluster3ValidationRuntime:
         token_ids: list[int],
         spec: Any,
         case: ValidationCase,
+        profilers: Any = (),
     ) -> tuple[Any, Any, dict[str, float]]:
         torch = __import__("torch")
         from sglang.srt.dllm.region.runtime import build_region_dag_runtime_plan
@@ -1220,16 +1267,29 @@ class Cluster3ValidationRuntime:
 
         req = self.runtime._make_req(rid, token_ids)
         plan = build_region_dag_runtime_plan(
-            spec, case.edited_regions, force_full_replay=True
+            spec,
+            case.edited_regions,
+            force_full_replay=True,
+            profilers=profilers,
         )
-        self._attach_request(req, spec, plan, mode="reference", initialized=False)
+        self._attach_request(
+            req,
+            spec,
+            plan,
+            mode="reference",
+            initialized=False,
+            profilers=profilers,
+        )
         req.prefix_indices = torch.empty(0, dtype=torch.int64, device=self.device)
         req.fill_ids = list(token_ids)
         req.set_extend_input_len(len(token_ids))
         batch = self._new_batch(req)
-        _, gather_scatter_ms = self._cuda_timed(
-            batch.prepare_for_extend, nvtx_phase="request_setup"
-        )
+        from sglang.srt.dllm.region.profiling import profile_many_phase
+
+        with profile_many_phase(profilers, "request_setup", cuda=True):
+            _, gather_scatter_ms = self._cuda_timed(
+                batch.prepare_for_extend, nvtx_phase="request_setup"
+            )
         self._bind_frontiers(req)
         worker_batch = batch.get_model_worker_batch()
         forward_batch, mask_build_ms = self._cuda_timed(
@@ -1251,6 +1311,7 @@ class Cluster3ValidationRuntime:
         token_ids: list[int],
         spec: Any,
         case: ValidationCase,
+        profilers: Any = (),
     ) -> tuple[Any, Any, dict[str, float]]:
         """Schedule only the stable topological prefix that owns the frontier."""
         torch = __import__("torch")
@@ -1260,21 +1321,31 @@ class Cluster3ValidationRuntime:
         )
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-        plan = build_region_dag_runtime_plan(spec, case.edited_regions)
+        plan = build_region_dag_runtime_plan(
+            spec, case.edited_regions, profilers=profilers
+        )
         boundary = int(plan.gdn_replay_start)
         frontier_spec = build_canonical_frontier_execution_spec(spec, boundary)
         req = self.runtime._make_req(rid, token_ids)
         self._attach_request(
-            req, spec, plan, mode="canonical_frontier", initialized=False
+            req,
+            spec,
+            plan,
+            mode="canonical_frontier",
+            initialized=False,
+            profilers=profilers,
         )
         req.region_dag_frontier_establishing = True
         req.prefix_indices = torch.empty(0, dtype=torch.int64, device=self.device)
         req.fill_ids = list(token_ids[:boundary])
         req.set_extend_input_len(boundary)
         batch = self._new_batch(req)
-        _, gather_scatter_ms = self._cuda_timed(
-            batch.prepare_for_extend, nvtx_phase="request_setup"
-        )
+        from sglang.srt.dllm.region.profiling import profile_many_phase
+
+        with profile_many_phase(profilers, "request_setup", cuda=True):
+            _, gather_scatter_ms = self._cuda_timed(
+                batch.prepare_for_extend, nvtx_phase="request_setup"
+            )
         self._bind_frontiers(req)
         batch.region_dag_execution_specs_cpu = [frontier_spec]
         batch.region_dag_query_positions_cpu = [tuple(range(boundary))]
@@ -1315,12 +1386,15 @@ class Cluster3ValidationRuntime:
         case: ValidationCase,
         *,
         restore: bool,
+        profilers: Any = (),
     ) -> tuple[Any, dict[str, float]]:
         """Attach the full suffix to a canonical live or committed frontier."""
         from sglang.srt.dllm.region.runtime import build_region_dag_runtime_plan
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-        plan = build_region_dag_runtime_plan(spec, case.edited_regions)
+        plan = build_region_dag_runtime_plan(
+            spec, case.edited_regions, profilers=profilers
+        )
         boundary = int(plan.gdn_replay_start)
         req.prefix_indices = self.runtime._canonical_prefix_locations(
             req.req_pool_idx, boundary
@@ -1334,15 +1408,20 @@ class Cluster3ValidationRuntime:
             plan,
             mode="canonical_cached" if restore else "canonical_segmented",
             initialized=True,
+            profilers=profilers,
         )
         req.region_dag_frontier_established = True
         req.region_dag_restore_required = bool(restore)
         self._bind_frontiers(req)
         batch = self._new_batch(req)
-        _, gather_scatter_ms = self._cuda_timed(
-            batch.prepare_for_extend,
-            nvtx_phase="kv_restore" if restore else "request_setup",
-        )
+        from sglang.srt.dllm.region.profiling import profile_many_phase
+
+        phase = "kv_restore" if restore else "request_setup"
+        with profile_many_phase(profilers, phase, cuda=True):
+            _, gather_scatter_ms = self._cuda_timed(
+                batch.prepare_for_extend,
+                nvtx_phase=phase,
+            )
         batch.region_dag_query_positions_cpu = [plan.attention_query_positions]
         batch.region_dag_restore_required_cpu = [bool(restore)]
         batch.region_dag_reference_cpu = [False]
@@ -1368,14 +1447,24 @@ class Cluster3ValidationRuntime:
         token_ids: list[int],
         spec: Any,
         case: ValidationCase,
+        profilers: Any = (),
     ) -> tuple[Any, dict[str, float]]:
         from sglang.srt.dllm.region.runtime import build_region_dag_runtime_plan
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-        plan = build_region_dag_runtime_plan(spec, case.edited_regions)
+        plan = build_region_dag_runtime_plan(
+            spec, case.edited_regions, profilers=profilers
+        )
         req.origin_input_ids = list(token_ids)
         req.fill_ids = list(token_ids)
-        self._attach_request(req, spec, plan, mode="cached", initialized=True)
+        self._attach_request(
+            req,
+            spec,
+            plan,
+            mode="cached",
+            initialized=True,
+            profilers=profilers,
+        )
         self._bind_frontiers(req)
         batch = self._new_batch(req)
         _, gather_scatter_ms = self._cuda_timed(
@@ -1395,6 +1484,12 @@ class Cluster3ValidationRuntime:
         self, forward_batch: Any, hooks: Any
     ) -> tuple[dict[str, Any], float, dict[str, Any]]:
         torch = __import__("torch")
+        from sglang.srt.dllm.region.profiling import (
+            profile_many_phase,
+            profilers_from_forward_batch,
+        )
+
+        profilers = profilers_from_forward_batch(forward_batch)
         with _nvtx_range(torch, "flashinfer_plan_build"):
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         mamba_slots = [
@@ -1403,13 +1498,16 @@ class Cluster3ValidationRuntime:
         ]
         started = torch.cuda.Event(enable_timing=True)
         finished = torch.cuda.Event(enable_timing=True)
-        with ScopedBackendTimers(self) as timers:
+        with ScopedBackendTimers(self, profilers) as timers:
             with _nvtx_range(torch, "model_forward_total"):
                 started.record()
                 with hooks.capture(mamba_slots):
-                    logits = self.runtime._forward(
-                        forward_batch, metadata_prepared=True
-                    )
+                    with profile_many_phase(
+                        profilers, "model_forward_total", cuda=True
+                    ):
+                        logits = self.runtime._forward(
+                            forward_batch, metadata_prepared=True
+                        )
             finished.record()
             self.runtime._synchronize()
             model_forward_ms = float(started.elapsed_time(finished))
@@ -1667,15 +1765,62 @@ class Cluster3ValidationRuntime:
             "gather_scatter_ms": [],
             "cache_lookup_restore_ms": [],
         }
+        request_phase_profiles: dict[str, list[Mapping[str, Any]]] = {
+            "full_replay": [],
+            "cold_handoff_build": [],
+            "warm_cached_suffix": [],
+        }
         cache_restore_unavailable = False
         peak = 0
         started = time.perf_counter()
         with (
             RuntimeLogEvidence().installed() as logs,
             self.cluster2.ScopedRowHooks(self.model_runner) as hooks,
+            self._profiling_request_cleanup(),
         ):
             for repetition in range(-warmup_repetitions, measurement_repetitions):
                 collect = repetition >= 0
+                route_profilers: dict[str, Any] = {}
+                if case.profile == "efficiency_one" and collect:
+                    from sglang.srt.dllm.region.profiling import RequestScopedProfiler
+
+                    for route in request_phase_profiles:
+                        route_profilers[route] = RequestScopedProfiler(
+                            request_id=f"{case.case_id}:{route}:{repetition}",
+                            cuda_enabled=True,
+                            device=self.device,
+                            debug_sync=False,
+                            timing_scope="request_exclusive",
+                            metadata={
+                                "route": route,
+                                "repetition_index": repetition,
+                                "case_id": case.case_id,
+                                "prefix_length": case.sequence_length
+                                - len(case.active_positions),
+                                "active_length": len(case.active_positions),
+                                "diffusion_steps": case.diffusion_steps,
+                                "batch_size": case.batch_size,
+                                "cache_status": (
+                                    "hit" if route == "warm_cached_suffix" else "miss"
+                                ),
+                            },
+                        )
+                full_profilers = tuple(
+                    value
+                    for key, value in route_profilers.items()
+                    if key == "full_replay"
+                )
+                cold_profilers = tuple(
+                    value
+                    for key, value in route_profilers.items()
+                    if key == "cold_handoff_build"
+                )
+                warm_profilers = tuple(
+                    value
+                    for key, value in route_profilers.items()
+                    if key == "warm_cached_suffix"
+                )
+                all_profilers = tuple(route_profilers.values())
                 edited_tokens = list(original_tokens)
                 for position in diffusion_positions:
                     edited_tokens[position] = int(self.runtime.dllm_config.mask_id)
@@ -1686,61 +1831,75 @@ class Cluster3ValidationRuntime:
                 repetition_cached_peak = 0
 
                 for step in range(case.diffusion_steps):
-                    edited_spec = build_execution_spec(case, edited_tokens, edited=True)
-                    plan = expected_plan(edited_spec, case.edited_regions)
+                    from sglang.srt.dllm.region.profiling import profile_many_phase
+
+                    with profile_many_phase(all_profilers, "request_total"):
+                        edited_spec = build_execution_spec(
+                            case,
+                            edited_tokens,
+                            edited=True,
+                            profilers=all_profilers,
+                        )
+                        plan = expected_plan(
+                            edited_spec, case.edited_regions, all_profilers
+                        )
                     replay_start = plan.gdn_replay_start
 
                     self._clear()
                     torch.cuda.reset_peak_memory_stats(self.device)
-                    if replay_start == 0:
-                        reference_req, reference_batch, reference_prepare = (
-                            self._prepare_reference(
+                    with profile_many_phase(full_profilers, "request_total"):
+                        if replay_start == 0:
+                            reference_req, reference_batch, reference_prepare = (
+                                self._prepare_reference(
+                                    f"{case.case_id}:reference:{repetition}:{step}",
+                                    edited_tokens,
+                                    edited_spec,
+                                    case,
+                                    full_profilers,
+                                )
+                            )
+                            reference_trace, reference_forward_ms, _ = (
+                                self._run_forward(reference_batch, hooks)
+                            )
+                            reference_frontier_trace = None
+                        else:
+                            (
+                                reference_req,
+                                reference_frontier_batch,
+                                reference_frontier_prepare,
+                            ) = self._prepare_canonical_frontier(
                                 f"{case.case_id}:reference:{repetition}:{step}",
                                 edited_tokens,
                                 edited_spec,
                                 case,
+                                full_profilers,
                             )
-                        )
-                        reference_trace, reference_forward_ms, _ = self._run_forward(
-                            reference_batch, hooks
-                        )
-                        reference_frontier_trace = None
-                    else:
-                        (
-                            reference_req,
-                            reference_frontier_batch,
-                            reference_frontier_prepare,
-                        ) = self._prepare_canonical_frontier(
-                            f"{case.case_id}:reference:{repetition}:{step}",
-                            edited_tokens,
-                            edited_spec,
-                            case,
-                        )
-                        (
-                            reference_frontier_trace,
-                            reference_frontier_ms,
-                            _,
-                        ) = self._run_forward(reference_frontier_batch, hooks)
-                        self.backend._region_dag_layer_snapshots.clear()
-                        reference_batch, reference_suffix_prepare = (
-                            self._prepare_frontier_suffix(
-                                reference_req,
-                                edited_tokens,
-                                edited_spec,
-                                case,
-                                restore=False,
+                            (
+                                reference_frontier_trace,
+                                reference_frontier_ms,
+                                _,
+                            ) = self._run_forward(reference_frontier_batch, hooks)
+                            self.backend._region_dag_layer_snapshots.clear()
+                            reference_batch, reference_suffix_prepare = (
+                                self._prepare_frontier_suffix(
+                                    reference_req,
+                                    edited_tokens,
+                                    edited_spec,
+                                    case,
+                                    restore=False,
+                                    profilers=full_profilers,
+                                )
                             )
-                        )
-                        reference_trace, reference_suffix_ms, _ = self._run_forward(
-                            reference_batch, hooks
-                        )
-                        reference_prepare = {
-                            "frontier": sum(reference_frontier_prepare.values()),
-                            "suffix": sum(reference_suffix_prepare.values()),
-                        }
-                        reference_forward_ms = (
-                            reference_frontier_ms + reference_suffix_ms
-                        )
+                            reference_trace, reference_suffix_ms, _ = self._run_forward(
+                                reference_batch, hooks
+                            )
+                            reference_prepare = {
+                                "frontier": sum(reference_frontier_prepare.values()),
+                                "suffix": sum(reference_suffix_prepare.values()),
+                            }
+                            reference_forward_ms = (
+                                reference_frontier_ms + reference_suffix_ms
+                            )
                     reference_reused_hash = self._reused_hash(
                         reference_req, replay_start
                     )
@@ -1759,25 +1918,37 @@ class Cluster3ValidationRuntime:
                         repetition_reference_peak,
                         int(torch.cuda.max_memory_allocated(self.device)),
                     )
+                    for profiler in full_profilers:
+                        profiler.observe_peak_memory()
 
                     self._clear()
-                    base_spec = build_execution_spec(
-                        case, original_tokens, edited=False
-                    )
+                    with profile_many_phase(
+                        (*cold_profilers, *warm_profilers), "request_total"
+                    ):
+                        base_spec = build_execution_spec(
+                            case,
+                            original_tokens,
+                            edited=False,
+                            profilers=(*cold_profilers, *warm_profilers),
+                        )
                     prepare_baseline = (
                         self._prepare_reference
                         if replay_start == 0
                         else self._prepare_canonical_frontier
                     )
-                    baseline_req, baseline_batch, baseline_prepare = prepare_baseline(
-                        f"{case.case_id}:cached:{repetition}:{step}",
-                        original_tokens,
-                        base_spec,
-                        case,
-                    )
-                    baseline_trace, baseline_forward_ms, _ = self._run_forward(
-                        baseline_batch, hooks
-                    )
+                    with profile_many_phase(cold_profilers, "request_total"):
+                        baseline_req, baseline_batch, baseline_prepare = (
+                            prepare_baseline(
+                                f"{case.case_id}:cached:{repetition}:{step}",
+                                original_tokens,
+                                base_spec,
+                                case,
+                                cold_profilers,
+                            )
+                        )
+                        baseline_trace, baseline_forward_ms, _ = self._run_forward(
+                            baseline_batch, hooks
+                        )
                     self._validate_trace_rows(
                         baseline_trace,
                         expected_rows=(
@@ -1791,24 +1962,38 @@ class Cluster3ValidationRuntime:
                             "reused pre-frontier KV/GDN state disagrees with "
                             "complete Region-DAG recomputation"
                         )
+                    for profiler in cold_profilers:
+                        profiler.observe_peak_memory()
                     torch.cuda.reset_peak_memory_stats(self.device)
-                    if replay_start == 0:
-                        cached_batch, cached_prepare = self._prepare_cached(
-                            baseline_req, edited_tokens, edited_spec, case
-                        )
-                    else:
-                        cached_batch, cached_prepare = self._prepare_frontier_suffix(
-                            baseline_req,
-                            edited_tokens,
-                            edited_spec,
-                            case,
-                            restore=True,
-                        )
-                    (
-                        cached_trace,
-                        cached_forward_ms,
-                        cached_backend_ms,
-                    ) = self._run_forward(cached_batch, hooks)
+                    cached_profilers = (*cold_profilers, *warm_profilers)
+                    with profile_many_phase(cached_profilers, "request_total"):
+                        with profile_many_phase(
+                            cached_profilers, "active_suffix_forward", cuda=True
+                        ):
+                            if replay_start == 0:
+                                cached_batch, cached_prepare = self._prepare_cached(
+                                    baseline_req,
+                                    edited_tokens,
+                                    edited_spec,
+                                    case,
+                                    cached_profilers,
+                                )
+                            else:
+                                cached_batch, cached_prepare = (
+                                    self._prepare_frontier_suffix(
+                                        baseline_req,
+                                        edited_tokens,
+                                        edited_spec,
+                                        case,
+                                        restore=True,
+                                        profilers=cached_profilers,
+                                    )
+                                )
+                            (
+                                cached_trace,
+                                cached_forward_ms,
+                                cached_backend_ms,
+                            ) = self._run_forward(cached_batch, hooks)
                     self._validate_trace_rows(
                         cached_trace,
                         expected_rows=plan.query_count,
@@ -1825,8 +2010,12 @@ class Cluster3ValidationRuntime:
                         repetition_cached_peak,
                         int(torch.cuda.max_memory_allocated(self.device)),
                     )
+                    for profiler in cached_profilers:
+                        profiler.observe_peak_memory()
 
-                    comparison = self._compare(reference_trace, cached_trace)
+                    with profile_many_phase(all_profilers, "request_total"):
+                        with profile_many_phase(all_profilers, "verification"):
+                            comparison = self._compare(reference_trace, cached_trace)
                     if collect:
                         comparisons.append(comparison)
                         paired_hashes.append(
@@ -1951,11 +2140,13 @@ class Cluster3ValidationRuntime:
                     )
                     repetition_work["gdn_state_restores"] += restore_calls
 
-                    _apply_reference_top1_at_absolute_positions(
-                        edited_tokens,
-                        diffusion_positions,
-                        reference_trace,
-                    )
+                    with profile_many_phase(all_profilers, "request_total"):
+                        with profile_many_phase(all_profilers, "scheduler_postprocess"):
+                            _apply_reference_top1_at_absolute_positions(
+                                edited_tokens,
+                                diffusion_positions,
+                                reference_trace,
+                            )
 
                 if collect:
                     for name, value in repetition_timings.items():
@@ -1975,6 +2166,36 @@ class Cluster3ValidationRuntime:
                         repetition_reference_peak,
                         repetition_cached_peak,
                     )
+                    self._detach_profiled_requests()
+                    for route, profiler in route_profilers.items():
+                        cache_hits = (
+                            repetition_work["kv_cache_hits"]
+                            if route != "full_replay"
+                            else 0
+                        )
+                        cache_misses = (
+                            repetition_work["kv_cache_misses"]
+                            if route == "warm_cached_suffix"
+                            else case.sequence_length * case.diffusion_steps
+                        )
+                        profiler.increment(
+                            "cache_hit_count",
+                            cache_hits,
+                        )
+                        profiler.increment(
+                            "cache_miss_count",
+                            cache_misses,
+                        )
+                        profiler.increment(
+                            "gdn_state_restore_count",
+                            (
+                                repetition_work["gdn_state_restores"]
+                                if route != "full_replay"
+                                else 0
+                            ),
+                        )
+                        profiler.increment("recovery_replay_count", 0)
+                        request_phase_profiles[route].append(profiler.finalize())
         if not hooks.released:
             raise RuntimeError("temporary row hooks survived Cluster-3 validation")
 
@@ -2069,6 +2290,23 @@ class Cluster3ValidationRuntime:
             "recovery_replays": logs.recovery_replays,
             "nan_or_inf_detected": False,
             "component_timings_ms": component_timings,
+            "request_phase_profiles": request_phase_profiles,
+            "warm_snapshot_behavior": {
+                "calls": sum(
+                    int(snapshot["counters"].get("snapshot_count", 0))
+                    for snapshot in request_phase_profiles["warm_cached_suffix"]
+                ),
+                "expected_zero": False,
+                "pass": bool(request_phase_profiles["warm_cached_suffix"])
+                and all(
+                    int(snapshot["counters"].get("snapshot_count", 0)) > 0
+                    for snapshot in request_phase_profiles["warm_cached_suffix"]
+                ),
+                "reason": (
+                    "conservative ordered GDN replay republishes every traversed "
+                    "frontier, including replay-start and final frontiers, on warm hits"
+                ),
+            },
             "timing_protocol": {
                 "warmup_repetitions": warmup_repetitions,
                 "timed_repetitions": measurement_repetitions,

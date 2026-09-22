@@ -511,7 +511,9 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
-    def _get_dllm_bidir_block_mask(self, device: torch.device) -> Optional[torch.Tensor]:
+    def _get_dllm_bidir_block_mask(
+        self, device: torch.device
+    ) -> Optional[torch.Tensor]:
         if not self.dllm_uses_bidir_mask:
             return None
         if (
@@ -590,6 +592,10 @@ class FlashInferAttnBackend(AttentionBackend):
             from sglang.srt.dllm.attention_mask import (
                 validate_region_dag_paged_custom_mask,
             )
+            from sglang.srt.dllm.region.profiling import (
+                profile_many_phase,
+                profilers_from_forward_batch,
+            )
 
             specs = forward_batch.region_dag_execution_specs_cpu
             query_positions = forward_batch.region_dag_query_positions_cpu
@@ -614,21 +620,26 @@ class FlashInferAttnBackend(AttentionBackend):
                     "Region-DAG FlashInfer query indptr differs from absolute rows: "
                     f"observed={observed_query_counts} expected={query_counts}"
                 )
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                prefix_lens=prefix_lens,
-                prefill_wrappers=self.prefill_wrappers_paged,
-                use_ragged=False,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=None,
-                fixed_split_size=self.prefill_split_tile_size,
-                custom_mask=custom_mask,
-                dllm_native_bidir_mask=False,
-                dllm_attn_mask_types=None,
-            )
+            with profile_many_phase(
+                profilers_from_forward_batch(forward_batch),
+                "flashinfer_plan_build",
+                cuda=True,
+            ):
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens=prefix_lens,
+                    prefill_wrappers=self.prefill_wrappers_paged,
+                    use_ragged=False,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=None,
+                    fixed_split_size=self.prefill_split_tile_size,
+                    custom_mask=custom_mask,
+                    dllm_native_bidir_mask=False,
+                    dllm_attn_mask_types=None,
+                )
             forward_batch.dllm_selected_mask_backend = "custom_paged"
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -650,18 +661,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
         ):
-            dllm_force_causal = getattr(
-                forward_batch, "dllm_force_causal", False
-            )
+            dllm_force_causal = getattr(forward_batch, "dllm_force_causal", False)
             dllm_force_bidir_mask = getattr(
                 forward_batch, "dllm_force_bidir_mask", False
             )
             dllm_bidir_custom_mask = getattr(
                 forward_batch, "dllm_bidir_custom_mask", None
             )
-            dllm_attn_mask_types = getattr(
-                forward_batch, "dllm_attn_mask_types", None
-            )
+            dllm_attn_mask_types = getattr(forward_batch, "dllm_attn_mask_types", None)
             prefix_lens = forward_batch.extend_prefix_lens
             dllm_mask_backend = getattr(
                 forward_batch, "dllm_bidir_mask_backend", "auto"
@@ -802,15 +809,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 is_commit = getattr(forward_batch, "dllm_is_commit", False)
                 if is_commit:
                     dllm_is_prefill = False
-                elif getattr(forward_batch, "dllm_attn_mask_types_cpu", None) is not None:
+                elif (
+                    getattr(forward_batch, "dllm_attn_mask_types_cpu", None) is not None
+                ):
                     dllm_is_prefill = all(
                         t != DLLM_ATTN_MASK_BIDIR_BLOCK
                         for t in forward_batch.dllm_attn_mask_types_cpu
                     )
                 else:
-                    dllm_is_prefill = not (
-                        forward_batch.input_ids == self.dllm_config.mask_id
-                    ).any().item()
+                    dllm_is_prefill = (
+                        not (forward_batch.input_ids == self.dllm_config.mask_id)
+                        .any()
+                        .item()
+                    )
             dllm_force_causal = getattr(forward_batch, "dllm_force_causal", False)
             dllm_force_bidir_mask = getattr(
                 forward_batch, "dllm_force_bidir_mask", False
@@ -1136,7 +1147,6 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    @debug_kernel_api
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1274,7 +1284,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                     qo_indptr = torch.arange(
                         0, (bs + 1) * blk, blk, dtype=torch.int32, device=q.device
-                    )[:bs + 1]
+                    )[: bs + 1]
                     self.prefill_wrapper_ragged.begin_forward(
                         qo_indptr,
                         qo_indptr,
@@ -1317,6 +1327,32 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    _forward_extend_unprofiled = forward_extend
+
+    @debug_kernel_api
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+        from sglang.srt.dllm.region.profiling import (
+            profile_many_phase,
+            profilers_from_forward_batch,
+        )
+
+        with profile_many_phase(
+            profilers_from_forward_batch(forward_batch),
+            "attention_forward",
+            cuda=True,
+        ):
+            return self._forward_extend_unprofiled(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
 
     @debug_kernel_api
     def forward_decode(
