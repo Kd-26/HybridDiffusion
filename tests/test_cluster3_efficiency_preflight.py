@@ -15,11 +15,18 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
+VALIDATED_QWEN35_2B_FINGERPRINT = {
+    "hidden_size": 2048,
+    "intermediate_size": 6144,
+    "num_hidden_layers": 24,
+}
+
+
 def write_checkpoint(root: Path, *, architecture=None, dtype="BF16") -> Path:
     root.mkdir()
     config = {
         "architectures": [architecture or MODULE.EXPECTED_ARCHITECTURE],
-        **MODULE.QWEN35_2B_FINGERPRINT,
+        **VALIDATED_QWEN35_2B_FINGERPRINT,
     }
     (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
     for name in ("tokenizer.json", "tokenizer_config.json"):
@@ -36,6 +43,7 @@ def write_checkpoint(root: Path, *, architecture=None, dtype="BF16") -> Path:
 
 
 def test_checkpoint_inventory_architecture_scale_and_bf16(tmp_path):
+    assert MODULE.QWEN35_2B_FINGERPRINT == VALIDATED_QWEN35_2B_FINGERPRINT
     checkpoint = write_checkpoint(tmp_path / "model")
     identity = MODULE.checkpoint_identity(checkpoint)
     assert identity["architecture"] == MODULE.EXPECTED_ARCHITECTURE

@@ -24,7 +24,7 @@ REQUIRED_CHECKPOINT_FILES = (
 )
 QWEN35_2B_FINGERPRINT = {
     "hidden_size": 2048,
-    "intermediate_size": 5632,
+    "intermediate_size": 6144,
     "num_hidden_layers": 24,
 }
 
