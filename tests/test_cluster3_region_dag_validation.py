@@ -443,6 +443,122 @@ class FakeEvent:
         return 1.25
 
 
+class FakeOperation:
+    def forward(self, value=None, *_args, **_kwargs):
+        return value
+
+
+class FakeRotary(FakeOperation):
+    pass
+
+
+class FakeCommunicator:
+    def prepare_attn_and_capture_last_layer_outputs(
+        self, value=None, *_args, **_kwargs
+    ):
+        return value
+
+    def prepare_mlp(self, value=None, *_args, **_kwargs):
+        return value
+
+    def postprocess_layer(self, value=None, *_args, **_kwargs):
+        return value
+
+
+class FakeAttentionLayer:
+    def __init__(
+        self,
+        rotary,
+        *,
+        communicator=None,
+        qkv_projection=None,
+        output_projection=None,
+        mlp=None,
+    ):
+        self.rotary_emb = rotary
+        self.layer_communicator = communicator or FakeCommunicator()
+        self.qkv_proj = qkv_projection or FakeOperation()
+        self.o_proj = output_projection or FakeOperation()
+        self.mlp = mlp or FakeOperation()
+
+    def _apply_qk_norm(self, value=None, *_args, **_kwargs):
+        return value
+
+    def self_attention(self, value=None, *_args, **_kwargs):
+        value = self.qkv_proj.forward(value)
+        value = self._apply_qk_norm(value)
+        value = self.rotary_emb.forward(value)
+        return self.o_proj.forward(value)
+
+    def forward(self, value=None, *_args, **_kwargs):
+        value = self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+            value
+        )
+        value = self.self_attention(value)
+        value = self.layer_communicator.prepare_mlp(value)
+        value = self.mlp.forward(value)
+        return self.layer_communicator.postprocess_layer(value)
+
+
+class FakeGDN(FakeOperation):
+    def __init__(self, *, norm=None, output_projection=None):
+        self.norm = norm or FakeOperation()
+        self.out_proj = output_projection or FakeOperation()
+
+    def _forward_input_proj(self, value=None, *_args, **_kwargs):
+        return value
+
+    def forward(self, value=None, *_args, **_kwargs):
+        value = self._forward_input_proj(value)
+        value = self.norm.forward(value)
+        return self.out_proj.forward(value)
+
+
+class FakeGDNLayer:
+    def __init__(self, *, communicator=None, gdn=None, mlp=None):
+        self.layer_communicator = communicator or FakeCommunicator()
+        self.linear_attn = gdn or FakeGDN()
+        self.mlp = mlp or FakeOperation()
+
+    def forward(self, value=None, *_args, **_kwargs):
+        value = self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+            value
+        )
+        value = self.linear_attn.forward(value)
+        value = self.layer_communicator.prepare_mlp(value)
+        value = self.mlp.forward(value)
+        return self.layer_communicator.postprocess_layer(value)
+
+
+class FakeUnknownLayer:
+    def __init__(self):
+        self.layer_communicator = FakeCommunicator()
+        self.mlp = FakeOperation()
+
+    def forward(self, value=None, *_args, **_kwargs):
+        return value
+
+
+def hierarchical_timer_runtime(layers):
+    runtime = fake_timer_runtime()
+    language_model = SimpleNamespace(
+        embed_tokens=FakeOperation(),
+        norm=FakeOperation(),
+        layers=list(layers),
+    )
+    root_model = SimpleNamespace(logits_processor=FakeOperation())
+    runtime.model_runner.model = root_model
+    runtime.cluster1.ModelTraceHooks._language_model = lambda _model: language_model
+    return runtime, language_model, root_model
+
+
+def assert_class_method_restored(target, name, expected_function):
+    assert name not in target.__dict__
+    bound = getattr(target, name)
+    assert bound.__func__ is expected_function
+    assert bound.__self__ is target
+
+
 def fake_timer_runtime():
     full = SimpleNamespace(forward_extend=lambda value: value + 1)
     gdn = SimpleNamespace(
@@ -545,6 +661,195 @@ def test_hierarchical_model_probes_cleanup_after_exception():
     assert embed.forward is original_embed
     snapshot = profiler.finalize()
     assert snapshot["phases"]["token_hidden_input_preparation"]["calls"] == 1
+
+
+def test_shared_rotary_installation_is_idempotent_and_counts_real_calls():
+    shared_rotary = FakeRotary()
+    layers = [FakeAttentionLayer(shared_rotary) for _ in range(6)]
+    runtime, _, _ = hierarchical_timer_runtime(layers)
+    profiler = PROFILING.RequestScopedProfiler(
+        request_id="shared-rotary", cuda_enabled=False
+    )
+
+    with MODULE.ScopedBackendTimers(runtime, (profiler,)) as timers:
+        key = (id(shared_rotary), "forward")
+        installation = timers._installations[key]
+        assert installation.phase_or_kind == "rope_attention_preparation"
+        wrapped = shared_rotary.__dict__["forward"]
+        installation_count = len(timers._installations)
+        timers._install_profile(shared_rotary, "forward", "rope_attention_preparation")
+        assert shared_rotary.__dict__["forward"] is wrapped
+        assert len(timers._installations) == installation_count
+        invocations = 0
+        for step in range(4):
+            for layer in layers:
+                invocations += 1
+                assert layer.rotary_emb.forward(step) == step
+        assert invocations == 24
+
+    assert timers.released
+    assert_class_method_restored(shared_rotary, "forward", FakeRotary.forward)
+    snapshot = profiler.finalize()
+    assert snapshot["phases"]["rope_attention_preparation"]["calls"] == 24
+
+
+def test_shared_rotary_exception_cleanup_restores_original_method():
+    shared_rotary = FakeRotary()
+    runtime, _, _ = hierarchical_timer_runtime(
+        [FakeAttentionLayer(shared_rotary), FakeAttentionLayer(shared_rotary)]
+    )
+    profiler = PROFILING.RequestScopedProfiler(
+        request_id="shared-rotary-exception", cuda_enabled=False
+    )
+
+    with pytest.raises(RuntimeError, match="primary"):
+        with MODULE.ScopedBackendTimers(runtime, (profiler,)) as timers:
+            shared_rotary.forward(1)
+            raise RuntimeError("primary")
+
+    assert timers.released
+    assert_class_method_restored(shared_rotary, "forward", FakeRotary.forward)
+
+
+def test_shared_target_conflicts_fail_closed_without_rewrapping():
+    shared_rotary = FakeRotary()
+    runtime, _, _ = hierarchical_timer_runtime(
+        [FakeAttentionLayer(shared_rotary), FakeAttentionLayer(shared_rotary)]
+    )
+    profiler = PROFILING.RequestScopedProfiler(
+        request_id="shared-conflict", cuda_enabled=False
+    )
+
+    with MODULE.ScopedBackendTimers(runtime, (profiler,)) as timers:
+        wrapped = shared_rotary.__dict__["forward"]
+        with pytest.raises(RuntimeError, match="conflicting phase assignment"):
+            timers._install_profile(
+                shared_rotary, "forward", "attention_output_projection"
+            )
+        with pytest.raises(RuntimeError, match="conflicting phase assignment"):
+            timers._install(shared_rotary, "forward", "mlp")
+        assert shared_rotary.__dict__["forward"] is wrapped
+
+    assert timers.released
+    assert_class_method_restored(shared_rotary, "forward", FakeRotary.forward)
+
+
+def test_partial_hierarchy_installation_failure_cleans_earlier_wrappers():
+    shared_rotary = FakeRotary()
+    good_layer = FakeAttentionLayer(shared_rotary)
+    bad_layer = FakeUnknownLayer()
+    runtime, language_model, root_model = hierarchical_timer_runtime(
+        [good_layer, bad_layer]
+    )
+    profiler = PROFILING.RequestScopedProfiler(
+        request_id="partial-installation", cuda_enabled=False
+    )
+
+    with pytest.raises(RuntimeError, match="unknown Qwen3.5 decoder layer type"):
+        MODULE.ScopedBackendTimers(runtime, (profiler,))
+
+    assert_class_method_restored(shared_rotary, "forward", FakeRotary.forward)
+    assert_class_method_restored(good_layer, "forward", FakeAttentionLayer.forward)
+    assert_class_method_restored(bad_layer, "forward", FakeUnknownLayer.forward)
+    assert_class_method_restored(
+        language_model.embed_tokens, "forward", FakeOperation.forward
+    )
+    assert_class_method_restored(
+        root_model.logits_processor, "forward", FakeOperation.forward
+    )
+
+
+def test_shared_mlp_backend_timer_is_installed_once_and_counts_every_call(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "Event", lambda **_kwargs: FakeEvent())
+    shared_mlp = FakeOperation()
+    runtime = fake_timer_runtime()
+    language_model = SimpleNamespace(
+        layers=[SimpleNamespace(mlp=shared_mlp), SimpleNamespace(mlp=shared_mlp)]
+    )
+    runtime.cluster1.ModelTraceHooks._language_model = lambda _model: language_model
+
+    with MODULE.ScopedBackendTimers(runtime) as timers:
+        key = (id(shared_mlp), "forward")
+        assert timers._installations[key].phase_or_kind == "mlp"
+        assert shared_mlp.forward(1) == 1
+        assert shared_mlp.forward(2) == 2
+        assert timers.snapshot()["mlp_calls"] == 2
+
+    assert timers.released
+    assert_class_method_restored(shared_mlp, "forward", FakeOperation.forward)
+
+
+def test_mixed_shared_model_records_all_hierarchy_probes(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "Event", lambda **_kwargs: FakeEvent())
+    shared_rotary = FakeRotary()
+    shared_communicator = FakeCommunicator()
+    shared_qkv = FakeOperation()
+    shared_attention_output = FakeOperation()
+    shared_gdn_norm = FakeOperation()
+    shared_gdn_output = FakeOperation()
+    layers = [
+        FakeAttentionLayer(
+            shared_rotary,
+            communicator=shared_communicator,
+            qkv_projection=shared_qkv,
+            output_projection=shared_attention_output,
+            mlp=FakeOperation(),
+        ),
+        FakeAttentionLayer(
+            shared_rotary,
+            communicator=shared_communicator,
+            qkv_projection=shared_qkv,
+            output_projection=shared_attention_output,
+            mlp=FakeOperation(),
+        ),
+        FakeGDNLayer(
+            communicator=shared_communicator,
+            gdn=FakeGDN(norm=shared_gdn_norm, output_projection=shared_gdn_output),
+            mlp=FakeOperation(),
+        ),
+        FakeGDNLayer(
+            communicator=shared_communicator,
+            gdn=FakeGDN(norm=shared_gdn_norm, output_projection=shared_gdn_output),
+            mlp=FakeOperation(),
+        ),
+    ]
+    runtime, language_model, root_model = hierarchical_timer_runtime(layers)
+    profiler = PROFILING.RequestScopedProfiler(
+        request_id="mixed-shared-model", cuda_enabled=False
+    )
+
+    with MODULE.ScopedBackendTimers(runtime, (profiler,)) as timers:
+        value = language_model.embed_tokens.forward(1)
+        for layer in layers:
+            value = layer.forward(value)
+        value = language_model.norm.forward(value)
+        assert root_model.logits_processor.forward(value) == 1
+        backend = timers.snapshot()
+
+    assert timers.released
+    snapshot = profiler.finalize()
+    expected_calls = {
+        "token_hidden_input_preparation": 1,
+        "decoder_layer_total": 4,
+        "pre_attention_normalization": 4,
+        "attention_block_total": 2,
+        "attention_qkv_projection": 2,
+        "rope_attention_preparation": 4,
+        "attention_output_projection": 2,
+        "gdn_block_total": 2,
+        "gdn_input_projection": 2,
+        "gdn_output_projection": 4,
+        "residual_post_attention_normalization": 4,
+        "mlp_forward": 4,
+        "residual_connection": 4,
+        "final_normalization": 1,
+        "lm_head_projection": 1,
+    }
+    for phase, calls in expected_calls.items():
+        assert snapshot["phases"][phase]["calls"] == calls
+    assert backend["mlp_calls"] == 4
+    assert backend["gdn_replay_calls"] == 0
+    assert_class_method_restored(shared_rotary, "forward", FakeRotary.forward)
 
 
 class FakeRuntime:

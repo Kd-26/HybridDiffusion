@@ -978,6 +978,17 @@ def _timing_evidence(
     return evidence
 
 
+@dataclass(frozen=True)
+class _ScopedMethodInstallation:
+    target: Any
+    method_name: str
+    installation_type: str
+    phase_or_kind: str
+    original_method: Any
+    had_instance_value: bool
+    instance_value: Any
+
+
 class ScopedBackendTimers:
     """Validator-only CUDA event probes removed on every exit path.
 
@@ -996,7 +1007,7 @@ class ScopedBackendTimers:
             attention_backend, "full_attn_backend", attention_backend
         )
         self.gdn_backend = runtime.backend
-        self._targets: list[tuple[Any, str, bool, Any]] = []
+        self._installations: dict[tuple[int, str], _ScopedMethodInstallation] = {}
         self._events: dict[str, list[tuple[Any, Any]]] = {
             "full_attention": [],
             "gdn_replay": [],
@@ -1029,10 +1040,62 @@ class ScopedBackendTimers:
             if self.profilers:
                 self._install_model_hierarchy(runtime, model)
         except BaseException:
-            self.close()
+            self.close(preserve_primary=True)
             raise
 
+    def _installation_key(self, target: Any, name: str) -> tuple[int, str]:
+        return (id(target), str(name))
+
+    def _is_duplicate_installation(
+        self,
+        target: Any,
+        name: str,
+        installation_type: str,
+        phase_or_kind: str,
+    ) -> bool:
+        key = self._installation_key(target, name)
+        existing = self._installations.get(key)
+        if existing is None:
+            return False
+        if (
+            existing.installation_type == installation_type
+            and existing.phase_or_kind == phase_or_kind
+        ):
+            return True
+        raise RuntimeError(
+            "shared profiler target has conflicting phase assignment: "
+            f"target={type(target).__qualname__}, method={name}, "
+            f"existing={existing.installation_type}:{existing.phase_or_kind}, "
+            f"requested={installation_type}:{phase_or_kind}"
+        )
+
+    def _record_installation(
+        self,
+        *,
+        target: Any,
+        name: str,
+        installation_type: str,
+        phase_or_kind: str,
+        original: Any,
+        had_instance_value: bool,
+        instance_value: Any,
+    ) -> None:
+        key = self._installation_key(target, name)
+        if key in self._installations:
+            raise RuntimeError("profiler installation registry changed unexpectedly")
+        self._installations[key] = _ScopedMethodInstallation(
+            target=target,
+            method_name=name,
+            installation_type=installation_type,
+            phase_or_kind=phase_or_kind,
+            original_method=original,
+            had_instance_value=had_instance_value,
+            instance_value=instance_value,
+        )
+
     def _install_profile(self, target: Any, name: str, phase: str) -> None:
+        if self._is_duplicate_installation(target, name, "hierarchical_profile", phase):
+            return
         original = getattr(target, name, None)
         if not callable(original):
             raise RuntimeError(f"hierarchical profiler cannot observe {name}")
@@ -1045,7 +1108,15 @@ class ScopedBackendTimers:
                 return original(*args, **kwargs)
 
         setattr(target, name, measured)
-        self._targets.append((target, name, had_instance_value, instance_value))
+        self._record_installation(
+            target=target,
+            name=name,
+            installation_type="hierarchical_profile",
+            phase_or_kind=phase,
+            original=original,
+            had_instance_value=had_instance_value,
+            instance_value=instance_value,
+        )
 
     def _install_model_hierarchy(self, runtime: Any, model: Any) -> None:
         root_model = runtime.model_runner.model
@@ -1115,6 +1186,8 @@ class ScopedBackendTimers:
                 raise RuntimeError("unknown Qwen3.5 decoder layer type")
 
     def _install(self, target: Any, name: str, kind: str) -> None:
+        if self._is_duplicate_installation(target, name, "backend_timer", kind):
+            return
         original = getattr(target, name, None)
         if not callable(original):
             raise RuntimeError(f"Region-DAG timer cannot observe {name}")
@@ -1145,7 +1218,15 @@ class ScopedBackendTimers:
             return result
 
         setattr(target, name, measured)
-        self._targets.append((target, name, had_instance_value, instance_value))
+        self._record_installation(
+            target=target,
+            name=name,
+            installation_type="backend_timer",
+            phase_or_kind=kind,
+            original=original,
+            had_instance_value=had_instance_value,
+            instance_value=instance_value,
+        )
 
     def snapshot(self) -> dict[str, Any]:
         values: dict[str, Any] = {}
@@ -1158,24 +1239,36 @@ class ScopedBackendTimers:
             values[f"{kind}_calls"] = len(pairs)
         return values
 
-    def close(self) -> None:
-        for target, name, had_instance_value, instance_value in reversed(self._targets):
-            if had_instance_value:
-                setattr(target, name, instance_value)
-            else:
-                delattr(target, name)
-        self._targets.clear()
+    def close(self, *, preserve_primary: bool = False) -> None:
+        errors = []
+        for installation in reversed(tuple(self._installations.values())):
+            try:
+                if installation.had_instance_value:
+                    setattr(
+                        installation.target,
+                        installation.method_name,
+                        installation.instance_value,
+                    )
+                else:
+                    delattr(installation.target, installation.method_name)
+            except BaseException as exc:
+                errors.append(exc)
+        self._installations.clear()
         self._events.clear()
+        if errors and not preserve_primary:
+            raise RuntimeError(
+                f"failed to restore {len(errors)} profiler method installation(s)"
+            ) from errors[0]
 
     @property
     def released(self) -> bool:
-        return not self._targets
+        return not self._installations and not self._events
 
     def __enter__(self) -> "ScopedBackendTimers":
         return self
 
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
-        self.close()
+        self.close(preserve_primary=_type is not None)
 
 
 class Cluster3ValidationRuntime:
