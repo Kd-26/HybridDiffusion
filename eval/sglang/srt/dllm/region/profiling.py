@@ -17,7 +17,7 @@ from contextlib import ExitStack
 from typing import Any, Iterator, Mapping, Optional
 
 
-PROFILE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = 3
 
 PROFILE_PHASES = (
     "request_setup",
@@ -40,13 +40,110 @@ PROFILE_PHASES = (
     "scheduler_postprocess",
     "model_forward_total",
     "request_total",
+    "suffix_prepare_total",
+    "suffix_finalize_total",
+    "runtime_plan_build",
+    "canonical_prefix_location_materialization",
+    "request_metadata_attachment",
+    "frontier_key_construction",
+    "schedule_batch_initialization",
+    "schedule_batch_prepare",
+    "worker_batch_construction",
+    "forward_batch_initialization",
+    "model_request_slot_materialization",
+    "trace_materialization",
+    "token_hidden_input_preparation",
+    "decoder_layer_total",
+    "pre_attention_normalization",
+    "attention_block_total",
+    "attention_qkv_projection",
+    "rope_attention_preparation",
+    "attention_output_projection",
+    "gdn_block_total",
+    "gdn_input_projection",
+    "gdn_output_projection",
+    "residual_post_attention_normalization",
+    "residual_connection",
+    "final_normalization",
+    "lm_head_projection",
 )
 
-# Totals are envelopes.  Every other phase is exclusive so the overhead table
-# can sum its rows without double counting.
+# The primary parent identifies the hierarchy used by the warm-route report.
+# Some phases also run on full/cold routes without that parent being active;
+# the snapshot still records the intended hierarchy so consumers never sum an
+# envelope with its descendants.
+PHASE_PARENTS = {
+    "request_total": None,
+    "active_suffix_forward": "request_total",
+    "suffix_prepare_total": "active_suffix_forward",
+    "model_forward_total": "active_suffix_forward",
+    "suffix_finalize_total": "active_suffix_forward",
+    "runtime_plan_build": "suffix_prepare_total",
+    "canonical_prefix_location_materialization": "suffix_prepare_total",
+    "request_metadata_attachment": "suffix_prepare_total",
+    "frontier_key_construction": "suffix_prepare_total",
+    "schedule_batch_initialization": "suffix_prepare_total",
+    "schedule_batch_prepare": "suffix_prepare_total",
+    "worker_batch_construction": "suffix_prepare_total",
+    "forward_batch_initialization": "suffix_prepare_total",
+    "region_mask_build": "forward_batch_initialization",
+    "kv_restore": "schedule_batch_prepare",
+    "flashinfer_plan_build": "suffix_prepare_total",
+    "model_request_slot_materialization": "suffix_prepare_total",
+    "trace_materialization": "suffix_finalize_total",
+    "token_hidden_input_preparation": "model_forward_total",
+    "decoder_layer_total": "model_forward_total",
+    "final_normalization": "model_forward_total",
+    "lm_head_projection": "model_forward_total",
+    "pre_attention_normalization": "decoder_layer_total",
+    "attention_block_total": "decoder_layer_total",
+    "gdn_block_total": "decoder_layer_total",
+    "residual_post_attention_normalization": "decoder_layer_total",
+    "mlp_forward": "decoder_layer_total",
+    "residual_connection": "decoder_layer_total",
+    "attention_qkv_projection": "attention_block_total",
+    "rope_attention_preparation": "attention_block_total",
+    "attention_forward": "attention_block_total",
+    "attention_output_projection": "attention_block_total",
+    "gdn_input_projection": "gdn_block_total",
+    "region_cache_lookup": "gdn_block_total",
+    "gdn_restore": "gdn_block_total",
+    "gdn_forward": "gdn_block_total",
+    "prefix_snapshot": "gdn_block_total",
+    "cache_commit": "gdn_block_total",
+    "gdn_output_projection": "gdn_block_total",
+    "identity_token_hash": "request_total",
+    "identity_position_hash": "request_total",
+    "dependency_validation": "runtime_plan_build",
+    "request_setup": "request_total",
+    "recovery_replay": "active_suffix_forward",
+    "verification": "request_total",
+    "scheduler_postprocess": "request_total",
+}
+
 ENVELOPE_PHASES = frozenset(
-    ("active_suffix_forward", "model_forward_total", "request_total")
+    (
+        "request_total",
+        "active_suffix_forward",
+        "suffix_prepare_total",
+        "model_forward_total",
+        "suffix_finalize_total",
+        "runtime_plan_build",
+        "schedule_batch_prepare",
+        "forward_batch_initialization",
+        "decoder_layer_total",
+        "attention_block_total",
+        "gdn_block_total",
+    )
 )
+
+PHASE_HIERARCHY = {
+    name: {
+        "parent": PHASE_PARENTS.get(name),
+        "kind": "envelope" if name in ENVELOPE_PHASES else "leaf",
+    }
+    for name in PROFILE_PHASES
+}
 
 
 class FrozenDict(dict):
@@ -212,6 +309,15 @@ class RequestScopedProfiler:
         if is_envelope:
             if name in self._active_envelopes:
                 raise RuntimeError(f"profiling phase {name!r} is already active")
+            if self._active_envelopes:
+                active = self._active_envelopes[-1]
+                parent = PHASE_PARENTS.get(name)
+                active_parent = PHASE_PARENTS.get(active)
+                if active != parent and active_parent == parent:
+                    raise RuntimeError(
+                        "profiling sibling envelopes must not overlap: "
+                        f"{active!r} and {name!r}"
+                    )
             self._active_envelopes.append(name)
         elif self._active_leaf is not None:
             raise RuntimeError(
@@ -297,6 +403,8 @@ class RequestScopedProfiler:
                 "timing_domain": "cuda" if gpu_samples else "host",
                 "timing_scope": self.timing_scope,
                 "envelope": name in ENVELOPE_PHASES,
+                "parent_phase": PHASE_PARENTS.get(name),
+                "hierarchy_kind": PHASE_HIERARCHY[name]["kind"],
                 "available": name not in self._unavailable,
                 "availability_reason": self._unavailable.get(
                     name,
@@ -320,6 +428,7 @@ class RequestScopedProfiler:
                 "timing_scope": self.timing_scope,
                 "debug_sync": self.debug_sync,
                 "metadata": dict(self.metadata),
+                "hierarchy": PHASE_HIERARCHY,
                 "phases": phase_values,
                 "counters": dict(sorted(self.counters.items())),
                 "synchronization_count": len(self.synchronizations),

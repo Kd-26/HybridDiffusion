@@ -106,6 +106,17 @@ class SamplingBatchInfo:
         return (batch, vocab_size)
 
 
+PREPARE_REPLAY_IMPL = class_method(
+    SCHEDULE_BATCH_PATH,
+    "ScheduleBatch",
+    "_prepare_for_region_dag_replay",
+    {
+        "ForwardMode": ForwardMode,
+        "SamplingBatchInfo": SamplingBatchInfo,
+        "time": time,
+        "torch": torch,
+    },
+)
 PREPARE_REPLAY = class_method(
     SCHEDULE_BATCH_PATH,
     "ScheduleBatch",
@@ -285,7 +296,7 @@ def make_batch(req, mapping=None):
         if mapping is None
         else mapping
     )
-    return types.SimpleNamespace(
+    batch = types.SimpleNamespace(
         reqs=[req],
         req_to_token_pool=types.SimpleNamespace(req_to_token=mapping),
         token_to_kv_pool_allocator=types.SimpleNamespace(size=64),
@@ -294,6 +305,8 @@ def make_batch(req, mapping=None):
         return_logprob=False,
         has_grammar=False,
     )
+    batch._prepare_for_region_dag_replay = types.MethodType(PREPARE_REPLAY_IMPL, batch)
+    return batch
 
 
 def test_cached_replay_reuses_real_page_table_with_int64_absolute_rows():
@@ -438,6 +451,16 @@ def test_region_initialization_requires_all_published_gdn_frontiers():
 
 
 def test_flashinfer_region_route_forces_exact_custom_paged_mask(monkeypatch):
+    for package_name in (
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.dllm",
+        "sglang.srt.dllm.region",
+    ):
+        package = types.ModuleType(package_name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, package_name, package)
+    load_module("sglang.srt.dllm.region.profiling", REGION_DIR / "profiling.py")
     mask_module = types.ModuleType("sglang.srt.dllm.attention_mask")
 
     def validate(mask, query_counts, kv_counts):

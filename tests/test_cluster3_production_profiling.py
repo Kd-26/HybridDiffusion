@@ -101,7 +101,7 @@ def make_cuda_profiler(*, debug_sync=False):
 
 
 def test_declares_every_required_phase_once():
-    assert MODULE.PROFILE_PHASES == (
+    required = {
         "request_setup",
         "identity_token_hash",
         "identity_position_hash",
@@ -122,8 +122,36 @@ def test_declares_every_required_phase_once():
         "scheduler_postprocess",
         "model_forward_total",
         "request_total",
-    )
+        "suffix_prepare_total",
+        "suffix_finalize_total",
+        "runtime_plan_build",
+        "canonical_prefix_location_materialization",
+        "request_metadata_attachment",
+        "frontier_key_construction",
+        "schedule_batch_initialization",
+        "schedule_batch_prepare",
+        "worker_batch_construction",
+        "forward_batch_initialization",
+        "model_request_slot_materialization",
+        "trace_materialization",
+        "token_hidden_input_preparation",
+        "decoder_layer_total",
+        "pre_attention_normalization",
+        "attention_block_total",
+        "attention_qkv_projection",
+        "rope_attention_preparation",
+        "attention_output_projection",
+        "gdn_block_total",
+        "gdn_input_projection",
+        "gdn_output_projection",
+        "residual_post_attention_normalization",
+        "residual_connection",
+        "final_normalization",
+        "lm_head_projection",
+    }
+    assert required == set(MODULE.PROFILE_PHASES)
     assert len(MODULE.PROFILE_PHASES) == len(set(MODULE.PROFILE_PHASES))
+    assert MODULE.PROFILE_SCHEMA_VERSION == 3
 
 
 def test_cuda_events_resolve_with_one_terminal_synchronization():
@@ -178,11 +206,27 @@ def test_legal_envelope_nesting_and_active_suffix_metadata():
     with profiler.phase("request_total"):
         with profiler.phase("active_suffix_forward"):
             with profiler.phase("model_forward_total"):
-                with profiler.phase("mlp_forward"):
-                    pass
+                with profiler.phase("decoder_layer_total"):
+                    with profiler.phase("mlp_forward"):
+                        pass
     record = profiler.finalize()
+    assert record["schema_version"] == 3
     assert record["phases"]["active_suffix_forward"]["envelope"] is True
     assert record["phases"]["mlp_forward"]["envelope"] is False
+    assert record["phases"]["mlp_forward"]["parent_phase"] == "decoder_layer_total"
+    assert record["hierarchy"]["model_forward_total"]["parent"] == (
+        "active_suffix_forward"
+    )
+
+
+def test_sibling_envelopes_cannot_overlap():
+    profiler = MODULE.RequestScopedProfiler(request_id="siblings", cuda_enabled=False)
+    with profiler.phase("request_total"):
+        with profiler.phase("active_suffix_forward"):
+            with profiler.phase("suffix_prepare_total"):
+                with pytest.raises(RuntimeError, match="sibling envelopes"):
+                    with profiler.phase("model_forward_total"):
+                        pass
 
 
 def test_envelopes_must_close_in_stack_order():
@@ -226,6 +270,21 @@ def test_cpu_profile_has_no_synchronization_and_reports_missing_phases():
     assert profiler.finalize() is record
     with pytest.raises(TypeError, match="immutable"):
         record["metadata"]["changed"] = True
+
+
+def test_unavailable_phase_requires_and_preserves_reason():
+    profiler = MODULE.RequestScopedProfiler(request_id="missing", cuda_enabled=False)
+    with pytest.raises(ValueError, match="reason"):
+        profiler.mark_unavailable("recovery_replay", "")
+    profiler.mark_unavailable(
+        "recovery_replay", "valid warm hit performs no recovery replay"
+    )
+    phase = profiler.finalize()["phases"]["recovery_replay"]
+    assert phase["calls"] == 0
+    assert phase["available"] is False
+    assert phase["availability_reason"] == (
+        "valid warm hit performs no recovery replay"
+    )
 
 
 def test_unknown_phase_and_post_finalize_mutation_fail_closed():

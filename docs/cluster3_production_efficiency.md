@@ -2,8 +2,8 @@
 
 ## Scope and current status
 
-This repair starts at the validated fingerprint commit
-`c7efe379d2cbffc8c9e813b174a776515965f8d2`. The profiling stage does not add
+This hierarchical profiling repair starts at
+`f2ae5bdeb96a59b805b88a7ae3fe40c566ee58c0`. It does not add
 generation capability or implement an optimization cluster. Model weights,
 BF16 behavior, sampling, attention contracts, absolute positions, Region-DAG
 rules, GDN replay, training, and TorchTitan behavior are unchanged.
@@ -11,19 +11,22 @@ rules, GDN replay, training, and TorchTitan behavior are unchanged.
 Local preflight was performed on a non-CUDA macOS host. The requested
 `/persistent/hybrid-diffusion-cache` mount is absent, so checkpoint hashes,
 checkpoint tensor dtypes, A30 identity, and CUDA timings have not been claimed.
-The existing Cluster 1–3 CPU regression selection passed with 317 tests and 2
-expected skips before profiling changes.
+The A30 rerun below is required before CUDA acceptance; local testing cannot
+substitute for it.
 
 No optimization may be selected from this document until the retained A30
 `efficiency_one` record and Nsight Systems trace identify a meaningful overhead.
 
 ## Pre-repair coverage audit
 
-The first A30 `efficiency_one` profile passed correctness, but attributed only
-63.01% of warm latency. The remaining 36.99% was one residual produced by
-subtracting medians from older component timers. That calculation was not a
-request-scoped phase decomposition: `RequestScopedProfiler` was defined but
-never instantiated, propagated, finalized, or emitted.
+The first request-scoped A30 `efficiency_one` profile passed correctness but
+exposed a hierarchy error in the report. The warm medians were 801.972237 ms
+for `active_suffix_forward`, 208.891424 ms for `model_forward_total`, and
+94.017552 ms for the nested named model leaves. The report subtracted the
+model leaves directly from the outer active-suffix envelope, producing 11.72%
+coverage and an 88.28% residual. Those phases belong to two hierarchy levels:
+the approximately 592.883276 ms active-minus-model gap and approximately
+114.803026 ms model-minus-leaves gap must be decomposed separately.
 
 The execution audit found three distinct route lifecycles. Full replay builds
 the identity/specification and dependency plan, prepares an uncached batch,
@@ -49,9 +52,9 @@ snapshot.
 ## Instrumentation
 
 `eval/sglang/srt/dllm/region/profiling.py` defines an opt-in request-scoped
-profiler with the 20 required phase names. Host work uses `perf_counter_ns`;
-CUDA work uses events on the current stream. Event resolution performs one
-terminal stream synchronization. Per-phase diagnostic synchronization is
+schema-v3 profiler with explicit parent and envelope identity. Host work uses
+`perf_counter_ns`; CUDA work uses events on the current stream. Event resolution
+performs one terminal stream synchronization. Per-phase diagnostic synchronization is
 available only through an explicit `debug_sync` setting and is counted with
 its source and classification. Request-exclusive and shared-batch timings are
 labeled separately. Missing phases remain explicit zero-call records rather
@@ -64,25 +67,33 @@ The controlled production-path exporter adds an `efficiency_one` case:
 - diffusion steps: 4;
 - batch size: 1;
 - warmups: 3;
-- measured repetitions: at least 10;
+- measured repetitions: exactly 10;
 - native BF16 and TP=1;
 - debug synchronization disabled.
 
-Every measured repetition emits one finalized schema-v2 snapshot for each of
-`full_replay`, `cold_handoff_build`, and `warm_cached_suffix`. Envelopes are
-`request_total`, `model_forward_total`, and `active_suffix_forward`; component
-leaves cannot overlap. CUDA events are resolved with one terminal profiler
-synchronization. The JSON report computes every residual per repetition before
-aggregation and never adds host and CUDA milliseconds.
+Every measured repetition emits one finalized schema-v3 snapshot for each of
+`full_replay`, `cold_handoff_build`, and `warm_cached_suffix`. The outer warm
+hierarchy is `active_suffix_forward` containing the non-overlapping
+`suffix_prepare_total`, `model_forward_total`, and `suffix_finalize_total`
+envelopes. Preparation, decoder, attention, and GDN operations have their own
+children. CUDA events are resolved with one terminal profiler synchronization.
+The JSON report computes raw residuals per repetition before aggregation and
+never adds host and CUDA milliseconds.
+
+`request_total` is intentionally a segmented route-wall aggregate, not a
+single request envelope. The expected non-overlapping segment counts are 16
+for full replay, 24 for cold handoff construction, and 20 for the warm cached
+suffix route. Both the semantics and expected count are recorded in every
+snapshot and validated by the report.
 
 The record shape is:
 
 ```json
 {
   "request_phase_profiles": {
-    "full_replay": [{"schema_version": 2, "finalized": true, "phases": {}}],
-    "cold_handoff_build": [{"schema_version": 2, "finalized": true, "phases": {}}],
-    "warm_cached_suffix": [{"schema_version": 2, "finalized": true, "phases": {}}]
+    "full_replay": [{"schema_version": 3, "finalized": true, "hierarchy": {}, "phases": {}}],
+    "cold_handoff_build": [{"schema_version": 3, "finalized": true, "hierarchy": {}, "phases": {}}],
+    "warm_cached_suffix": [{"schema_version": 3, "finalized": true, "hierarchy": {}, "phases": {}}]
   },
   "warm_snapshot_behavior": {
     "calls": 1,
@@ -105,14 +116,17 @@ downloads or replaces a checkpoint.
 `eval/scripts/cluster3_efficiency_profile_report.py` accepts only finalized
 request-scoped evidence from a passing `efficiency_one` record with three
 warmups, ten samples, BF16, TP=1, request-exclusive scope, exactly one profiler
-resolution synchronization, and debug synchronization disabled. Legacy
-component medians are retained in the record but are never substituted for
-missing phase evidence.
+resolution synchronization, and debug synchronization disabled. Separate
+outer-suffix and model-forward CUDA coverage gates must both reach 90% in
+every repetition. The report exports the suffix, decoder, attention, and GDN
+sub-hierarchies, raw phase inventory, and unclamped per-repetition residuals.
+Host orchestration remains a separate timing domain.
 
 ## Initial bottleneck profile
 
-No A30 profile exists in this checkout. The following table is intentionally
-unpopulated rather than estimated from CPU time or prior runs.
+No schema-v3 A30 profile exists in this checkout. The prior A30 evidence above
+identifies coverage gaps but cannot satisfy the repaired gates. The following
+table is intentionally unpopulated rather than estimated from CPU time.
 
 | Phase | Absolute ms | % warm latency | Difference from full replay | Cold cost | Warm cost |
 |---|---:|---:|---:|---:|---:|
@@ -121,7 +135,7 @@ unpopulated rather than estimated from CPU time or prior runs.
 The report generator produces separate host/orchestration and GPU/model
 critical-path rankings, route totals, phase call counts, cache/recovery/snapshot
 counters, synchronization counts, per-repetition residual distributions, and a
-warm coverage gate. Missing evidence fails closed.
+pair of CUDA coverage gates. Missing evidence fails closed.
 
 ## A30 execution
 
@@ -137,9 +151,10 @@ export MODEL_PATH=/persistent/hybrid-diffusion-cache/models/HybridDiffusion-2B
 export CACHE_ROOT=/persistent/hybrid-diffusion-cache
 export RESULT_ROOT=/persistent/hybrid-diffusion-cache/results/cluster3-production-efficiency
 export PY=/persistent/hybrid-diffusion-cache/venvs/hybrid-diffusion-eval/bin/python
-export PARENT_SHA=c7efe379d2cbffc8c9e813b174a776515965f8d2
+export PARENT_SHA=f2ae5bdeb96a59b805b88a7ae3fe40c566ee58c0
 export FROZEN_SHA=cf5e14c2f5a4e4700fb66b3183dd021bbe722fe4
 
+test "$(git branch --show-current)" = cluster3-hierarchical-profiling-repair
 test "$(git rev-parse HEAD^)" = "$PARENT_SHA"
 
 mkdir -p "$RESULT_ROOT/profile-one"

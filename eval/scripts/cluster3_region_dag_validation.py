@@ -1026,9 +1026,93 @@ class ScopedBackendTimers:
             )
             for layer in model.layers:
                 self._install(layer.mlp, "forward", "mlp")
+            if self.profilers:
+                self._install_model_hierarchy(runtime, model)
         except BaseException:
             self.close()
             raise
+
+    def _install_profile(self, target: Any, name: str, phase: str) -> None:
+        original = getattr(target, name, None)
+        if not callable(original):
+            raise RuntimeError(f"hierarchical profiler cannot observe {name}")
+        namespace = getattr(target, "__dict__", {})
+        had_instance_value = name in namespace
+        instance_value = namespace.get(name)
+
+        def measured(*args: Any, **kwargs: Any) -> Any:
+            with _profile_many_phase(self.profilers, phase, cuda=True):
+                return original(*args, **kwargs)
+
+        setattr(target, name, measured)
+        self._targets.append((target, name, had_instance_value, instance_value))
+
+    def _install_model_hierarchy(self, runtime: Any, model: Any) -> None:
+        root_model = runtime.model_runner.model
+        self._install_profile(
+            model.embed_tokens, "forward", "token_hidden_input_preparation"
+        )
+        self._install_profile(model.norm, "forward", "final_normalization")
+        logits_processor = next(
+            (
+                value
+                for candidate in (
+                    root_model,
+                    getattr(root_model, "model", None),
+                    getattr(root_model, "language_model", None),
+                )
+                if candidate is not None
+                for value in (getattr(candidate, "logits_processor", None),)
+                if value is not None
+            ),
+            None,
+        )
+        if logits_processor is None:
+            raise RuntimeError("Qwen3.5 root model exposes no logits processor")
+        self._install_profile(logits_processor, "forward", "lm_head_projection")
+
+        for layer in model.layers:
+            self._install_profile(layer, "forward", "decoder_layer_total")
+            communicator = layer.layer_communicator
+            self._install_profile(
+                communicator,
+                "prepare_attn_and_capture_last_layer_outputs",
+                "pre_attention_normalization",
+            )
+            self._install_profile(
+                communicator,
+                "prepare_mlp",
+                "residual_post_attention_normalization",
+            )
+            self._install_profile(
+                communicator,
+                "postprocess_layer",
+                "residual_connection",
+            )
+            if hasattr(layer, "self_attention"):
+                self._install_profile(layer, "self_attention", "attention_block_total")
+                self._install_profile(
+                    layer.qkv_proj, "forward", "attention_qkv_projection"
+                )
+                self._install_profile(
+                    layer, "_apply_qk_norm", "rope_attention_preparation"
+                )
+                self._install_profile(
+                    layer.rotary_emb, "forward", "rope_attention_preparation"
+                )
+                self._install_profile(
+                    layer.o_proj, "forward", "attention_output_projection"
+                )
+            elif hasattr(layer, "linear_attn"):
+                gdn = layer.linear_attn
+                self._install_profile(gdn, "forward", "gdn_block_total")
+                self._install_profile(
+                    gdn, "_forward_input_proj", "gdn_input_projection"
+                )
+                self._install_profile(gdn.norm, "forward", "gdn_output_projection")
+                self._install_profile(gdn.out_proj, "forward", "gdn_output_projection")
+            else:
+                raise RuntimeError("unknown Qwen3.5 decoder layer type")
 
     def _install(self, target: Any, name: str, kind: str) -> None:
         original = getattr(target, name, None)
@@ -1390,46 +1474,57 @@ class Cluster3ValidationRuntime:
     ) -> tuple[Any, dict[str, float]]:
         """Attach the full suffix to a canonical live or committed frontier."""
         from sglang.srt.dllm.region.runtime import build_region_dag_runtime_plan
+        from sglang.srt.dllm.region.profiling import profile_many_phase
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-        plan = build_region_dag_runtime_plan(
-            spec, case.edited_regions, profilers=profilers
-        )
-        boundary = int(plan.gdn_replay_start)
-        req.prefix_indices = self.runtime._canonical_prefix_locations(
-            req.req_pool_idx, boundary
-        )
-        req.origin_input_ids = list(token_ids)
-        req.fill_ids = list(token_ids)
-        req.set_extend_input_len(len(token_ids) - boundary)
-        self._attach_request(
-            req,
-            spec,
-            plan,
-            mode="canonical_cached" if restore else "canonical_segmented",
-            initialized=True,
-            profilers=profilers,
-        )
-        req.region_dag_frontier_established = True
-        req.region_dag_restore_required = bool(restore)
-        self._bind_frontiers(req)
-        batch = self._new_batch(req)
-        from sglang.srt.dllm.region.profiling import profile_many_phase
-
-        phase = "kv_restore" if restore else "request_setup"
-        with profile_many_phase(profilers, phase, cuda=True):
-            _, gather_scatter_ms = self._cuda_timed(
-                batch.prepare_for_extend,
-                nvtx_phase=phase,
+        with profile_many_phase(profilers, "runtime_plan_build"):
+            plan = build_region_dag_runtime_plan(
+                spec, case.edited_regions, profilers=profilers
             )
+        boundary = int(plan.gdn_replay_start)
+        with profile_many_phase(
+            profilers,
+            "canonical_prefix_location_materialization",
+            cuda=True,
+        ):
+            req.prefix_indices = self.runtime._canonical_prefix_locations(
+                req.req_pool_idx, boundary
+            )
+        with profile_many_phase(profilers, "request_metadata_attachment"):
+            req.origin_input_ids = list(token_ids)
+            req.fill_ids = list(token_ids)
+            req.set_extend_input_len(len(token_ids) - boundary)
+            self._attach_request(
+                req,
+                spec,
+                plan,
+                mode="canonical_cached" if restore else "canonical_segmented",
+                initialized=True,
+                profilers=profilers,
+            )
+            req.region_dag_frontier_established = True
+            req.region_dag_restore_required = bool(restore)
+        with profile_many_phase(profilers, "frontier_key_construction"):
+            self._bind_frontiers(req)
+        with profile_many_phase(profilers, "schedule_batch_initialization"):
+            batch = self._new_batch(req)
+        phase = "kv_restore" if restore else "request_setup"
+        with profile_many_phase(profilers, "schedule_batch_prepare", cuda=True):
+            with profile_many_phase(profilers, phase, cuda=True):
+                _, gather_scatter_ms = self._cuda_timed(
+                    batch.prepare_for_extend,
+                    nvtx_phase=phase,
+                )
         batch.region_dag_query_positions_cpu = [plan.attention_query_positions]
         batch.region_dag_restore_required_cpu = [bool(restore)]
         batch.region_dag_reference_cpu = [False]
-        worker_batch = batch.get_model_worker_batch()
-        forward_batch, mask_build_ms = self._cuda_timed(
-            lambda: ForwardBatch.init_new(worker_batch, self.model_runner),
-            nvtx_phase="region_mask_build",
-        )
+        with profile_many_phase(profilers, "worker_batch_construction"):
+            worker_batch = batch.get_model_worker_batch()
+        with profile_many_phase(profilers, "forward_batch_initialization", cuda=True):
+            forward_batch, mask_build_ms = self._cuda_timed(
+                lambda: ForwardBatch.init_new(worker_batch, self.model_runner),
+                nvtx_phase="region_mask_build",
+            )
         if not restore:
             forward_batch.region_dag_diagnostic_live_prefix_cpu = [True]
         if bool(forward_batch.region_dag_restore_required_cpu[0]) != bool(restore):
@@ -1480,9 +1575,7 @@ class Cluster3ValidationRuntime:
             "mask_build": mask_build_ms,
         }
 
-    def _run_forward(
-        self, forward_batch: Any, hooks: Any
-    ) -> tuple[dict[str, Any], float, dict[str, Any]]:
+    def _prepare_forward_metadata(self, forward_batch: Any) -> tuple[int, ...]:
         torch = __import__("torch")
         from sglang.srt.dllm.region.profiling import (
             profile_many_phase,
@@ -1492,10 +1585,37 @@ class Cluster3ValidationRuntime:
         profilers = profilers_from_forward_batch(forward_batch)
         with _nvtx_range(torch, "flashinfer_plan_build"):
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        mamba_slots = [
-            self.backend._current_mamba_slot(int(value))
-            for value in forward_batch.req_pool_indices.detach().cpu().tolist()
-        ]
+        with profile_many_phase(
+            profilers,
+            "model_request_slot_materialization",
+            cuda=True,
+        ):
+            mamba_slots = tuple(
+                self.backend._current_mamba_slot(int(value))
+                for value in forward_batch.req_pool_indices.detach().cpu().tolist()
+            )
+        return mamba_slots
+
+    def _run_forward(
+        self,
+        forward_batch: Any,
+        hooks: Any,
+        *,
+        prepared_mamba_slots: Optional[Sequence[int]] = None,
+        profile_suffix_finalize: bool = False,
+    ) -> tuple[dict[str, Any], float, dict[str, Any]]:
+        torch = __import__("torch")
+        from sglang.srt.dllm.region.profiling import (
+            profile_many_phase,
+            profilers_from_forward_batch,
+        )
+
+        profilers = profilers_from_forward_batch(forward_batch)
+        mamba_slots = (
+            tuple(prepared_mamba_slots)
+            if prepared_mamba_slots is not None
+            else self._prepare_forward_metadata(forward_batch)
+        )
         started = torch.cuda.Event(enable_timing=True)
         finished = torch.cuda.Event(enable_timing=True)
         with ScopedBackendTimers(self, profilers) as timers:
@@ -1514,24 +1634,29 @@ class Cluster3ValidationRuntime:
             backend_timings = timers.snapshot()
         if not timers.released:
             raise RuntimeError("temporary backend timers survived model execution")
-        trace = hooks.snapshot()
-        trace.update(
-            logits=_trace_tensor_to_cpu(logits),
-            top1=_trace_tensor_to_cpu(logits.argmax(dim=-1)),
-            positions=tuple(
-                int(value) for value in forward_batch.positions.cpu().tolist()
-            ),
-            selected_mask_backend=forward_batch.dllm_selected_mask_backend,
-            mask=_trace_tensor_to_cpu(forward_batch.region_dag_custom_mask),
-        )
-        if not trace["hidden"] or not trace["gdn_states"]:
-            raise RuntimeError("model hooks produced incomplete layer evidence")
-        tensors = [trace["logits"], *trace["hidden"].values()]
-        tensors.extend(
-            value for states in trace["gdn_states"].values() for value in states
-        )
-        if any(not bool(value.isfinite().all()) for value in tensors):
-            raise RuntimeError("model execution produced NaN or Inf evidence")
+        finalize_profilers = profilers if profile_suffix_finalize else ()
+        with profile_many_phase(finalize_profilers, "suffix_finalize_total", cuda=True):
+            with profile_many_phase(
+                finalize_profilers, "trace_materialization", cuda=True
+            ):
+                trace = hooks.snapshot()
+                trace.update(
+                    logits=_trace_tensor_to_cpu(logits),
+                    top1=_trace_tensor_to_cpu(logits.argmax(dim=-1)),
+                    positions=tuple(
+                        int(value) for value in forward_batch.positions.cpu().tolist()
+                    ),
+                    selected_mask_backend=forward_batch.dllm_selected_mask_backend,
+                    mask=_trace_tensor_to_cpu(forward_batch.region_dag_custom_mask),
+                )
+                if not trace["hidden"] or not trace["gdn_states"]:
+                    raise RuntimeError("model hooks produced incomplete layer evidence")
+                tensors = [trace["logits"], *trace["hidden"].values()]
+                tensors.extend(
+                    value for states in trace["gdn_states"].values() for value in states
+                )
+                if any(not bool(value.isfinite().all()) for value in tensors):
+                    raise RuntimeError("model execution produced NaN or Inf evidence")
         return trace, model_forward_ms, backend_timings
 
     def _kv_hash(self, req: Any, positions: Sequence[int]) -> str:
@@ -1803,6 +1928,14 @@ class Cluster3ValidationRuntime:
                                 "cache_status": (
                                     "hit" if route == "warm_cached_suffix" else "miss"
                                 ),
+                                "request_total_semantics": (
+                                    "segmented_route_wall_aggregate"
+                                ),
+                                "expected_request_total_calls": {
+                                    "full_replay": 16,
+                                    "cold_handoff_build": 24,
+                                    "warm_cached_suffix": 20,
+                                }[route],
                             },
                         )
                 full_profilers = tuple(
@@ -1970,30 +2103,41 @@ class Cluster3ValidationRuntime:
                         with profile_many_phase(
                             cached_profilers, "active_suffix_forward", cuda=True
                         ):
-                            if replay_start == 0:
-                                cached_batch, cached_prepare = self._prepare_cached(
-                                    baseline_req,
-                                    edited_tokens,
-                                    edited_spec,
-                                    case,
-                                    cached_profilers,
-                                )
-                            else:
-                                cached_batch, cached_prepare = (
-                                    self._prepare_frontier_suffix(
+                            with profile_many_phase(
+                                cached_profilers, "suffix_prepare_total", cuda=True
+                            ):
+                                if replay_start == 0:
+                                    cached_batch, cached_prepare = self._prepare_cached(
                                         baseline_req,
                                         edited_tokens,
                                         edited_spec,
                                         case,
-                                        restore=True,
-                                        profilers=cached_profilers,
+                                        cached_profilers,
                                     )
+                                else:
+                                    cached_batch, cached_prepare = (
+                                        self._prepare_frontier_suffix(
+                                            baseline_req,
+                                            edited_tokens,
+                                            edited_spec,
+                                            case,
+                                            restore=True,
+                                            profilers=cached_profilers,
+                                        )
+                                    )
+                                prepared_mamba_slots = self._prepare_forward_metadata(
+                                    cached_batch
                                 )
                             (
                                 cached_trace,
                                 cached_forward_ms,
                                 cached_backend_ms,
-                            ) = self._run_forward(cached_batch, hooks)
+                            ) = self._run_forward(
+                                cached_batch,
+                                hooks,
+                                prepared_mamba_slots=prepared_mamba_slots,
+                                profile_suffix_finalize=True,
+                            )
                     self._validate_trace_rows(
                         cached_trace,
                         expected_rows=plan.query_count,

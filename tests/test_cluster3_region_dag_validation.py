@@ -28,6 +28,7 @@ def load_module(name, path):
 load_module("sglang.srt.dllm.region.execution_spec", REGION / "execution_spec.py")
 load_module("sglang.srt.dllm.region.dependency_graph", REGION / "dependency_graph.py")
 load_module("sglang.srt.dllm.region.runtime", REGION / "runtime.py")
+PROFILING = load_module("sglang.srt.dllm.region.profiling", REGION / "profiling.py")
 MODULE = load_module("cluster3_region_dag_validation", SCRIPT)
 
 
@@ -498,6 +499,52 @@ def test_backend_timing_probes_cleanup_after_exception(monkeypatch):
             raise RuntimeError("primary")
     assert timers.released
     assert runtime.backend.forward_extend is original
+
+
+def test_hierarchical_model_probes_cleanup_after_exception():
+    operation = lambda value=None, **_kwargs: value
+    mlp = SimpleNamespace(forward=operation)
+    communicator = SimpleNamespace(
+        prepare_attn_and_capture_last_layer_outputs=operation,
+        prepare_mlp=operation,
+        postprocess_layer=operation,
+    )
+    gdn = SimpleNamespace(
+        forward=operation,
+        _forward_input_proj=operation,
+        norm=SimpleNamespace(forward=operation),
+        out_proj=SimpleNamespace(forward=operation),
+    )
+    layer = SimpleNamespace(
+        forward=operation,
+        mlp=mlp,
+        layer_communicator=communicator,
+        linear_attn=gdn,
+    )
+    embed = SimpleNamespace(forward=operation)
+    language_model = SimpleNamespace(
+        embed_tokens=embed,
+        norm=SimpleNamespace(forward=operation),
+        layers=[layer],
+    )
+    root_model = SimpleNamespace(logits_processor=SimpleNamespace(forward=operation))
+    runtime = fake_timer_runtime()
+    runtime.model_runner.model = root_model
+    runtime.cluster1.ModelTraceHooks._language_model = lambda _model: language_model
+    original_embed = embed.forward
+    profiler = PROFILING.RequestScopedProfiler(
+        request_id="hierarchical-cleanup", cuda_enabled=False
+    )
+
+    with pytest.raises(RuntimeError, match="primary"):
+        with MODULE.ScopedBackendTimers(runtime, (profiler,)) as timers:
+            assert embed.forward(7) == 7
+            raise RuntimeError("primary")
+
+    assert timers.released
+    assert embed.forward is original_embed
+    snapshot = profiler.finalize()
+    assert snapshot["phases"]["token_hidden_input_preparation"]["calls"] == 1
 
 
 class FakeRuntime:
