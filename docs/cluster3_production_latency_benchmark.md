@@ -6,20 +6,46 @@ optimization. The fixed workload is one HybridDiffusion-2B request with a
 2,048-token stable prefix, a 64-token active suffix, four diffusion steps,
 batch size one, BF16, and TP=1.
 
-The benchmark measures `full_replay`, `cold_handoff_build`, and
-`warm_cached_suffix`. Each route runs an uninstrumented control and a minimally
-profiled variant for three warmups followed by exactly ten retained
-measurements. The uninstrumented CUDA median is the headline latency. The
-profiled variant adds non-overlapping preparation and model envelopes; state
-commit is zero with an explicit reason because publication occurs inside model
-forward. Each timed route has one outer CUDA event pair and exactly one
-terminal stream synchronization.
+The production latency reference is the accepted Cluster-3 canonical segmented
+no-cache execution (`reference_execution=canonical_segmented_no_cache`). For
+every diffusion step, `full_replay` clears runtime state, builds and forwards
+the canonical `[0:b)` prefix, removes only the temporary committed Region-DAG
+layer snapshots, attaches `[b:N)` with `restore=False`, and forwards the live
+suffix. The prefix is rebuilt on all four steps. This is Path B from the
+accepted B-versus-C handoff oracle. The monolithic 2,112-row BF16 path remains a
+numerical diagnostic only; it is not the production latency or cache-handoff
+reference because projection/kernel tiling can change with row shape.
+
+The three measured route semantics are:
+
+- `full_replay`: canonical prefix plus live suffix, rebuilt inside timing for
+  each of four steps.
+- `cold_handoff_build`: canonical prefix built once inside timing, followed by
+  four suffixes attached with `restore=True`.
+- `warm_cached_suffix`: canonical prefix built before timing, followed by four
+  timed suffixes attached with `restore=True`.
+
+Each route runs an uninstrumented control and a minimally profiled variant for
+three warmups followed by exactly ten retained measurements. The uninstrumented
+CUDA median is the headline latency. The profiled variant adds non-overlapping
+preparation and model envelopes; state commit is zero with an explicit reason
+because publication occurs inside model forward. Each timed route has one outer
+CUDA event pair and exactly one terminal stream synchronization.
 
 Row hooks, backend trace wrappers, hidden/GDN captures, trace snapshots, full
 tensor copies, tensor comparisons, finite scans, and JSON/report generation are
 absent from the timed path. Compact active-position top-1 values are copied and
 hashed only after the route timer is finalized. Warm-prefix construction is
-preconditioning and is excluded from the warm route interval.
+preconditioning and is excluded from the warm route interval. A hash mismatch
+still fails closed; its optional outside-timing diagnostic contains only the
+paired token IDs, first differing flattened index, route identity, workload
+fingerprint, and reference label—never logits or hidden tensors.
+
+Accounting verifies prefix positions are exactly `range(0, b)`, suffix
+positions equal the plan's absolute attention-query positions, and prefix plus
+suffix equal full-sequence work on every full-replay step. Attention and GDN
+token-layer counts include both full-replay forwards. Cold and warm count only
+the prefix/suffix work actually executed inside their respective route.
 
 The run fails closed unless the accepted `efficiency_one` summary and preflight
 belong to `057dcab2261895a0e32357f5d57c65e1eb4b3b8c`, the checkpoint hashes
@@ -44,13 +70,14 @@ export MODEL_PATH=/persistent/hybrid-diffusion-cache/models/HybridDiffusion-2B
 export CACHE_ROOT=/persistent/hybrid-diffusion-cache
 export RESULT_ROOT=/persistent/hybrid-diffusion-cache/results/cluster3-production-efficiency
 export PY=/persistent/hybrid-diffusion-cache/venvs/hybrid-diffusion-eval/bin/python
-export EXPECTED_PARENT=057dcab2261895a0e32357f5d57c65e1eb4b3b8c
+export EXPECTED_PARENT=3be05adc2759c6472c7387b31e081fd5dbdffff5
+export ACCEPTED_CORRECTNESS_REVISION=057dcab2261895a0e32357f5d57c65e1eb4b3b8c
 export CORRECTNESS_ARTIFACT="$RESULT_ROOT/profile-one/summary.json"
 export CORRECTNESS_PREFLIGHT="$RESULT_ROOT/profile-one/preflight.json"
 export PRODUCTION_OUT="$RESULT_ROOT/production-latency/$(git rev-parse HEAD)"
 export CUDA_VISIBLE_DEVICES=0
 
-test "$(git branch --show-current)" = cluster3-production-latency-benchmark
+test "$(git branch --show-current)" = cluster3-production-latency-oracle-fix
 test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
 test -f "$CORRECTNESS_ARTIFACT"
 test -f "$CORRECTNESS_PREFLIGHT"
@@ -59,6 +86,8 @@ test -f "$MODEL_PATH/model-00001-of-00001.safetensors"
 test -f "$MODEL_PATH/tokenizer.json"
 test -f "$MODEL_PATH/tokenizer_config.json"
 test -f "$MODEL_PATH/chat_template.jinja"
+test "$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["cluster3_revision"])' \
+  "$CORRECTNESS_ARTIFACT")" = "$ACCEPTED_CORRECTNESS_REVISION"
 
 unset CUDA_LAUNCH_BLOCKING
 unset SGLANG_DLLM_REQUEST_METRICS

@@ -35,6 +35,7 @@ WARMUP_REPETITIONS = 3
 MEASURED_REPETITIONS = 10
 BOOTSTRAP_REPETITIONS = 2000
 MAX_PROFILING_OVERHEAD_PERCENT = 5.0
+REFERENCE_EXECUTION = "canonical_segmented_no_cache"
 FORBIDDEN_PRODUCTION_ENVIRONMENT = (
     "CUDA_LAUNCH_BLOCKING",
     "SGLANG_DLLM_REQUEST_METRICS",
@@ -75,6 +76,69 @@ def _hash_token_ids(token_ids: Sequence[int]) -> str:
     for token_id in token_ids:
         digest.update(int(token_id).to_bytes(8, "little", signed=True))
     return digest.hexdigest()
+
+
+def _first_differing_token_index(
+    reference: Sequence[int], candidate: Sequence[int]
+) -> Optional[int]:
+    for index, (expected, actual) in enumerate(zip(reference, candidate)):
+        if int(expected) != int(actual):
+            return index
+    if len(reference) != len(candidate):
+        return min(len(reference), len(candidate))
+    return None
+
+
+def _output_mismatch_diagnostic(
+    reference: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    route: str,
+    variant: str,
+    repetition: int,
+) -> dict[str, Any]:
+    reference_ids = [
+        int(value) for value in reference.get("generated_top1_token_ids", ())
+    ]
+    candidate_ids = [
+        int(value) for value in candidate.get("generated_top1_token_ids", ())
+    ]
+    return {
+        "paired_full_replay_token_ids": reference_ids,
+        "candidate_token_ids": candidate_ids,
+        "first_differing_flattened_token_index": _first_differing_token_index(
+            reference_ids, candidate_ids
+        ),
+        "route": route,
+        "variant": variant,
+        "repetition": repetition,
+        "workload_fingerprint": candidate.get("workload_fingerprint"),
+        "reference_execution": candidate.get("reference_execution"),
+    }
+
+
+def _require_paired_output_hash(
+    reference: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    route: str,
+    variant: str,
+    repetition: int,
+) -> None:
+    if str(candidate.get("output_hash", "")) == str(reference.get("output_hash", "")):
+        return
+    diagnostic = _output_mismatch_diagnostic(
+        reference,
+        candidate,
+        route=route,
+        variant=variant,
+        repetition=repetition,
+    )
+    raise RuntimeError(
+        "production output hash differs from paired full replay: "
+        f"route={route} variant={variant} repetition={repetition} "
+        f"diagnostic={json.dumps(diagnostic, sort_keys=True)}"
+    )
 
 
 def _stats(
@@ -342,6 +406,97 @@ def _untimed_frontier_setup(runtime: Any, validation: Any, case: Any, token_ids)
     return req
 
 
+def _discard_temporary_layer_snapshots(runtime: Any) -> None:
+    """Drop prefix publications while preserving the request's live continuation."""
+    snapshots = getattr(runtime.backend, "_region_dag_layer_snapshots", None)
+    if snapshots is None or not hasattr(snapshots, "clear"):
+        raise RuntimeError(
+            "canonical segmented reference requires Region-DAG layer snapshots"
+        )
+    snapshots.clear()
+
+
+def _execute_canonical_segmented_step(
+    runtime: Any,
+    case: Any,
+    route_identity: str,
+    edited_tokens: list[int],
+    edited_spec: Any,
+    replay_start: int,
+    expected_suffix_positions: tuple[int, ...],
+    timer: ProductionTimingEnvelope,
+    outputs: list[Any],
+    active: set[int],
+    work: dict[str, Any],
+) -> tuple[Any, tuple[int, ...], tuple[int, ...]]:
+    """Recompute one uncached canonical prefix plus its live suffix."""
+    runtime._clear()
+    req, prefix_batch, _ = _prepare_call(
+        timer,
+        lambda: runtime._prepare_canonical_frontier(
+            route_identity,
+            edited_tokens,
+            edited_spec,
+            case,
+            collect_component_timing=False,
+        ),
+    )
+    prefix_positions = _query_positions(prefix_batch)
+    if prefix_positions != tuple(range(replay_start)):
+        raise RuntimeError(
+            "canonical segmented full replay changed absolute prefix positions"
+        )
+    _production_forward(runtime, prefix_batch, timer, [], set(), work)
+
+    # The controlled validator removes only these temporary publications.  The
+    # live recurrent continuation owned by req must remain intact for suffix B.
+    _discard_temporary_layer_snapshots(runtime)
+    suffix_batch, _ = _prepare_call(
+        timer,
+        lambda: runtime._prepare_frontier_suffix(
+            req,
+            edited_tokens,
+            edited_spec,
+            case,
+            restore=False,
+            collect_component_timing=False,
+        ),
+    )
+    suffix_positions = _query_positions(suffix_batch)
+    if suffix_positions != expected_suffix_positions:
+        raise RuntimeError(
+            "canonical segmented full replay changed absolute suffix positions"
+        )
+    if len(prefix_positions) + len(suffix_positions) != case.sequence_length:
+        raise RuntimeError(
+            "canonical segmented full replay did not execute full sequence work"
+        )
+    _production_forward(runtime, suffix_batch, timer, outputs, active, work)
+    return req, prefix_positions, suffix_positions
+
+
+def _prepare_restored_suffix(
+    runtime: Any,
+    req: Any,
+    edited_tokens: list[int],
+    edited_spec: Any,
+    case: Any,
+    timer: ProductionTimingEnvelope,
+) -> tuple[Any, dict[str, float]]:
+    """Attach a suffix to the cached frontier used by cold and warm routes."""
+    return _prepare_call(
+        timer,
+        lambda: runtime._prepare_frontier_suffix(
+            req,
+            edited_tokens,
+            edited_spec,
+            case,
+            restore=True,
+            collect_component_timing=False,
+        ),
+    )
+
+
 def execute_production_measurement(
     runtime: Any,
     validation: Any,
@@ -395,6 +550,9 @@ def execute_production_measurement(
     positions_preserved = True
     stable_queries_absent = True
     full_replay_processed_prefix = route == "full_replay"
+    full_replay_prefix_positions_preserved = route == "full_replay"
+    full_replay_suffix_positions_preserved = route == "full_replay"
+    full_replay_full_sequence_work = route == "full_replay"
     restore_contract_observed = True
     cold_req = None
 
@@ -417,43 +575,56 @@ def execute_production_measurement(
 
         for step in range(case.diffusion_steps):
             if route == "full_replay":
-                runtime._clear()
-                req, batch, _ = _prepare_call(
-                    timer,
-                    lambda step=step: runtime._prepare_reference(
+                req, prefix_positions, suffix_positions = (
+                    _execute_canonical_segmented_step(
+                        runtime,
+                        case,
                         f"{case.case_id}:{route}:{variant}:{repetition}:{step}",
                         edited_tokens,
                         edited_spec,
-                        case,
-                        collect_component_timing=False,
-                    ),
+                        replay_start,
+                        tuple(plan.attention_query_positions),
+                        timer,
+                        outputs,
+                        active,
+                        work,
+                    )
+                )
+                full_replay_processed_prefix = (
+                    full_replay_processed_prefix
+                    and prefix_positions == tuple(range(replay_start))
+                )
+                full_replay_prefix_positions_preserved = (
+                    full_replay_prefix_positions_preserved
+                    and prefix_positions == tuple(range(replay_start))
+                )
+                full_replay_suffix_positions_preserved = (
+                    full_replay_suffix_positions_preserved
+                    and suffix_positions == tuple(plan.attention_query_positions)
+                )
+                full_replay_full_sequence_work = (
+                    full_replay_full_sequence_work
+                    and len(prefix_positions) + len(suffix_positions)
+                    == case.sequence_length
+                )
+                positions_preserved = (
+                    positions_preserved
+                    and full_replay_prefix_positions_preserved
+                    and full_replay_suffix_positions_preserved
                 )
             else:
                 req = warm_req if route == "warm_cached_suffix" else cold_req
                 if req is None:
                     raise RuntimeError("production suffix route has no valid frontier")
-                batch, _ = _prepare_call(
+                batch, _ = _prepare_restored_suffix(
+                    runtime,
+                    req,
+                    edited_tokens,
+                    edited_spec,
+                    case,
                     timer,
-                    lambda req=req: runtime._prepare_frontier_suffix(
-                        req,
-                        edited_tokens,
-                        edited_spec,
-                        case,
-                        restore=True,
-                        collect_component_timing=False,
-                    ),
                 )
-            positions = _query_positions(batch)
-            if route == "full_replay":
-                expected_full_positions = tuple(range(case.sequence_length))
-                full_replay_processed_prefix = (
-                    full_replay_processed_prefix
-                    and positions == expected_full_positions
-                )
-                positions_preserved = (
-                    positions_preserved and positions == expected_full_positions
-                )
-            else:
+                positions = _query_positions(batch)
                 stable_queries_absent = stable_queries_absent and all(
                     position >= replay_start for position in positions
                 )
@@ -470,7 +641,7 @@ def execute_production_measurement(
                 if bool(restore_flags) and bool(restore_flags[0]):
                     _, gdn_layers = _layer_counts(runtime)
                     gdn_restores += gdn_layers
-            _production_forward(runtime, batch, timer, outputs, active, work)
+                _production_forward(runtime, batch, timer, outputs, active, work)
             metrics = req.region_dag_instrumentation
             if metrics is None:
                 raise RuntimeError("production request lost Region-DAG instrumentation")
@@ -481,12 +652,31 @@ def execute_production_measurement(
     timing = timer.result()
     output_hash, top1_ids = compact_output_hash_after_timing(outputs, timer)
     peak_memory = int(torch.cuda.max_memory_allocated(runtime.device))
+    expected_query_positions = {
+        "full_replay": case.sequence_length * case.diffusion_steps,
+        "cold_handoff_build": replay_start
+        + len(plan.attention_query_positions) * case.diffusion_steps,
+        "warm_cached_suffix": len(plan.attention_query_positions)
+        * case.diffusion_steps,
+    }[route]
+    executed_query_positions = sum(int(value) for value in work["query_counts"])
+    attention_layers, gdn_layers = _layer_counts(runtime)
+    work_accounting_matches = (
+        executed_query_positions == expected_query_positions
+        and work["full_attention_query_token_layer_positions"]
+        == expected_query_positions * attention_layers
+        and work["gdn_replay_token_layer_positions"]
+        == expected_query_positions * gdn_layers
+    )
+    if not work_accounting_matches:
+        raise RuntimeError("production route token-layer accounting is inconsistent")
     workload_fingerprint = _sha256_json(
         {
             "input_token_hash": _hash_token_ids(edited_tokens),
             "active_positions": sorted(active),
             "diffusion_steps": case.diffusion_steps,
             "attention_contract": edited_spec.attention_contract_id,
+            "reference_execution": REFERENCE_EXECUTION,
         }
     )
     if route == "warm_cached_suffix" and replay_start > 0 and cache_hits <= 0:
@@ -513,11 +703,22 @@ def execute_production_measurement(
         "gdn_replay_token_layer_positions": work["gdn_replay_token_layer_positions"],
         "peak_allocated_gpu_memory_bytes": peak_memory,
         "workload_fingerprint": workload_fingerprint,
+        "reference_execution": REFERENCE_EXECUTION,
         "attention_contract": edited_spec.attention_contract_id,
         "diffusion_steps": case.diffusion_steps,
         "positions_preserved": positions_preserved,
         "stable_queries_absent": stable_queries_absent,
         "full_replay_processed_prefix": full_replay_processed_prefix,
+        "full_replay_prefix_positions_preserved": (
+            full_replay_prefix_positions_preserved
+        ),
+        "full_replay_suffix_positions_preserved": (
+            full_replay_suffix_positions_preserved
+        ),
+        "full_replay_full_sequence_work": full_replay_full_sequence_work,
+        "executed_query_positions": executed_query_positions,
+        "expected_query_positions": expected_query_positions,
+        "work_accounting_matches": work_accounting_matches,
         "warm_restored_valid_prefix": (
             route != "warm_cached_suffix"
             or (replay_start > 0 and cache_hits > 0 and restore_contract_observed)
@@ -583,6 +784,7 @@ def summarize(
         workload_signatures = {
             (
                 str(record["workload_fingerprint"]),
+                str(record["reference_execution"]),
                 int(record["active_token_count"]),
                 int(record["full_attention_query_token_layer_positions"]),
                 int(record["gdn_replay_token_layer_positions"]),
@@ -695,6 +897,7 @@ def summarize(
             "workload_fingerprint": (
                 next(iter(fingerprints)) if len(fingerprints) == 1 else None
             ),
+            "reference_execution": str(uninstrumented[0]["reference_execution"]),
         }
 
     full = route_summaries["full_replay"]["uninstrumented_cuda_latency_ms"]
@@ -727,6 +930,24 @@ def summarize(
             bool(record["full_replay_processed_prefix"])
             for record in _route_records(records, "full_replay", "uninstrumented")
         ),
+        "full_replay_prefix_positions_preserved": all(
+            bool(record["full_replay_prefix_positions_preserved"])
+            for record in _route_records(records, "full_replay", "uninstrumented")
+        ),
+        "full_replay_suffix_positions_preserved": all(
+            bool(record["full_replay_suffix_positions_preserved"])
+            for record in _route_records(records, "full_replay", "uninstrumented")
+        ),
+        "full_replay_executes_full_sequence_each_step": all(
+            bool(record["full_replay_full_sequence_work"])
+            for record in _route_records(records, "full_replay", "uninstrumented")
+        ),
+        "route_work_accounting_matches": all(
+            bool(record["work_accounting_matches"])
+            and int(record["executed_query_positions"])
+            == int(record["expected_query_positions"])
+            for record in records
+        ),
         "warm_restores_valid_prefix": all(
             bool(record["warm_restored_valid_prefix"]) for record in warm_records
         ),
@@ -745,6 +966,7 @@ def summarize(
         == 1,
         "fixed_production_workload": all(
             record["attention_contract"] == "region_dag_conservative_gdn_v1"
+            and record["reference_execution"] == REFERENCE_EXECUTION
             and int(record["diffusion_steps"]) == 4
             and int(record["active_token_count"]) == 64
             and len(record["generated_top1_token_ids"]) == 256
@@ -793,6 +1015,7 @@ def summarize(
             "prefix_tokens": 2048,
             "active_tokens": 64,
             "diffusion_steps": 4,
+            "reference_execution": REFERENCE_EXECUTION,
         },
         "routes": route_summaries,
         "comparisons": {
@@ -963,7 +1186,7 @@ def run_production_benchmark(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     records = []
-    full_replay_hashes: dict[tuple[str, int], str] = {}
+    full_replay_records: dict[tuple[str, int], Mapping[str, Any]] = {}
     primary_error: Optional[BaseException] = None
     try:
         with output_path.open("w", encoding="utf-8") as destination:
@@ -981,14 +1204,15 @@ def run_production_benchmark(
                         if repetition < 0:
                             continue
                         comparison_key = (variant, repetition)
-                        output_hash = str(record.get("output_hash", ""))
                         if route == "full_replay":
-                            full_replay_hashes[comparison_key] = output_hash
-                        elif output_hash != full_replay_hashes.get(comparison_key):
-                            raise RuntimeError(
-                                "production output hash differs from paired full replay: "
-                                f"route={route} variant={variant} "
-                                f"repetition={repetition}"
+                            full_replay_records[comparison_key] = dict(record)
+                        else:
+                            _require_paired_output_hash(
+                                full_replay_records.get(comparison_key, {}),
+                                record,
+                                route=route,
+                                variant=variant,
+                                repetition=repetition,
                             )
                         records.append(dict(record))
                         destination.write(json.dumps(record, sort_keys=True) + "\n")

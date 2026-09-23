@@ -80,6 +80,11 @@ def raw_record(route, variant, repetition, *, output_hash="a" * 64, recovery=0):
     }[route]
     profiled = variant == "minimally_profiled"
     total = base * (1.01 if profiled else 1.0)
+    executed_positions = {
+        "full_replay": 2112 * 4,
+        "cold_handoff_build": 2048 + 64 * 4,
+        "warm_cached_suffix": 64 * 4,
+    }[route]
     return {
         "schema_version": 1,
         "profile": "production_efficiency",
@@ -107,15 +112,22 @@ def raw_record(route, variant, repetition, *, output_hash="a" * 64, recovery=0):
         "recovery_replay_count": recovery,
         "fallback_count": 0,
         "active_token_count": 64,
-        "full_attention_query_token_layer_positions": 1536,
-        "gdn_replay_token_layer_positions": 4608,
+        "full_attention_query_token_layer_positions": executed_positions * 6,
+        "gdn_replay_token_layer_positions": executed_positions * 18,
         "peak_allocated_gpu_memory_bytes": 1024,
         "workload_fingerprint": "same-work",
+        "reference_execution": MODULE.REFERENCE_EXECUTION,
         "attention_contract": "region_dag_conservative_gdn_v1",
         "diffusion_steps": 4,
         "positions_preserved": True,
         "stable_queries_absent": True,
         "full_replay_processed_prefix": route == "full_replay",
+        "full_replay_prefix_positions_preserved": route == "full_replay",
+        "full_replay_suffix_positions_preserved": route == "full_replay",
+        "full_replay_full_sequence_work": route == "full_replay",
+        "executed_query_positions": executed_positions,
+        "expected_query_positions": executed_positions,
+        "work_accounting_matches": True,
         "warm_restored_valid_prefix": True,
         "trace_hooks_installed": False,
     }
@@ -181,9 +193,172 @@ def test_production_source_excludes_trace_and_full_validation_work():
     assert source.index("timer.result()") < source.index(
         "compact_output_hash_after_timing"
     )
+    assert "_prepare_reference" not in source
     assert "ScopedRowHooks" in inspect.getsource(
         VALIDATION.Cluster3ValidationRuntime.run_case
     )
+    assert "_prepare_reference" not in inspect.getsource(
+        MODULE._execute_canonical_segmented_step
+    )
+
+
+class FakeCanonicalRuntime:
+    def __init__(self, prefix_positions=(0, 1), suffix_positions=(2, 3)):
+        self.prefix_positions = tuple(prefix_positions)
+        self.suffix_positions = tuple(suffix_positions)
+        self.backend = SimpleNamespace(_region_dag_layer_snapshots={})
+        self.clear_count = 0
+        self.reference_calls = 0
+        self.frontier_calls = []
+        self.suffix_calls = []
+        self.live_requests = []
+
+    def _clear(self):
+        self.clear_count += 1
+        self.backend._region_dag_layer_snapshots.clear()
+
+    def _prepare_reference(self, *_args, **_kwargs):
+        self.reference_calls += 1
+        raise AssertionError("monolithic reference must not be used")
+
+    def _prepare_canonical_frontier(self, rid, *_args, **_kwargs):
+        req = SimpleNamespace(rid=rid, live_recurrent_state=object())
+        self.live_requests.append(req)
+        self.frontier_calls.append(rid)
+        self.backend._region_dag_layer_snapshots[(rid, 0)] = object()
+        batch = SimpleNamespace(region_dag_query_positions_cpu=[self.prefix_positions])
+        return req, batch, {}
+
+    def _prepare_frontier_suffix(self, req, *_args, restore, **_kwargs):
+        self.suffix_calls.append(
+            {
+                "rid": req.rid,
+                "restore": restore,
+                "snapshots_empty": not self.backend._region_dag_layer_snapshots,
+                "live_recurrent_state": req.live_recurrent_state,
+            }
+        )
+        batch = SimpleNamespace(region_dag_query_positions_cpu=[self.suffix_positions])
+        return batch, {}
+
+
+def _fake_forward(_runtime, batch, _timer, _outputs, _active, work):
+    positions = MODULE._query_positions(batch)
+    work["query_counts"].append(len(positions))
+    work["full_attention_query_token_layer_positions"] += len(positions) * 2
+    work["gdn_replay_token_layer_positions"] += len(positions) * 3
+
+
+def test_full_replay_rebuilds_canonical_segmented_frontier_each_step(monkeypatch):
+    runtime = FakeCanonicalRuntime()
+    case = SimpleNamespace(sequence_length=4)
+    work = {
+        "query_counts": [],
+        "full_attention_query_token_layer_positions": 0,
+        "gdn_replay_token_layer_positions": 0,
+    }
+    monkeypatch.setattr(MODULE, "_prepare_call", lambda _timer, operation: operation())
+    monkeypatch.setattr(MODULE, "_production_forward", _fake_forward)
+
+    for step in range(4):
+        MODULE._execute_canonical_segmented_step(
+            runtime,
+            case,
+            f"full:{step}",
+            [1, 2, 3, 4],
+            object(),
+            2,
+            (2, 3),
+            object(),
+            [],
+            {2, 3},
+            work,
+        )
+
+    assert runtime.reference_calls == 0
+    assert runtime.clear_count == 4
+    assert runtime.frontier_calls == [f"full:{step}" for step in range(4)]
+    assert [call["restore"] for call in runtime.suffix_calls] == [False] * 4
+    assert all(call["snapshots_empty"] for call in runtime.suffix_calls)
+    assert len({id(req) for req in runtime.live_requests}) == 4
+    assert all(
+        call["live_recurrent_state"] is not None for call in runtime.suffix_calls
+    )
+    assert work["query_counts"] == [2, 2] * 4
+    assert work["full_attention_query_token_layer_positions"] == 4 * 4 * 2
+    assert work["gdn_replay_token_layer_positions"] == 4 * 4 * 3
+
+
+def test_cold_and_warm_suffix_helper_always_restores(monkeypatch):
+    runtime = FakeCanonicalRuntime()
+    req = SimpleNamespace(rid="frontier", live_recurrent_state=object())
+    monkeypatch.setattr(MODULE, "_prepare_call", lambda _timer, operation: operation())
+
+    for _route in ("cold_handoff_build", "warm_cached_suffix"):
+        MODULE._prepare_restored_suffix(
+            runtime, req, [1, 2, 3, 4], object(), object(), object()
+        )
+
+    assert [call["restore"] for call in runtime.suffix_calls] == [True, True]
+
+
+@pytest.mark.parametrize(
+    ("prefix", "suffix", "message"),
+    (
+        ((1, 0), (2, 3), "absolute prefix positions"),
+        ((0, 1), (3, 2), "absolute suffix positions"),
+    ),
+)
+def test_full_replay_checks_prefix_and_suffix_absolute_positions_separately(
+    monkeypatch, prefix, suffix, message
+):
+    runtime = FakeCanonicalRuntime(prefix, suffix)
+    monkeypatch.setattr(MODULE, "_prepare_call", lambda _timer, operation: operation())
+    monkeypatch.setattr(MODULE, "_production_forward", _fake_forward)
+    work = {
+        "query_counts": [],
+        "full_attention_query_token_layer_positions": 0,
+        "gdn_replay_token_layer_positions": 0,
+    }
+
+    with pytest.raises(RuntimeError, match=message):
+        MODULE._execute_canonical_segmented_step(
+            runtime,
+            SimpleNamespace(sequence_length=4),
+            "full:0",
+            [1, 2, 3, 4],
+            object(),
+            2,
+            (2, 3),
+            object(),
+            [],
+            {2, 3},
+            work,
+        )
+
+
+def test_mismatched_output_hash_fails_closed_with_compact_diagnostic():
+    reference = raw_record("full_replay", "uninstrumented", 0)
+    candidate = raw_record(
+        "cold_handoff_build", "uninstrumented", 0, output_hash="b" * 64
+    )
+    candidate["generated_top1_token_ids"][7] = 99
+
+    with pytest.raises(RuntimeError, match="output hash differs") as caught:
+        MODULE._require_paired_output_hash(
+            reference,
+            candidate,
+            route="cold_handoff_build",
+            variant="uninstrumented",
+            repetition=0,
+        )
+
+    message = str(caught.value)
+    assert '"first_differing_flattened_token_index": 7' in message
+    assert '"route": "cold_handoff_build"' in message
+    assert '"reference_execution": "canonical_segmented_no_cache"' in message
+    assert "logits" not in message
+    assert "hidden" not in message
 
 
 def test_output_hashing_requires_finalized_timing():
@@ -263,6 +438,15 @@ def test_summary_computes_overhead_and_comparisons():
     assert summary["comparisons"]["warm_latency_reduction_pct"] == 50.0
     assert summary["comparisons"]["cold_amortization_steps"] == 0.8
     assert summary["gates"]["profiling_overhead_acceptable"] is True
+    assert (
+        summary["timing_protocol"]["reference_execution"]
+        == "canonical_segmented_no_cache"
+    )
+    assert summary["workload_sanity"]["route_work_accounting_matches"] is True
+    assert (
+        summary["workload_sanity"]["full_replay_executes_full_sequence_each_step"]
+        is True
+    )
     assert summary["publication_acceptable"] is True
 
 
@@ -285,6 +469,16 @@ def test_profiled_and_uninstrumented_work_counters_must_match():
         summary["workload_sanity"]["profiled_and_uninstrumented_workloads_identical"]
         is False
     )
+    assert summary["publication_acceptable"] is False
+
+
+def test_route_work_accounting_mismatch_fails_publication():
+    records = raw_records()
+    records[0]["expected_query_positions"] += 1
+
+    summary = summarize(records)
+
+    assert summary["workload_sanity"]["route_work_accounting_matches"] is False
     assert summary["publication_acceptable"] is False
 
 
