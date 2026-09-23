@@ -168,7 +168,7 @@ def test_cli_help_does_not_load_cuda_or_model():
         text=True,
     )
     assert (
-        "--profile {one1,smoke16,paper100,effectiveness,efficiency_one}"
+        "--profile {one1,smoke16,paper100,effectiveness,efficiency_one,production_efficiency}"
         in completed.stdout
     )
     assert "--timed-repetitions" in completed.stdout

@@ -197,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
             "paper100",
             "effectiveness",
             "efficiency_one",
+            "production_efficiency",
         ),
     )
     parser.add_argument("--dtype", default="bfloat16", choices=("bfloat16",))
@@ -206,6 +207,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-total-tokens", default=4096, type=int)
     parser.add_argument("--timed-repetitions", default=10, type=int)
     parser.add_argument("--debug-sync-stages", action="store_true")
+    parser.add_argument("--correctness-artifact", type=Path)
+    parser.add_argument("--preflight-json", type=Path)
     return parser
 
 
@@ -219,6 +222,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         raise ValueError("--max-total-tokens must be positive")
     if args.timed_repetitions < 10:
         raise ValueError("--timed-repetitions must be at least 10")
+    if args.profile == "production_efficiency":
+        if args.timed_repetitions != 10:
+            raise ValueError("production_efficiency requires exactly 10 repetitions")
+        if args.debug_sync_stages:
+            raise ValueError("production_efficiency forbids debug synchronization")
+        if args.correctness_artifact is None or args.preflight_json is None:
+            raise ValueError(
+                "production_efficiency requires --correctness-artifact and "
+                "--preflight-json"
+            )
     return args
 
 
@@ -468,10 +481,10 @@ def build_manifest(profile: str, seed: int = DEFAULT_SEED) -> list[ValidationCas
         return _paper_cases(seed)
     if profile == "effectiveness":
         return _effectiveness_cases(seed)
-    if profile == "efficiency_one":
+    if profile in ("efficiency_one", "production_efficiency"):
         return [
             _case(
-                "efficiency_one",
+                profile,
                 1,
                 seed,
                 2112,
@@ -1430,6 +1443,17 @@ class Cluster3ValidationRuntime:
             finished.record()
         return result, DeferredCudaTiming(started, finished)
 
+    def _maybe_cuda_timed(
+        self,
+        operation: Callable[[], Any],
+        *,
+        nvtx_phase: str,
+        collect_component_timing: bool,
+    ) -> tuple[Any, Any]:
+        if collect_component_timing:
+            return self._cuda_timed(operation, nvtx_phase=nvtx_phase)
+        return operation(), 0.0
+
     def _prepare_reference(
         self,
         rid: str,
@@ -1437,6 +1461,8 @@ class Cluster3ValidationRuntime:
         spec: Any,
         case: ValidationCase,
         profilers: Any = (),
+        *,
+        collect_component_timing: bool = True,
     ) -> tuple[Any, Any, dict[str, float]]:
         torch = __import__("torch")
         from sglang.srt.dllm.region.runtime import build_region_dag_runtime_plan
@@ -1464,14 +1490,17 @@ class Cluster3ValidationRuntime:
         from sglang.srt.dllm.region.profiling import profile_many_phase
 
         with profile_many_phase(profilers, "request_setup", cuda=True):
-            _, gather_scatter_ms = self._cuda_timed(
-                batch.prepare_for_extend, nvtx_phase="request_setup"
+            _, gather_scatter_ms = self._maybe_cuda_timed(
+                batch.prepare_for_extend,
+                nvtx_phase="request_setup",
+                collect_component_timing=collect_component_timing,
             )
         self._bind_frontiers(req)
         worker_batch = batch.get_model_worker_batch()
-        forward_batch, mask_build_ms = self._cuda_timed(
+        forward_batch, mask_build_ms = self._maybe_cuda_timed(
             lambda: ForwardBatch.init_new(worker_batch, self.model_runner),
             nvtx_phase="region_mask_build",
+            collect_component_timing=collect_component_timing,
         )
         return (
             req,
@@ -1489,6 +1518,8 @@ class Cluster3ValidationRuntime:
         spec: Any,
         case: ValidationCase,
         profilers: Any = (),
+        *,
+        collect_component_timing: bool = True,
     ) -> tuple[Any, Any, dict[str, float]]:
         """Schedule only the stable topological prefix that owns the frontier."""
         torch = __import__("torch")
@@ -1520,8 +1551,10 @@ class Cluster3ValidationRuntime:
         from sglang.srt.dllm.region.profiling import profile_many_phase
 
         with profile_many_phase(profilers, "request_setup", cuda=True):
-            _, gather_scatter_ms = self._cuda_timed(
-                batch.prepare_for_extend, nvtx_phase="request_setup"
+            _, gather_scatter_ms = self._maybe_cuda_timed(
+                batch.prepare_for_extend,
+                nvtx_phase="request_setup",
+                collect_component_timing=collect_component_timing,
             )
         self._bind_frontiers(req)
         batch.region_dag_execution_specs_cpu = [frontier_spec]
@@ -1536,9 +1569,10 @@ class Cluster3ValidationRuntime:
         batch.region_dag_restore_required_cpu = [False]
         batch.region_dag_reference_cpu = [True]
         worker_batch = batch.get_model_worker_batch()
-        forward_batch, mask_build_ms = self._cuda_timed(
+        forward_batch, mask_build_ms = self._maybe_cuda_timed(
             lambda: ForwardBatch.init_new(worker_batch, self.model_runner),
             nvtx_phase="region_mask_build",
+            collect_component_timing=collect_component_timing,
         )
         if tuple(forward_batch.region_dag_query_positions_cpu[0]) != tuple(
             range(boundary)
@@ -1564,6 +1598,7 @@ class Cluster3ValidationRuntime:
         *,
         restore: bool,
         profilers: Any = (),
+        collect_component_timing: bool = True,
     ) -> tuple[Any, dict[str, float]]:
         """Attach the full suffix to a canonical live or committed frontier."""
         from sglang.srt.dllm.region.runtime import build_region_dag_runtime_plan
@@ -1604,9 +1639,10 @@ class Cluster3ValidationRuntime:
         phase = "kv_restore" if restore else "request_setup"
         with profile_many_phase(profilers, "schedule_batch_prepare", cuda=True):
             with profile_many_phase(profilers, phase, cuda=True):
-                _, gather_scatter_ms = self._cuda_timed(
+                _, gather_scatter_ms = self._maybe_cuda_timed(
                     batch.prepare_for_extend,
                     nvtx_phase=phase,
+                    collect_component_timing=collect_component_timing,
                 )
         batch.region_dag_query_positions_cpu = [plan.attention_query_positions]
         batch.region_dag_restore_required_cpu = [bool(restore)]
@@ -1614,9 +1650,10 @@ class Cluster3ValidationRuntime:
         with profile_many_phase(profilers, "worker_batch_construction"):
             worker_batch = batch.get_model_worker_batch()
         with profile_many_phase(profilers, "forward_batch_initialization", cuda=True):
-            forward_batch, mask_build_ms = self._cuda_timed(
+            forward_batch, mask_build_ms = self._maybe_cuda_timed(
                 lambda: ForwardBatch.init_new(worker_batch, self.model_runner),
                 nvtx_phase="region_mask_build",
+                collect_component_timing=collect_component_timing,
             )
         if not restore:
             forward_batch.region_dag_diagnostic_live_prefix_cpu = [True]
@@ -2663,7 +2700,18 @@ def run_validation(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    run_validation(parse_args(argv))
+    args = parse_args(argv)
+    if args.profile == "production_efficiency":
+        module = _load_module(
+            "cluster3_production_latency_benchmark",
+            Path(__file__).with_name("cluster3_production_latency_benchmark.py"),
+        )
+        module.run_production_benchmark(
+            args,
+            validation_module=sys.modules[__name__],
+        )
+        return
+    run_validation(args)
 
 
 if __name__ == "__main__":
