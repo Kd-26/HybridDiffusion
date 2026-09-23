@@ -497,6 +497,97 @@ def _prepare_restored_suffix(
     )
 
 
+def _capture_prefix_reuse_observation(req: Any, forward_batch: Any) -> dict[str, Any]:
+    """Retain device evidence without inspecting or synchronizing it in timing."""
+    restore_flags = getattr(forward_batch, "region_dag_restore_required_cpu", None)
+    restore_required = bool(
+        restore_flags and len(restore_flags) == 1 and bool(restore_flags[0])
+    )
+    return {
+        "req_pool_idx": getattr(req, "req_pool_idx", None),
+        "prefix_indices": getattr(req, "prefix_indices", None),
+        "restore_required": restore_required,
+    }
+
+
+def verify_prefix_kv_reuse_after_timing(
+    runtime: Any,
+    timer: ProductionTimingEnvelope,
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    replay_start: int,
+    expected_restore_steps: int,
+) -> dict[str, Any]:
+    """Prove physical prefix reuse after the route's terminal synchronization."""
+    if not timer.finalized:
+        raise RuntimeError("physical KV reuse must be verified after route timing")
+    if replay_start <= 0:
+        raise RuntimeError("physical KV reuse requires a positive prefix boundary")
+    if len(observations) != expected_restore_steps:
+        raise RuntimeError(
+            "restored suffix count differs from the diffusion-step contract: "
+            f"observed={len(observations)} expected={expected_restore_steps}"
+        )
+
+    torch = __import__("torch")
+    allocator = runtime.model_runner.token_to_kv_pool_allocator
+    pool_size = int(allocator.size)
+    canonical_lookup = runtime.runtime._canonical_prefix_locations
+    verified_steps = 0
+    for step, observation in enumerate(observations):
+        if observation.get("restore_required") is not True:
+            raise RuntimeError(f"restored suffix step {step} lacks its restore flag")
+        req_pool_idx = observation.get("req_pool_idx")
+        if req_pool_idx is None:
+            raise RuntimeError(f"restored suffix step {step} has no request-pool slot")
+        prefix_indices = observation.get("prefix_indices")
+        if not isinstance(prefix_indices, torch.Tensor):
+            raise RuntimeError(
+                f"restored suffix step {step} has no prefix-index tensor"
+            )
+        if prefix_indices.dtype is not torch.int64:
+            raise RuntimeError(
+                f"restored suffix step {step} prefix indices are not int64"
+            )
+        if prefix_indices.ndim != 1 or int(prefix_indices.numel()) != replay_start:
+            raise RuntimeError(
+                f"restored suffix step {step} prefix length differs from boundary"
+            )
+        if not prefix_indices.is_contiguous():
+            raise RuntimeError(
+                f"restored suffix step {step} prefix indices are not contiguous"
+            )
+
+        canonical = canonical_lookup(int(req_pool_idx), replay_start)
+        if not isinstance(canonical, torch.Tensor):
+            raise RuntimeError("canonical prefix lookup did not return a tensor")
+        if (
+            canonical.dtype is not torch.int64
+            or canonical.ndim != 1
+            or int(canonical.numel()) != replay_start
+            or not canonical.is_contiguous()
+        ):
+            raise RuntimeError("authoritative canonical prefix locations are invalid")
+        if canonical.device != prefix_indices.device:
+            raise RuntimeError("canonical prefix lookup changed tensor device")
+        if not bool(((canonical >= 0) & (canonical < pool_size)).all().item()):
+            raise RuntimeError("canonical prefix contains an invalid physical location")
+        if not torch.equal(prefix_indices, canonical):
+            raise RuntimeError(
+                f"restored suffix step {step} changed canonical physical KV locations"
+            )
+        verified_steps += 1
+
+    observed_reused_positions = replay_start * verified_steps
+    return {
+        "method": "canonical_prefix_page_table_identity",
+        "restore_steps": verified_steps,
+        "prefix_positions_per_step": replay_start,
+        "physical_locations_match": True,
+        "observed_reused_positions": observed_reused_positions,
+    }
+
+
 def execute_production_measurement(
     runtime: Any,
     validation: Any,
@@ -543,7 +634,7 @@ def execute_production_measurement(
         "full_attention_query_token_layer_positions": 0,
         "gdn_replay_token_layer_positions": 0,
     }
-    cache_hits = 0
+    instrumentation_kv_cache_hits = 0
     gdn_restores = 0
     recovery_replays = 0
     fallback_count = 0
@@ -554,6 +645,7 @@ def execute_production_measurement(
     full_replay_suffix_positions_preserved = route == "full_replay"
     full_replay_full_sequence_work = route == "full_replay"
     restore_contract_observed = True
+    prefix_reuse_observations: list[dict[str, Any]] = []
     cold_req = None
 
     with timer.route():
@@ -638,6 +730,9 @@ def execute_production_measurement(
                     and len(restore_flags) == 1
                     and bool(restore_flags[0])
                 )
+                prefix_reuse_observations.append(
+                    _capture_prefix_reuse_observation(req, batch)
+                )
                 if bool(restore_flags) and bool(restore_flags[0]):
                     _, gdn_layers = _layer_counts(runtime)
                     gdn_restores += gdn_layers
@@ -645,11 +740,30 @@ def execute_production_measurement(
             metrics = req.region_dag_instrumentation
             if metrics is None:
                 raise RuntimeError("production request lost Region-DAG instrumentation")
-            cache_hits += int(metrics.kv_cache_hits)
+            instrumentation_kv_cache_hits += int(metrics.kv_cache_hits)
             recovery_replays += int(metrics.recovery_replays)
             fallback_count += int(metrics.fallback_count)
 
     timing = timer.result()
+    if route in ("cold_handoff_build", "warm_cached_suffix"):
+        kv_reuse_evidence = verify_prefix_kv_reuse_after_timing(
+            runtime,
+            timer,
+            prefix_reuse_observations,
+            replay_start=replay_start,
+            expected_restore_steps=case.diffusion_steps,
+        )
+    else:
+        if prefix_reuse_observations:
+            raise RuntimeError("full replay unexpectedly recorded restored KV state")
+        kv_reuse_evidence = {
+            "method": "not_applicable_full_replay",
+            "restore_steps": 0,
+            "prefix_positions_per_step": 0,
+            "physical_locations_match": True,
+            "observed_reused_positions": 0,
+        }
+    cache_hits = int(kv_reuse_evidence["observed_reused_positions"])
     output_hash, top1_ids = compact_output_hash_after_timing(outputs, timer)
     peak_memory = int(torch.cuda.max_memory_allocated(runtime.device))
     expected_query_positions = {
@@ -679,8 +793,13 @@ def execute_production_measurement(
             "reference_execution": REFERENCE_EXECUTION,
         }
     )
-    if route == "warm_cached_suffix" and replay_start > 0 and cache_hits <= 0:
-        raise RuntimeError("warm cached route did not reuse the stable prefix")
+    if route == "warm_cached_suffix":
+        if replay_start > 0 and cache_hits <= 0:
+            raise RuntimeError("warm cached route did not reuse the stable prefix")
+        if int(kv_reuse_evidence["restore_steps"]) != case.diffusion_steps:
+            raise RuntimeError("warm cached route did not restore every suffix step")
+        if recovery_replays or fallback_count:
+            raise RuntimeError("warm cached route recovered or fell back")
     return {
         "schema_version": SCHEMA_VERSION,
         "profile": "production_efficiency",
@@ -692,6 +811,16 @@ def execute_production_measurement(
         "generated_top1_token_ids": top1_ids,
         "cache_status": "hit" if route == "warm_cached_suffix" else "miss",
         "cache_hits": cache_hits,
+        "instrumentation_kv_cache_hits": instrumentation_kv_cache_hits,
+        "instrumentation_kv_cache_hits_unavailable_reason": (
+            (
+                "canonical prepare_for_extend does not increment the legacy "
+                "prepare_for_region_dag_replay counter"
+            )
+            if route in ("cold_handoff_build", "warm_cached_suffix")
+            else "not applicable to canonical segmented full replay"
+        ),
+        "kv_reuse_evidence": kv_reuse_evidence,
         "cache_misses": sum(int(value) for value in work["query_counts"]),
         "gdn_state_restores": gdn_restores,
         "recovery_replay_count": recovery_replays,
@@ -874,6 +1003,16 @@ def summarize(
             ),
             "output_hash": next(iter(route_hashes)) if len(route_hashes) == 1 else None,
             "cache_hits": [int(record["cache_hits"]) for record in uninstrumented],
+            "instrumentation_kv_cache_hits": [
+                int(record["instrumentation_kv_cache_hits"])
+                for record in uninstrumented
+            ],
+            "instrumentation_kv_cache_hits_unavailable_reason": str(
+                uninstrumented[0]["instrumentation_kv_cache_hits_unavailable_reason"]
+            ),
+            "kv_reuse_evidence": [
+                dict(record["kv_reuse_evidence"]) for record in uninstrumented
+            ],
             "cache_misses": [int(record["cache_misses"]) for record in uninstrumented],
             "recovery_replay_count": [
                 int(record["recovery_replay_count"]) for record in uninstrumented
@@ -950,6 +1089,19 @@ def summarize(
         ),
         "warm_restores_valid_prefix": all(
             bool(record["warm_restored_valid_prefix"]) for record in warm_records
+        ),
+        "physical_kv_reuse_proven": all(
+            record["kv_reuse_evidence"].get("method")
+            == "canonical_prefix_page_table_identity"
+            and record["kv_reuse_evidence"].get("physical_locations_match") is True
+            and int(record["kv_reuse_evidence"].get("restore_steps", 0)) == 4
+            and int(record["kv_reuse_evidence"].get("prefix_positions_per_step", 0))
+            == 2048
+            and int(record["kv_reuse_evidence"].get("observed_reused_positions", 0))
+            == 8192
+            and int(record["cache_hits"]) == 8192
+            for record in records
+            if record["route"] in ("cold_handoff_build", "warm_cached_suffix")
         ),
         "stable_queries_absent_from_warm": all(
             bool(record["stable_queries_absent"]) for record in warm_records

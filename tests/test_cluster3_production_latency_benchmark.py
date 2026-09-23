@@ -85,6 +85,18 @@ def raw_record(route, variant, repetition, *, output_hash="a" * 64, recovery=0):
         "cold_handoff_build": 2048 + 64 * 4,
         "warm_cached_suffix": 64 * 4,
     }[route]
+    restored = route in ("cold_handoff_build", "warm_cached_suffix")
+    kv_reuse_evidence = {
+        "method": (
+            "canonical_prefix_page_table_identity"
+            if restored
+            else "not_applicable_full_replay"
+        ),
+        "restore_steps": 4 if restored else 0,
+        "prefix_positions_per_step": 2048 if restored else 0,
+        "physical_locations_match": True,
+        "observed_reused_positions": 8192 if restored else 0,
+    }
     return {
         "schema_version": 1,
         "profile": "production_efficiency",
@@ -106,7 +118,14 @@ def raw_record(route, variant, repetition, *, output_hash="a" * 64, recovery=0):
         "output_hash": output_hash,
         "generated_top1_token_ids": [1, 2, 3, 4] * 64,
         "cache_status": "hit" if route == "warm_cached_suffix" else "miss",
-        "cache_hits": 64 if route == "warm_cached_suffix" else 0,
+        "cache_hits": 8192 if restored else 0,
+        "instrumentation_kv_cache_hits": 0,
+        "instrumentation_kv_cache_hits_unavailable_reason": (
+            "canonical prepare_for_extend does not increment the legacy counter"
+            if restored
+            else "not applicable to canonical segmented full replay"
+        ),
+        "kv_reuse_evidence": kv_reuse_evidence,
         "cache_misses": 64,
         "gdn_state_restores": 72 if route == "warm_cached_suffix" else 0,
         "recovery_replay_count": recovery,
@@ -192,6 +211,9 @@ def test_production_source_excludes_trace_and_full_validation_work():
         assert forbidden not in source
     assert source.index("timer.result()") < source.index(
         "compact_output_hash_after_timing"
+    )
+    assert source.index("timer.result()") < source.index(
+        "verify_prefix_kv_reuse_after_timing"
     )
     assert "_prepare_reference" not in source
     assert "ScopedRowHooks" in inspect.getsource(
@@ -372,6 +394,171 @@ def test_output_hashing_requires_finalized_timing():
     )
     assert token_ids == [1, 2]
     assert digest == MODULE._hash_token_ids(token_ids)
+
+
+def _prefix_reuse_runtime(canonical, *, pool_size=128):
+    canonical = canonical.clone()
+
+    def lookup(req_pool_idx, boundary):
+        assert req_pool_idx == 7
+        assert boundary == canonical.numel()
+        return canonical.clone()
+
+    return SimpleNamespace(
+        model_runner=SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(size=pool_size)
+        ),
+        runtime=SimpleNamespace(_canonical_prefix_locations=lookup),
+    )
+
+
+def _finalized_timer():
+    timer = MODULE.ProductionTimingEnvelope(fake_torch(), 0, profiled=False)
+    with timer.route():
+        pass
+    return timer
+
+
+def _reuse_observation(prefix, *, req_pool_idx=7, restore_required=True):
+    return {
+        "req_pool_idx": req_pool_idx,
+        "prefix_indices": prefix,
+        "restore_required": restore_required,
+    }
+
+
+def test_valid_physical_prefix_identity_counts_every_restore_step():
+    prefix = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+    evidence = MODULE.verify_prefix_kv_reuse_after_timing(
+        _prefix_reuse_runtime(prefix),
+        _finalized_timer(),
+        [_reuse_observation(prefix.clone()), _reuse_observation(prefix.clone())],
+        replay_start=4,
+        expected_restore_steps=2,
+    )
+    assert evidence == {
+        "method": "canonical_prefix_page_table_identity",
+        "restore_steps": 2,
+        "prefix_positions_per_step": 4,
+        "physical_locations_match": True,
+        "observed_reused_positions": 8,
+    }
+
+
+def test_physical_prefix_location_mismatch_fails_closed():
+    canonical = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+    changed = torch.tensor([1, 2, 3, 5], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="changed canonical physical KV"):
+        MODULE.verify_prefix_kv_reuse_after_timing(
+            _prefix_reuse_runtime(canonical),
+            _finalized_timer(),
+            [_reuse_observation(changed)],
+            replay_start=4,
+            expected_restore_steps=1,
+        )
+
+
+def test_prefix_reuse_rejects_wrong_dtype():
+    canonical = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="not int64"):
+        MODULE.verify_prefix_kv_reuse_after_timing(
+            _prefix_reuse_runtime(canonical),
+            _finalized_timer(),
+            [_reuse_observation(canonical.to(torch.int32))],
+            replay_start=4,
+            expected_restore_steps=1,
+        )
+
+
+def test_prefix_reuse_rejects_wrong_length():
+    canonical = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="prefix length differs"):
+        MODULE.verify_prefix_kv_reuse_after_timing(
+            _prefix_reuse_runtime(canonical),
+            _finalized_timer(),
+            [_reuse_observation(canonical[:3])],
+            replay_start=4,
+            expected_restore_steps=1,
+        )
+
+
+def test_prefix_reuse_rejects_missing_request_slot():
+    canonical = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="no request-pool slot"):
+        MODULE.verify_prefix_kv_reuse_after_timing(
+            _prefix_reuse_runtime(canonical),
+            _finalized_timer(),
+            [_reuse_observation(canonical, req_pool_idx=None)],
+            replay_start=4,
+            expected_restore_steps=1,
+        )
+
+
+def test_prefix_reuse_rejects_invalid_physical_location():
+    invalid = torch.tensor([1, 2, 3, 128], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="invalid physical location"):
+        MODULE.verify_prefix_kv_reuse_after_timing(
+            _prefix_reuse_runtime(invalid),
+            _finalized_timer(),
+            [_reuse_observation(invalid)],
+            replay_start=4,
+            expected_restore_steps=1,
+        )
+
+
+def test_prefix_reuse_rejects_missing_restore_step():
+    prefix = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="suffix count differs"):
+        MODULE.verify_prefix_kv_reuse_after_timing(
+            _prefix_reuse_runtime(prefix),
+            _finalized_timer(),
+            [_reuse_observation(prefix)],
+            replay_start=4,
+            expected_restore_steps=2,
+        )
+
+
+def test_prefix_reuse_rejects_missing_restore_flag():
+    prefix = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="lacks its restore flag"):
+        MODULE.verify_prefix_kv_reuse_after_timing(
+            _prefix_reuse_runtime(prefix),
+            _finalized_timer(),
+            [_reuse_observation(prefix, restore_required=False)],
+            replay_start=4,
+            expected_restore_steps=1,
+        )
+
+
+def test_prefix_reuse_verification_requires_finalized_timing():
+    prefix = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+    timer = MODULE.ProductionTimingEnvelope(fake_torch(), 0, profiled=False)
+    with pytest.raises(RuntimeError, match="after route timing"):
+        MODULE.verify_prefix_kv_reuse_after_timing(
+            _prefix_reuse_runtime(prefix),
+            timer,
+            [_reuse_observation(prefix)],
+            replay_start=4,
+            expected_restore_steps=1,
+        )
+
+
+def test_zero_legacy_counter_does_not_hide_proven_physical_reuse():
+    records = raw_records()
+    assert all(record["instrumentation_kv_cache_hits"] == 0 for record in records)
+    restored = [
+        record
+        for record in records
+        if record["route"] in ("cold_handoff_build", "warm_cached_suffix")
+    ]
+    assert all(record["cache_hits"] == 2048 * 4 for record in restored)
+    assert all(
+        record["kv_reuse_evidence"]["observed_reused_positions"] == 2048 * 4
+        for record in restored
+    )
+    summary = summarize(records)
+    assert summary["workload_sanity"]["physical_kv_reuse_proven"] is True
+    assert summary["publication_acceptable"] is True
 
 
 def test_production_environment_rejects_debug_and_trace_modes(monkeypatch):

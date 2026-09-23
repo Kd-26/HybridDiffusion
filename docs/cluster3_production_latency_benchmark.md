@@ -47,6 +47,28 @@ suffix equal full-sequence work on every full-replay step. Attention and GDN
 token-layer counts include both full-replay forwards. Cold and warm count only
 the prefix/suffix work actually executed inside their respective route.
 
+## Physical KV-reuse evidence
+
+The canonical production suffix is assembled through `prepare_for_extend`, not
+`prepare_for_region_dag_replay`. Consequently, the legacy
+`RegionDAGInstrumentation.kv_cache_hits` counter is not available for this path
+and is retained only as a separately labeled raw diagnostic. It is never used
+as proof of production reuse.
+
+For every cold and warm restored suffix, the benchmark retains the request-pool
+slot and exact `int64` prefix-location tensor without inspecting either tensor
+inside the timed route. After the route's existing terminal synchronization, it
+requires all four restore steps and compares each retained tensor with the
+authoritative canonical page table for the same request slot and 2,048-token
+boundary. Shape, dtype, contiguity, device, physical-pool bounds, and exact
+tensor identity all fail closed. A passing route reports
+`method=canonical_prefix_page_table_identity` and 8,192 observed reused
+positions: 2,048 prefix positions across four restored suffix steps.
+
+This post-timing verification adds no synchronization or device-to-host copy to
+the measured interval. Output-hash, recovery, fallback, position, work, and
+one-terminal-synchronization gates remain mandatory.
+
 The run fails closed unless the accepted `efficiency_one` summary and preflight
 belong to `057dcab2261895a0e32357f5d57c65e1eb4b3b8c`, the checkpoint hashes
 still match, and both runs use the same one-A30 CUDA/PyTorch environment. It
@@ -70,14 +92,17 @@ export MODEL_PATH=/persistent/hybrid-diffusion-cache/models/HybridDiffusion-2B
 export CACHE_ROOT=/persistent/hybrid-diffusion-cache
 export RESULT_ROOT=/persistent/hybrid-diffusion-cache/results/cluster3-production-efficiency
 export PY=/persistent/hybrid-diffusion-cache/venvs/hybrid-diffusion-eval/bin/python
-export EXPECTED_PARENT=3be05adc2759c6472c7387b31e081fd5dbdffff5
+export EXPECTED_PARENT=465044dc0266ace753581ba92fb475e465a721a9
 export ACCEPTED_CORRECTNESS_REVISION=057dcab2261895a0e32357f5d57c65e1eb4b3b8c
-export CORRECTNESS_ARTIFACT="$RESULT_ROOT/profile-one/summary.json"
-export CORRECTNESS_PREFLIGHT="$RESULT_ROOT/profile-one/preflight.json"
+export CORRECTNESS_DIR="$RESULT_ROOT/$ACCEPTED_CORRECTNESS_REVISION/a30-production-latency-05-correctness"
+export CORRECTNESS_ARTIFACT="$CORRECTNESS_DIR/summary.json"
+export CORRECTNESS_PREFLIGHT="$CORRECTNESS_DIR/preflight.json"
 export PRODUCTION_OUT="$RESULT_ROOT/production-latency/$(git rev-parse HEAD)"
 export CUDA_VISIBLE_DEVICES=0
+export FLASHINFER_WORKSPACE_BASE="$CACHE_ROOT/flashinfer-workspaces/cluster3-production-$(git rev-parse --short=12 HEAD)"
+export TORCH_EXTENSIONS_DIR="$FLASHINFER_WORKSPACE_BASE/torch-extensions"
 
-test "$(git branch --show-current)" = cluster3-production-latency-oracle-fix
+test "$(git branch --show-current)" = cluster3-production-kv-reuse-evidence-fix
 test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
 test -f "$CORRECTNESS_ARTIFACT"
 test -f "$CORRECTNESS_PREFLIGHT"
