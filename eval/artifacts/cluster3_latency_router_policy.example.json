@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "policy_version": "cluster3-ridge-v1-example",
+  "model_provenance": "example-only-not-fitted-evidence",
+  "safety_margin": 0.02,
+  "feature_schema": [
+    "total_tokens",
+    "stable_tokens",
+    "active_tokens",
+    "stable_fraction",
+    "diffusion_steps",
+    "active_region_count",
+    "batch_size",
+    "active_tokens_x_diffusion_steps",
+    "total_tokens_x_diffusion_steps",
+    "stable_tokens_x_diffusion_steps",
+    "batch_size_x_active_tokens"
+  ],
+  "route_models": {
+    "full_replay": {
+      "intercept": 100.0,
+      "coefficients": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "feature_means": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "feature_scales": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+      "ridge_alpha": 1.0,
+      "training_case_count": 0,
+      "training_mae_ms": 0.0
+    },
+    "cold_handoff_build": {
+      "intercept": 70.0,
+      "coefficients": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "feature_means": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "feature_scales": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+      "ridge_alpha": 1.0,
+      "training_case_count": 0,
+      "training_mae_ms": 0.0
+    },
+    "warm_cached_suffix": {
+      "intercept": 50.0,
+      "coefficients": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "feature_means": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "feature_scales": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+      "ridge_alpha": 1.0,
+      "training_case_count": 0,
+      "training_mae_ms": 0.0
+    }
+  },
+  "support_domain": {
+    "total_tokens": [256.0, 4096.0],
+    "stable_tokens": [1.0, 4095.0],
+    "active_tokens": [1.0, 2048.0],
+    "stable_fraction": [0.0, 1.0],
+    "diffusion_steps": [1.0, 16.0],
+    "active_region_count": [1.0, 4.0],
+    "batch_size": [1.0, 1.0],
+    "active_tokens_x_diffusion_steps": [1.0, 32768.0],
+    "total_tokens_x_diffusion_steps": [256.0, 65536.0],
+    "stable_tokens_x_diffusion_steps": [1.0, 65520.0],
+    "batch_size_x_active_tokens": [1.0, 2048.0]
+  },
+  "data_split": {
+    "seed": 20260924,
+    "split_unit": "normalized_case_id",
+    "train_case_ids": [],
+    "validation_case_ids": [],
+    "test_case_ids": []
+  },
+  "source_jsonl_sha256": {},
+  "fit_timestamp": "example-only",
+  "benchmark_revision": [],
+  "normalization": "per-route training mean and population standard deviation"
+}

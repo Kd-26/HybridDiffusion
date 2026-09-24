@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "policy_version": "cluster3-ridge-v1-example",
+  "held_out_case_ids": [],
+  "metrics": {
+    "case_count": 0,
+    "exact_route_selection_accuracy": null,
+    "aggregate_latency_ms": null,
+    "aggregate_regret_ms": null,
+    "aggregate_regret_fraction": null,
+    "median_regret_fraction": null,
+    "p95_regret_fraction": null,
+    "worst_case_regret_fraction": null,
+    "cases_within_2pct_of_oracle": null,
+    "router_decision_overhead_ms_median": null,
+    "router_decision_overhead_ms_p95": null,
+    "router_overhead_fraction_of_selected_median": null,
+    "fallback_count": 0,
+    "out_of_domain_count": 0,
+    "fixed_policy_aggregate_latency_ms": {}
+  },
+  "acceptance_gates": {},
+  "acceptance_pass": false,
+  "example_only": true,
+  "cases": []
+}

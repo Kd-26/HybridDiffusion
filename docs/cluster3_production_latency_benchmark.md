@@ -1,5 +1,9 @@
 # Cluster-3 production latency benchmark
 
+The parameterized manifest and conservative routing extension is documented in
+[`cluster3_parameterized_benchmark_router.md`](cluster3_parameterized_benchmark_router.md).
+Omitting `--case-manifest` retains the fixed regression described below.
+
 `production_efficiency` is a production-only latency path. It preserves the
 `efficiency_one` controlled correctness path and does not implement a runtime
 optimization. The fixed workload is one HybridDiffusion-2B request with a

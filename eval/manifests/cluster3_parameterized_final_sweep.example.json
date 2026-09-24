@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"case_id": "p256-a32-s2-b1", "total_tokens_per_request": 288, "prefix_tokens": 256, "active_spans": [[256, 288]], "diffusion_steps": 2, "batch_size": 1},
+    {"case_id": "p512-a64-s4-b1", "total_tokens_per_request": 576, "prefix_tokens": 512, "active_spans": [[512, 576]], "diffusion_steps": 4, "batch_size": 1},
+    {"case_id": "p512-a128-s2-b1", "total_tokens_per_request": 640, "prefix_tokens": 512, "active_spans": [[512, 640]], "diffusion_steps": 2, "batch_size": 1},
+    {"case_id": "p1024-a64-s8-b1", "total_tokens_per_request": 1088, "prefix_tokens": 1024, "active_spans": [[1024, 1088]], "diffusion_steps": 8, "batch_size": 1},
+    {"case_id": "p1024-a256-s4-b1", "total_tokens_per_request": 1280, "prefix_tokens": 1024, "active_spans": [[1024, 1280]], "diffusion_steps": 4, "batch_size": 1},
+    {"case_id": "p2048-a64-s4-b1", "total_tokens_per_request": 2112, "prefix_tokens": 2048, "active_spans": [[2048, 2112]], "diffusion_steps": 4, "batch_size": 1},
+    {"case_id": "p2048-a256-s8-b1", "total_tokens_per_request": 2304, "prefix_tokens": 2048, "active_spans": [[2048, 2304]], "diffusion_steps": 8, "batch_size": 1},
+    {"case_id": "p512-a512-s4-b1", "total_tokens_per_request": 1024, "prefix_tokens": 512, "active_spans": [[512, 1024]], "diffusion_steps": 4, "batch_size": 1},
+    {
+      "case_id": "internal-a32-s4-b1",
+      "total_tokens_per_request": 1024,
+      "active_spans": [[400, 432]],
+      "diffusion_steps": 4,
+      "batch_size": 1,
+      "regions": [
+        {"region_id": "S0", "start": 0, "end": 400, "stable": true, "parents": []},
+        {"region_id": "X0", "start": 400, "end": 432, "stable": false, "parents": ["S0"]},
+        {"region_id": "S1", "start": 432, "end": 1024, "stable": true, "parents": ["S0"]}
+      ]
+    },
+    {
+      "case_id": "two-distant-a16-s4-b1",
+      "total_tokens_per_request": 1024,
+      "active_spans": [[128, 144], [896, 912]],
+      "diffusion_steps": 4,
+      "batch_size": 1,
+      "regions": [
+        {"region_id": "S0", "start": 0, "end": 128, "stable": true, "parents": []},
+        {"region_id": "X0", "start": 128, "end": 144, "stable": false, "parents": ["S0"]},
+        {"region_id": "S1", "start": 144, "end": 896, "stable": true, "parents": ["S0"]},
+        {"region_id": "X1", "start": 896, "end": 912, "stable": false, "parents": ["S0"]},
+        {"region_id": "S2", "start": 912, "end": 1024, "stable": true, "parents": ["S0"]}
+      ]
+    },
+    {
+      "case_id": "four-spans-a8-s4-b1",
+      "total_tokens_per_request": 256,
+      "active_spans": [[32, 40], [96, 104], [160, 168], [224, 232]],
+      "diffusion_steps": 4,
+      "batch_size": 1,
+      "regions": [
+        {"region_id": "S0", "start": 0, "end": 32, "stable": true, "parents": []},
+        {"region_id": "X0", "start": 32, "end": 40, "stable": false, "parents": ["S0"]},
+        {"region_id": "S1", "start": 40, "end": 96, "stable": true, "parents": ["S0"]},
+        {"region_id": "X1", "start": 96, "end": 104, "stable": false, "parents": ["S0"]},
+        {"region_id": "S2", "start": 104, "end": 160, "stable": true, "parents": ["S0"]},
+        {"region_id": "X2", "start": 160, "end": 168, "stable": false, "parents": ["S0"]},
+        {"region_id": "S3", "start": 168, "end": 224, "stable": true, "parents": ["S0"]},
+        {"region_id": "X3", "start": 224, "end": 232, "stable": false, "parents": ["S0"]},
+        {"region_id": "S4", "start": 232, "end": 256, "stable": true, "parents": ["S0"]}
+      ]
+    }
+  ]
+}

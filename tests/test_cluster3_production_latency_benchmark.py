@@ -561,6 +561,41 @@ def test_zero_legacy_counter_does_not_hide_proven_physical_reuse():
     assert summary["publication_acceptable"] is True
 
 
+def test_summary_uses_dynamic_reuse_and_case_shape_instead_of_8192():
+    records = raw_records()
+    for record in records:
+        record["diffusion_steps"] = 2
+        record["active_token_count"] = 8
+        record["generated_top1_token_ids"] = [1] * 16
+        record["reusable_prefix_positions"] = 32
+        if record["route"] in ("cold_handoff_build", "warm_cached_suffix"):
+            record["cache_hits"] = 64
+            record["kv_reuse_evidence"].update(
+                restore_steps=2,
+                prefix_positions_per_step=32,
+                observed_reused_positions=64,
+            )
+    summary = MODULE.summarize(
+        records,
+        revision="revision",
+        hardware={"device_name": "NVIDIA A30"},
+        checkpoint={"model_scale": "2B"},
+        correctness_prerequisite_pass=True,
+        normalized_case={
+            "case_id": "dynamic",
+            "total_tokens_per_request": 40,
+            "prefix_tokens": 32,
+            "active_spans": [[32, 40]],
+            "diffusion_steps": 2,
+            "batch_size": 1,
+        },
+    )
+    assert summary["workload_sanity"]["physical_kv_reuse_proven"] is True
+    assert summary["timing_protocol"]["prefix_tokens"] == 32
+    assert summary["timing_protocol"]["active_tokens"] == 8
+    assert summary["timing_protocol"]["diffusion_steps"] == 2
+
+
 def test_production_environment_rejects_debug_and_trace_modes(monkeypatch):
     monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "")
     with pytest.raises(RuntimeError, match="CUDA_LAUNCH_BLOCKING"):

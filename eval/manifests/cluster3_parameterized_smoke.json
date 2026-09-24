@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "case_id": "p2048-a64-s4-b1",
+      "total_tokens_per_request": 2112,
+      "prefix_tokens": 2048,
+      "active_spans": [[2048, 2112]],
+      "diffusion_steps": 4,
+      "batch_size": 1
+    },
+    {
+      "case_id": "p512-a128-s2-b1",
+      "total_tokens_per_request": 640,
+      "prefix_tokens": 512,
+      "active_spans": [[512, 640]],
+      "diffusion_steps": 2,
+      "batch_size": 1
+    },
+    {
+      "case_id": "p512-a512-s4-b1",
+      "total_tokens_per_request": 1024,
+      "prefix_tokens": 512,
+      "active_spans": [[512, 1024]],
+      "diffusion_steps": 4,
+      "batch_size": 1
+    },
+    {
+      "case_id": "two-distant-spans",
+      "total_tokens_per_request": 1024,
+      "active_spans": [[100, 120], [900, 920]],
+      "diffusion_steps": 4,
+      "batch_size": 1,
+      "regions": [
+        {"region_id": "S0", "start": 0, "end": 100, "stable": true, "parents": []},
+        {"region_id": "X0", "start": 100, "end": 120, "stable": false, "parents": ["S0"]},
+        {"region_id": "S1", "start": 120, "end": 900, "stable": true, "parents": ["S0"]},
+        {"region_id": "X1", "start": 900, "end": 920, "stable": false, "parents": ["S0"]},
+        {"region_id": "S2", "start": 920, "end": 1024, "stable": true, "parents": ["S0"]}
+      ]
+    },
+    {
+      "case_id": "four-active-spans",
+      "total_tokens_per_request": 1024,
+      "active_spans": [[128, 144], [384, 400], [640, 656], [896, 912]],
+      "diffusion_steps": 4,
+      "batch_size": 1,
+      "regions": [
+        {"region_id": "S0", "start": 0, "end": 128, "stable": true, "parents": []},
+        {"region_id": "X0", "start": 128, "end": 144, "stable": false, "parents": ["S0"]},
+        {"region_id": "S1", "start": 144, "end": 384, "stable": true, "parents": ["S0"]},
+        {"region_id": "X1", "start": 384, "end": 400, "stable": false, "parents": ["S0"]},
+        {"region_id": "S2", "start": 400, "end": 640, "stable": true, "parents": ["S0"]},
+        {"region_id": "X2", "start": 640, "end": 656, "stable": false, "parents": ["S0"]},
+        {"region_id": "S3", "start": 656, "end": 896, "stable": true, "parents": ["S0"]},
+        {"region_id": "X3", "start": 896, "end": 912, "stable": false, "parents": ["S0"]},
+        {"region_id": "S4", "start": 912, "end": 1024, "stable": true, "parents": ["S0"]}
+      ]
+    }
+  ]
+}

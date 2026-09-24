@@ -129,6 +129,17 @@ def _explicit_regions(
     )
     if region_active_spans != active_spans:
         raise ValueError("active_spans must exactly match non-stable regions")
+    known_ids = {region.region_id for region in regions}
+    missing_parents = sorted(
+        {
+            parent
+            for region in regions
+            for parent in region.parents
+            if parent not in known_ids
+        }
+    )
+    if missing_parents:
+        raise ValueError(f"regions contain unknown parent IDs: {missing_parents}")
     return tuple(regions)
 
 
