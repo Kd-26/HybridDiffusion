@@ -206,6 +206,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", default=DEFAULT_SEED, type=int)
     parser.add_argument("--max-total-tokens", default=4096, type=int)
     parser.add_argument("--timed-repetitions", default=10, type=int)
+    parser.add_argument(
+        "--warmups",
+        default=3,
+        type=int,
+        help="Production-only untimed repetitions per route and variant.",
+    )
+    parser.add_argument(
+        "--routes",
+        nargs="+",
+        default=("full_replay", "cold_handoff_build", "warm_cached_suffix"),
+        choices=("full_replay", "cold_handoff_build", "warm_cached_suffix"),
+        help="Production routes to execute; cached routes require full_replay.",
+    )
+    parser.add_argument(
+        "--case-manifest",
+        type=Path,
+        help="Versioned production case manifest; omitted for the legacy case.",
+    )
     parser.add_argument("--debug-sync-stages", action="store_true")
     parser.add_argument("--correctness-artifact", type=Path)
     parser.add_argument("--preflight-json", type=Path)
@@ -220,18 +238,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         raise ValueError("--device must be non-negative")
     if args.max_total_tokens <= 0:
         raise ValueError("--max-total-tokens must be positive")
-    if args.timed_repetitions < 10:
-        raise ValueError("--timed-repetitions must be at least 10")
+    if args.timed_repetitions <= 0:
+        raise ValueError("--timed-repetitions must be positive")
+    if args.warmups < 0:
+        raise ValueError("--warmups must be non-negative")
+    if len(set(args.routes)) != len(args.routes):
+        raise ValueError("--routes must not contain duplicates")
     if args.profile == "production_efficiency":
-        if args.timed_repetitions != 10:
-            raise ValueError("production_efficiency requires exactly 10 repetitions")
         if args.debug_sync_stages:
             raise ValueError("production_efficiency forbids debug synchronization")
+        if any(route != "full_replay" for route in args.routes) and (
+            "full_replay" not in args.routes
+        ):
+            raise ValueError("cached production routes require full_replay")
         if args.correctness_artifact is None or args.preflight_json is None:
             raise ValueError(
                 "production_efficiency requires --correctness-artifact and "
                 "--preflight-json"
             )
+    elif args.timed_repetitions < 10:
+        raise ValueError("validation profiles require at least 10 repetitions")
     return args
 
 

@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import random
 import statistics
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
@@ -46,6 +48,16 @@ FORBIDDEN_PRODUCTION_ENVIRONMENT = (
     "SGLANG_HYBRID_EXACT_HANDOFF_DEBUG",
     "SGLANG_HYBRID_EXACT_HANDOFF_DEBUG_SYNC",
 )
+
+
+def _load_local_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load Python module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _validate_production_environment() -> None:
@@ -142,28 +154,41 @@ def _require_paired_output_hash(
 
 
 def _stats(
-    samples: Sequence[float], *, seed: int, allow_negative: bool = False
+    samples: Sequence[float],
+    *,
+    seed: int,
+    allow_negative: bool = False,
+    expected_count: Optional[int] = None,
 ) -> dict[str, Any]:
     values = [float(value) for value in samples]
-    if len(values) != MEASURED_REPETITIONS or any(
+    expected_count = MEASURED_REPETITIONS if expected_count is None else expected_count
+    if len(values) != expected_count or any(
         not math.isfinite(value) or (value < 0 and not allow_negative)
         for value in values
     ):
         qualifier = "finite" if allow_negative else "finite nonnegative"
-        raise RuntimeError(f"latency evidence requires ten {qualifier} samples")
+        raise RuntimeError(
+            f"latency evidence requires {expected_count} {qualifier} samples"
+        )
     median = statistics.median(values)
     rng = random.Random(seed)
     medians = sorted(
         statistics.median(rng.choices(values, k=len(values)))
         for _ in range(BOOTSTRAP_REPETITIONS)
     )
+    lower_index = max(0, int(0.025 * BOOTSTRAP_REPETITIONS) - 1)
+    upper_index = min(BOOTSTRAP_REPETITIONS - 1, int(0.975 * BOOTSTRAP_REPETITIONS) - 1)
+    ordered = sorted(values)
+    p95_index = min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)
     return {
         "samples": values,
         "median": median,
+        "p50": median,
+        "p95": ordered[p95_index],
         "mad": statistics.median(abs(value - median) for value in values),
         "minimum": min(values),
         "maximum": max(values),
-        "bootstrap_95_ci": [medians[49], medians[1949]],
+        "bootstrap_95_ci": [medians[lower_index], medians[upper_index]],
     }
 
 
@@ -175,15 +200,17 @@ def bootstrap_improvement_interval(
 ) -> list[float]:
     full = [float(value) for value in full_samples]
     warm = [float(value) for value in warm_samples]
-    if len(full) != MEASURED_REPETITIONS or len(warm) != MEASURED_REPETITIONS:
-        raise RuntimeError("bootstrap comparison requires ten samples per route")
+    if not full or len(full) != len(warm):
+        raise RuntimeError("bootstrap comparison requires equal nonempty route samples")
     rng = random.Random(seed)
     improvements = sorted(
         statistics.median(rng.choices(full, k=len(full)))
         - statistics.median(rng.choices(warm, k=len(warm)))
         for _ in range(BOOTSTRAP_REPETITIONS)
     )
-    return [improvements[49], improvements[1949]]
+    lower_index = max(0, int(0.025 * BOOTSTRAP_REPETITIONS) - 1)
+    upper_index = min(BOOTSTRAP_REPETITIONS - 1, int(0.975 * BOOTSTRAP_REPETITIONS) - 1)
+    return [improvements[lower_index], improvements[upper_index]]
 
 
 class ProductionTimingEnvelope:
@@ -392,6 +419,10 @@ def _prepare_call(timer: ProductionTimingEnvelope, operation: Callable[[], Any])
 
 
 def _untimed_frontier_setup(runtime: Any, validation: Any, case: Any, token_ids):
+    started = runtime.torch.cuda.Event(enable_timing=True)
+    finished = runtime.torch.cuda.Event(enable_timing=True)
+    stream = runtime.torch.cuda.current_stream(device=runtime.device)
+    started.record(stream)
     spec = validation.build_execution_spec(case, token_ids, edited=False)
     req, batch, _ = runtime._prepare_canonical_frontier(
         f"{case.case_id}:production-warm-setup",
@@ -402,8 +433,9 @@ def _untimed_frontier_setup(runtime: Any, validation: Any, case: Any, token_ids)
     )
     runtime.model_runner.attn_backend.init_forward_metadata(batch)
     runtime.runtime._forward(batch, metadata_prepared=True)
-    runtime.torch.cuda.current_stream(device=runtime.device).synchronize()
-    return req
+    finished.record(stream)
+    stream.synchronize()
+    return req, float(started.elapsed_time(finished))
 
 
 def _discard_temporary_layer_snapshots(runtime: Any) -> None:
@@ -612,15 +644,18 @@ def execute_production_measurement(
     edited_spec = validation.build_execution_spec(case, edited_tokens, edited=True)
     plan = validation.expected_plan(edited_spec, case.edited_regions)
     replay_start = int(plan.gdn_replay_start)
-    if replay_start != case.sequence_length - len(active):
+    if replay_start <= 0 or replay_start >= case.sequence_length:
         raise RuntimeError(
-            "production workload did not retain the complete stable prefix"
+            "production cached routes require an internal replay frontier"
         )
 
     runtime._clear()
     warm_req = None
+    warm_cache_build_cuda_ms = None
     if route == "warm_cached_suffix":
-        warm_req = _untimed_frontier_setup(runtime, validation, case, original_tokens)
+        warm_req, warm_cache_build_cuda_ms = _untimed_frontier_setup(
+            runtime, validation, case, original_tokens
+        )
 
     torch.cuda.reset_peak_memory_stats(runtime.device)
     timer = ProductionTimingEnvelope(
@@ -775,6 +810,9 @@ def execute_production_measurement(
     }[route]
     executed_query_positions = sum(int(value) for value in work["query_counts"])
     attention_layers, gdn_layers = _layer_counts(runtime)
+    logical_active_attention_work = (
+        len(active) * case.diffusion_steps * attention_layers
+    )
     work_accounting_matches = (
         executed_query_positions == expected_query_positions
         and work["full_attention_query_token_layer_positions"]
@@ -826,11 +864,15 @@ def execute_production_measurement(
         "recovery_replay_count": recovery_replays,
         "fallback_count": fallback_count,
         "active_token_count": len(active),
+        "active_region_count": len(edited_spec.active_regions),
+        "reusable_prefix_positions": replay_start,
+        "full_attention_active_token_layer_positions": logical_active_attention_work,
         "full_attention_query_token_layer_positions": work[
             "full_attention_query_token_layer_positions"
         ],
         "gdn_replay_token_layer_positions": work["gdn_replay_token_layer_positions"],
         "peak_allocated_gpu_memory_bytes": peak_memory,
+        "cache_build_cuda_ms": warm_cache_build_cuda_ms,
         "workload_fingerprint": workload_fingerprint,
         "reference_execution": REFERENCE_EXECUTION,
         "attention_contract": edited_spec.attention_contract_id,
@@ -856,18 +898,24 @@ def execute_production_measurement(
     }
 
 
-def _route_records(records: Sequence[Mapping[str, Any]], route: str, variant: str):
+def _route_records(
+    records: Sequence[Mapping[str, Any]],
+    route: str,
+    variant: str,
+    *,
+    expected_count: int = MEASURED_REPETITIONS,
+):
     values = [
         record
         for record in records
         if record.get("route") == route and record.get("variant") == variant
     ]
-    if len(values) != MEASURED_REPETITIONS:
+    if len(values) != expected_count:
         raise RuntimeError(
-            f"{route}/{variant} requires exactly ten production measurements"
+            f"{route}/{variant} requires exactly {expected_count} production measurements"
         )
     if {int(value.get("repetition_index", -1)) for value in values} != set(
-        range(MEASURED_REPETITIONS)
+        range(expected_count)
     ):
         raise RuntimeError(f"{route}/{variant} has invalid repetition indices")
     if any(
@@ -886,7 +934,14 @@ def summarize(
     hardware: Mapping[str, Any],
     checkpoint: Mapping[str, Any],
     correctness_prerequisite_pass: bool,
+    normalized_case: Optional[Mapping[str, Any]] = None,
+    measured_repetitions: int = MEASURED_REPETITIONS,
+    warmups: int = WARMUP_REPETITIONS,
+    routes: Sequence[str] = ROUTES,
 ) -> dict[str, Any]:
+    routes = tuple(routes)
+    if not routes or any(route not in ROUTES for route in routes):
+        raise RuntimeError("summary routes are empty or invalid")
     if any(record.get("route") not in ROUTES for record in records):
         raise RuntimeError("production evidence contains an incorrect route label")
     if any(record.get("variant") not in VARIANTS for record in records):
@@ -898,9 +953,19 @@ def summarize(
     all_sync_counts = []
     all_workloads_identical = True
     all_workload_fingerprints = set()
-    for route_index, route in enumerate(ROUTES):
-        uninstrumented = _route_records(records, route, "uninstrumented")
-        profiled = _route_records(records, route, "minimally_profiled")
+    for route_index, route in enumerate(routes):
+        uninstrumented = _route_records(
+            records,
+            route,
+            "uninstrumented",
+            expected_count=measured_repetitions,
+        )
+        profiled = _route_records(
+            records,
+            route,
+            "minimally_profiled",
+            expected_count=measured_repetitions,
+        )
         route_hashes = {
             str(record["output_hash"]) for record in (*uninstrumented, *profiled)
         }
@@ -935,8 +1000,16 @@ def summarize(
             float(record["timing"]["production_route_total_cuda_ms"])
             for record in profiled
         ]
-        uninstrumented_stats = _stats(uninstrumented_cuda, seed=101 + route_index)
-        profiled_stats = _stats(profiled_cuda, seed=111 + route_index)
+        uninstrumented_stats = _stats(
+            uninstrumented_cuda,
+            seed=101 + route_index,
+            expected_count=measured_repetitions,
+        )
+        profiled_stats = _stats(
+            profiled_cuda,
+            seed=111 + route_index,
+            expected_count=measured_repetitions,
+        )
         if uninstrumented_stats["median"] <= 0:
             raise RuntimeError("production CUDA latency median must be positive")
         overhead[route] = (
@@ -955,6 +1028,7 @@ def summarize(
                     for record in uninstrumented
                 ],
                 seed=121 + route_index,
+                expected_count=measured_repetitions,
             ),
             "uninstrumented_cuda_latency_ms": uninstrumented_stats,
             "minimally_profiled_cuda_latency_ms": profiled_stats,
@@ -964,6 +1038,7 @@ def summarize(
                     for record in profiled
                 ],
                 seed=131 + route_index,
+                expected_count=measured_repetitions,
             ),
             "production_model_cuda_ms": _stats(
                 [
@@ -971,6 +1046,7 @@ def summarize(
                     for record in profiled
                 ],
                 seed=141 + route_index,
+                expected_count=measured_repetitions,
             ),
             "production_state_commit_cuda_ms": _stats(
                 [
@@ -978,6 +1054,7 @@ def summarize(
                     for record in profiled
                 ],
                 seed=151 + route_index,
+                expected_count=measured_repetitions,
             ),
             "production_residual_cuda_ms": _stats(
                 [
@@ -986,6 +1063,7 @@ def summarize(
                 ],
                 seed=161 + route_index,
                 allow_negative=True,
+                expected_count=measured_repetitions,
             ),
             "production_scheduler_host_ms": _stats(
                 [
@@ -993,6 +1071,7 @@ def summarize(
                     for record in profiled
                 ],
                 seed=171 + route_index,
+                expected_count=measured_repetitions,
             ),
             "peak_allocated_gpu_memory_bytes": _stats(
                 [
@@ -1000,6 +1079,7 @@ def summarize(
                     for record in uninstrumented
                 ],
                 seed=181 + route_index,
+                expected_count=measured_repetitions,
             ),
             "output_hash": next(iter(route_hashes)) if len(route_hashes) == 1 else None,
             "cache_hits": [int(record["cache_hits"]) for record in uninstrumented],
@@ -1021,6 +1101,19 @@ def summarize(
                 int(record["fallback_count"]) for record in uninstrumented
             ],
             "active_token_count": int(uninstrumented[0]["active_token_count"]),
+            "active_region_count": int(uninstrumented[0].get("active_region_count", 1)),
+            "reusable_prefix_positions": int(
+                uninstrumented[0].get("reusable_prefix_positions", 2048)
+            ),
+            "full_attention_active_token_layer_positions": [
+                int(
+                    record.get(
+                        "full_attention_active_token_layer_positions",
+                        record["full_attention_query_token_layer_positions"],
+                    )
+                )
+                for record in uninstrumented
+            ],
             "full_attention_query_token_layer_positions": [
                 int(record["full_attention_query_token_layer_positions"])
                 for record in uninstrumented
@@ -1037,20 +1130,75 @@ def summarize(
                 next(iter(fingerprints)) if len(fingerprints) == 1 else None
             ),
             "reference_execution": str(uninstrumented[0]["reference_execution"]),
+            "cache_build_cuda_ms": (
+                _stats(
+                    [float(record["cache_build_cuda_ms"]) for record in uninstrumented],
+                    seed=191 + route_index,
+                    expected_count=measured_repetitions,
+                )
+                if all(
+                    record.get("cache_build_cuda_ms") is not None
+                    for record in uninstrumented
+                )
+                else None
+            ),
         }
 
+    first_record = records[0]
+    diffusion_steps = int(first_record["diffusion_steps"])
+    active_tokens = int(first_record["active_token_count"])
+    reusable_prefix = int(first_record.get("reusable_prefix_positions", 2048))
     full = route_summaries["full_replay"]["uninstrumented_cuda_latency_ms"]
-    cold = route_summaries["cold_handoff_build"]["uninstrumented_cuda_latency_ms"]
-    warm = route_summaries["warm_cached_suffix"]["uninstrumented_cuda_latency_ms"]
-    improvement_ci = bootstrap_improvement_interval(full["samples"], warm["samples"])
-    reliable = improvement_ci[0] > 0.0
-    warm_speedup = full["median"] / warm["median"]
-    warm_reduction = 100.0 * (full["median"] - warm["median"]) / full["median"]
-    per_step_saving = (full["median"] - warm["median"]) / 4.0
-    cold_extra = cold["median"] - warm["median"]
-    cold_amortization = cold_extra / per_step_saving if per_step_saving > 0 else None
+    cold = (
+        route_summaries["cold_handoff_build"]["uninstrumented_cuda_latency_ms"]
+        if "cold_handoff_build" in route_summaries
+        else None
+    )
+    warm = (
+        route_summaries["warm_cached_suffix"]["uninstrumented_cuda_latency_ms"]
+        if "warm_cached_suffix" in route_summaries
+        else None
+    )
+    improvement_ci = (
+        bootstrap_improvement_interval(full["samples"], warm["samples"])
+        if warm is not None
+        else None
+    )
+    reliable = improvement_ci is not None and improvement_ci[0] > 0.0
+    warm_speedup = full["median"] / warm["median"] if warm is not None else None
+    warm_reduction = (
+        100.0 * (full["median"] - warm["median"]) / full["median"]
+        if warm is not None
+        else None
+    )
+    per_step_saving = (
+        (full["median"] - warm["median"]) / diffusion_steps
+        if warm is not None
+        else None
+    )
+    cold_extra = (
+        cold["median"] - warm["median"]
+        if cold is not None and warm is not None
+        else None
+    )
+    cold_amortization = (
+        cold_extra / per_step_saving
+        if cold_extra is not None
+        and per_step_saving is not None
+        and per_step_saving > 0
+        else None
+    )
 
-    warm_records = _route_records(records, "warm_cached_suffix", "uninstrumented")
+    warm_records = (
+        _route_records(
+            records,
+            "warm_cached_suffix",
+            "uninstrumented",
+            expected_count=measured_repetitions,
+        )
+        if "warm_cached_suffix" in routes
+        else []
+    )
     output_hashes_identical = (
         len(all_hashes) == 1
         and len(next(iter(all_hashes))) == 64
@@ -1067,19 +1215,39 @@ def summarize(
     sanity = {
         "full_replay_processes_prefix": all(
             bool(record["full_replay_processed_prefix"])
-            for record in _route_records(records, "full_replay", "uninstrumented")
+            for record in _route_records(
+                records,
+                "full_replay",
+                "uninstrumented",
+                expected_count=measured_repetitions,
+            )
         ),
         "full_replay_prefix_positions_preserved": all(
             bool(record["full_replay_prefix_positions_preserved"])
-            for record in _route_records(records, "full_replay", "uninstrumented")
+            for record in _route_records(
+                records,
+                "full_replay",
+                "uninstrumented",
+                expected_count=measured_repetitions,
+            )
         ),
         "full_replay_suffix_positions_preserved": all(
             bool(record["full_replay_suffix_positions_preserved"])
-            for record in _route_records(records, "full_replay", "uninstrumented")
+            for record in _route_records(
+                records,
+                "full_replay",
+                "uninstrumented",
+                expected_count=measured_repetitions,
+            )
         ),
         "full_replay_executes_full_sequence_each_step": all(
             bool(record["full_replay_full_sequence_work"])
-            for record in _route_records(records, "full_replay", "uninstrumented")
+            for record in _route_records(
+                records,
+                "full_replay",
+                "uninstrumented",
+                expected_count=measured_repetitions,
+            )
         ),
         "route_work_accounting_matches": all(
             bool(record["work_accounting_matches"])
@@ -1094,12 +1262,13 @@ def summarize(
             record["kv_reuse_evidence"].get("method")
             == "canonical_prefix_page_table_identity"
             and record["kv_reuse_evidence"].get("physical_locations_match") is True
-            and int(record["kv_reuse_evidence"].get("restore_steps", 0)) == 4
+            and int(record["kv_reuse_evidence"].get("restore_steps", 0))
+            == diffusion_steps
             and int(record["kv_reuse_evidence"].get("prefix_positions_per_step", 0))
-            == 2048
+            == reusable_prefix
             and int(record["kv_reuse_evidence"].get("observed_reused_positions", 0))
-            == 8192
-            and int(record["cache_hits"]) == 8192
+            == reusable_prefix * diffusion_steps
+            and int(record["cache_hits"]) == reusable_prefix * diffusion_steps
             for record in records
             if record["route"] in ("cold_handoff_build", "warm_cached_suffix")
         ),
@@ -1116,12 +1285,13 @@ def summarize(
             }
         )
         == 1,
-        "fixed_production_workload": all(
+        "normalized_production_workload": all(
             record["attention_contract"] == "region_dag_conservative_gdn_v1"
             and record["reference_execution"] == REFERENCE_EXECUTION
-            and int(record["diffusion_steps"]) == 4
-            and int(record["active_token_count"]) == 64
-            and len(record["generated_top1_token_ids"]) == 256
+            and int(record["diffusion_steps"]) == diffusion_steps
+            and int(record["active_token_count"]) == active_tokens
+            and len(record["generated_top1_token_ids"])
+            == active_tokens * diffusion_steps
             for record in records
         ),
         "same_tokens_and_spec_across_routes": len(all_workload_fingerprints) == 1,
@@ -1156,20 +1326,22 @@ def summarize(
         "checkpoint": dict(checkpoint),
         "correctness_prerequisite_pass": bool(correctness_prerequisite_pass),
         "timing_protocol": {
-            "warmups": WARMUP_REPETITIONS,
-            "measured_repetitions": MEASURED_REPETITIONS,
+            "warmups": warmups,
+            "measured_repetitions": measured_repetitions,
             "cuda_events": True,
             "debug_synchronization": False,
             "headline_metric": "uninstrumented_cuda_latency_ms",
             "dtype": "bfloat16",
             "tensor_parallel_size": 1,
-            "batch_size": 1,
-            "prefix_tokens": 2048,
-            "active_tokens": 64,
-            "diffusion_steps": 4,
+            "batch_size": int((normalized_case or {}).get("batch_size", 1)),
+            "prefix_tokens": reusable_prefix,
+            "active_tokens": active_tokens,
+            "diffusion_steps": diffusion_steps,
+            "selected_routes": list(routes),
             "reference_execution": REFERENCE_EXECUTION,
         },
         "routes": route_summaries,
+        "normalized_case": dict(normalized_case or {}),
         "comparisons": {
             "warm_speedup": warm_speedup,
             "warm_latency_reduction_pct": warm_reduction,
@@ -1305,15 +1477,69 @@ def run_production_benchmark(
         raise RuntimeError(
             "production benchmark requires --profile production_efficiency"
         )
-    if int(args.timed_repetitions) != MEASURED_REPETITIONS:
-        raise RuntimeError("production benchmark requires exactly ten repetitions")
+    measured_repetitions = int(args.timed_repetitions)
+    warmups = int(getattr(args, "warmups", WARMUP_REPETITIONS))
+    routes = tuple(getattr(args, "routes", ROUTES))
+    if measured_repetitions <= 0 or warmups < 0:
+        raise RuntimeError(
+            "production repetitions must be positive and warmups nonnegative"
+        )
+    if (
+        not routes
+        or len(set(routes)) != len(routes)
+        or any(route not in ROUTES for route in routes)
+    ):
+        raise RuntimeError("production routes are empty, duplicated, or invalid")
+    if "full_replay" not in routes:
+        raise RuntimeError("production route comparison requires full_replay")
     if args.dtype != "bfloat16" or int(args.tp_size) != 1:
         raise RuntimeError("production benchmark requires BF16 and TP=1")
-    if int(args.max_total_tokens) < 2112:
-        raise RuntimeError("production benchmark requires capacity for 2,112 tokens")
     if bool(args.debug_sync_stages):
         raise RuntimeError("production benchmark forbids debug synchronization")
     _validate_production_environment()
+
+    # Parse and validate all cases before checkpoint inspection or runtime/model load.
+    manifest_module = _load_local_module(
+        "cluster3_benchmark_manifest",
+        Path(__file__).with_name("cluster3_benchmark_manifest.py"),
+    )
+    case_manifest = getattr(args, "case_manifest", None)
+    if case_manifest is None:
+        if hasattr(validation_module, "RegionShape"):
+            cases, normalized_cases = manifest_module.legacy_production_case(
+                validation_module, seed=int(args.seed), requested_routes=routes
+            )
+        else:
+            # Compatibility for injected unit-test validation doubles.  Real
+            # execution always uses the concrete validation module above.
+            cases = validation_module.build_manifest(args.profile, args.seed)
+            normalized_cases = [
+                {
+                    "schema_version": 1,
+                    "case_id": "p2048-a64-s4-b1",
+                    "total_tokens_per_request": 2112,
+                    "prefix_tokens": 2048,
+                    "active_spans": [[2048, 2112]],
+                    "diffusion_steps": 4,
+                    "batch_size": 1,
+                }
+            ]
+    else:
+        cases, normalized_cases = manifest_module.load_manifest(
+            Path(case_manifest),
+            validation_module=validation_module,
+            seed=int(args.seed),
+            requested_routes=routes,
+        )
+    required_capacity = max(
+        int(value["total_tokens_per_request"]) * int(value["batch_size"])
+        for value in normalized_cases
+    )
+    if int(args.max_total_tokens) < required_capacity:
+        raise RuntimeError(
+            "production benchmark token capacity is too small: "
+            f"required={required_capacity} configured={args.max_total_tokens}"
+        )
 
     preflight_module = validation_module._load_module(
         "cluster3_production_preflight",
@@ -1329,46 +1555,47 @@ def run_production_benchmark(
 
     factory = runtime_factory or validation_module.Cluster3ValidationRuntime
     runtime = factory(args)
-    cases = validation_module.build_manifest(args.profile, args.seed)
-    if len(cases) != 1:
-        raise RuntimeError("production benchmark requires exactly one fixed case")
-    case = cases[0]
     output_path = Path(args.output_jsonl)
     summary_path = Path(args.summary_json)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     records = []
-    full_replay_records: dict[tuple[str, int], Mapping[str, Any]] = {}
+    full_replay_records: dict[tuple[str, str, int], Mapping[str, Any]] = {}
     primary_error: Optional[BaseException] = None
     try:
         with output_path.open("w", encoding="utf-8") as destination:
-            for route in ROUTES:
-                for repetition in range(-WARMUP_REPETITIONS, MEASURED_REPETITIONS):
-                    for variant in VARIANTS:
-                        record = measurement_runner(
-                            runtime,
-                            validation_module,
-                            case,
-                            route,
-                            variant,
-                            repetition,
-                        )
-                        if repetition < 0:
-                            continue
-                        comparison_key = (variant, repetition)
-                        if route == "full_replay":
-                            full_replay_records[comparison_key] = dict(record)
-                        else:
-                            _require_paired_output_hash(
-                                full_replay_records.get(comparison_key, {}),
-                                record,
-                                route=route,
-                                variant=variant,
-                                repetition=repetition,
+            for case, normalized_case in zip(cases, normalized_cases):
+                case_id = str(normalized_case["case_id"])
+                for route in routes:
+                    for repetition in range(-warmups, measured_repetitions):
+                        for variant in VARIANTS:
+                            measured = measurement_runner(
+                                runtime,
+                                validation_module,
+                                case,
+                                route,
+                                variant,
+                                repetition,
                             )
-                        records.append(dict(record))
-                        destination.write(json.dumps(record, sort_keys=True) + "\n")
-                        destination.flush()
+                            if repetition < 0:
+                                continue
+                            record = dict(measured)
+                            record["case_id"] = case_id
+                            record["normalized_case"] = dict(normalized_case)
+                            comparison_key = (case_id, variant, repetition)
+                            if route == "full_replay":
+                                full_replay_records[comparison_key] = record
+                            else:
+                                _require_paired_output_hash(
+                                    full_replay_records.get(comparison_key, {}),
+                                    record,
+                                    route=route,
+                                    variant=variant,
+                                    repetition=repetition,
+                                )
+                            records.append(record)
+                            destination.write(json.dumps(record, sort_keys=True) + "\n")
+                            destination.flush()
     except BaseException as exc:
         primary_error = exc
     finally:
@@ -1380,13 +1607,38 @@ def run_production_benchmark(
     if primary_error is not None:
         raise primary_error
 
-    summary = summarize(
-        records,
-        revision=validation_module._git_revision(),
-        hardware=hardware,
-        checkpoint=actual_checkpoint,
-        correctness_prerequisite_pass=True,
-    )
+    revision = validation_module._git_revision()
+    case_summaries = []
+    for case, normalized_case in zip(cases, normalized_cases):
+        case_id = str(normalized_case["case_id"])
+        case_records = [record for record in records if record["case_id"] == case_id]
+        case_summary = summarize(
+            case_records,
+            revision=revision,
+            hardware=hardware,
+            checkpoint=actual_checkpoint,
+            correctness_prerequisite_pass=True,
+            normalized_case=normalized_case,
+            measured_repetitions=measured_repetitions,
+            warmups=warmups,
+            routes=routes,
+        )
+        case_summaries.append(case_summary)
+    if len(case_summaries) == 1:
+        summary = case_summaries[0]
+    else:
+        summary = {
+            "schema_version": SCHEMA_VERSION,
+            "revision": revision,
+            "hardware": dict(hardware),
+            "checkpoint": dict(actual_checkpoint),
+            "case_count": len(case_summaries),
+            "case_ids": [value["case_id"] for value in normalized_cases],
+            "cases": case_summaries,
+            "publication_acceptable": all(
+                value["publication_acceptable"] for value in case_summaries
+            ),
+        }
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
