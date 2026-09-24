@@ -224,6 +224,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Versioned production case manifest; omitted for the legacy case.",
     )
+    parser.add_argument(
+        "--adaptive-router-policy",
+        type=Path,
+        help="Execute an additional adaptive route using this policy JSON.",
+    )
+    parser.add_argument(
+        "--adaptive-output-jsonl",
+        type=Path,
+        help="Separate JSONL for actually executed adaptive-route evidence.",
+    )
     parser.add_argument("--debug-sync-stages", action="store_true")
     parser.add_argument("--correctness-artifact", type=Path)
     parser.add_argument("--preflight-json", type=Path)
@@ -244,6 +254,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         raise ValueError("--warmups must be non-negative")
     if len(set(args.routes)) != len(args.routes):
         raise ValueError("--routes must not contain duplicates")
+    if bool(args.adaptive_router_policy) != bool(args.adaptive_output_jsonl):
+        raise ValueError(
+            "--adaptive-router-policy and --adaptive-output-jsonl must be used together"
+        )
     if args.profile == "production_efficiency":
         if args.debug_sync_stages:
             raise ValueError("production_efficiency forbids debug synchronization")

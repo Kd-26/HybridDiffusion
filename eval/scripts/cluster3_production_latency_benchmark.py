@@ -1540,6 +1540,20 @@ def run_production_benchmark(
             "production benchmark token capacity is too small: "
             f"required={required_capacity} configured={args.max_total_tokens}"
         )
+    adaptive_policy_path = getattr(args, "adaptive_router_policy", None)
+    adaptive_output_path = getattr(args, "adaptive_output_jsonl", None)
+    if bool(adaptive_policy_path) != bool(adaptive_output_path):
+        raise RuntimeError("adaptive policy and output path must be supplied together")
+    adaptive_router = None
+    router_module = None
+    if adaptive_policy_path:
+        router_module = _load_local_module(
+            "cluster3_latency_router_for_benchmark",
+            Path(__file__).parents[1] / "sglang/srt/dllm/region/latency_router.py",
+        )
+        adaptive_router = router_module.ConservativeLatencyRouter.from_path(
+            Path(adaptive_policy_path)
+        )
 
     preflight_module = validation_module._load_module(
         "cluster3_production_preflight",
@@ -1555,11 +1569,13 @@ def run_production_benchmark(
 
     factory = runtime_factory or validation_module.Cluster3ValidationRuntime
     runtime = factory(args)
+    revision = validation_module._git_revision()
     output_path = Path(args.output_jsonl)
     summary_path = Path(args.summary_json)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     records = []
+    adaptive_records = []
     full_replay_records: dict[tuple[str, str, int], Mapping[str, Any]] = {}
     primary_error: Optional[BaseException] = None
     try:
@@ -1582,6 +1598,7 @@ def run_production_benchmark(
                             record = dict(measured)
                             record["case_id"] = case_id
                             record["normalized_case"] = dict(normalized_case)
+                            record["benchmark_revision"] = revision
                             comparison_key = (case_id, variant, repetition)
                             if route == "full_replay":
                                 full_replay_records[comparison_key] = record
@@ -1596,6 +1613,103 @@ def run_production_benchmark(
                             records.append(record)
                             destination.write(json.dumps(record, sort_keys=True) + "\n")
                             destination.flush()
+        if adaptive_router is not None:
+            adaptive_path = Path(adaptive_output_path)
+            adaptive_path.parent.mkdir(parents=True, exist_ok=True)
+            with adaptive_path.open("w", encoding="utf-8") as destination:
+                for case, normalized_case in zip(cases, normalized_cases):
+                    case_id = str(normalized_case["case_id"])
+                    inputs = router_module.router_inputs_from_normalized_case(
+                        normalized_case,
+                        cache_available="warm_cached_suffix" in routes,
+                        cache_state=(
+                            "warm" if "warm_cached_suffix" in routes else "absent"
+                        ),
+                        cache_constructible="cold_handoff_build" in routes,
+                        compatible=True,
+                    )
+                    for repetition in range(measured_repetitions):
+                        decision_started = time.perf_counter_ns()
+                        decision = adaptive_router.decide(inputs)
+                        decision_overhead_ms = (
+                            time.perf_counter_ns() - decision_started
+                        ) / 1_000_000.0
+                        selected_route = decision.selected_route
+                        if selected_route not in routes:
+                            selected_route = "full_replay"
+                        actual = dict(
+                            measurement_runner(
+                                runtime,
+                                validation_module,
+                                case,
+                                selected_route,
+                                "uninstrumented",
+                                repetition,
+                            )
+                        )
+                        reference = full_replay_records[
+                            (case_id, "uninstrumented", repetition)
+                        ]
+                        _require_paired_output_hash(
+                            reference,
+                            actual,
+                            route=selected_route,
+                            variant="adaptive",
+                            repetition=repetition,
+                        )
+                        candidates = [
+                            record
+                            for record in records
+                            if record["case_id"] == case_id
+                            and record["variant"] == "uninstrumented"
+                            and int(record["repetition_index"]) == repetition
+                        ]
+                        oracle_record = min(
+                            candidates,
+                            key=lambda record: (
+                                float(
+                                    record["timing"]["production_route_total_cuda_ms"]
+                                ),
+                                str(record["route"]),
+                            ),
+                        )
+                        actual_latency = float(
+                            actual["timing"]["production_route_total_cuda_ms"]
+                        )
+                        oracle_latency = float(
+                            oracle_record["timing"]["production_route_total_cuda_ms"]
+                        )
+                        adaptive_record = {
+                            "schema_version": SCHEMA_VERSION,
+                            "case_id": case_id,
+                            "normalized_case": dict(normalized_case),
+                            "repetition_index": repetition,
+                            "policy_decision": decision.to_dict(),
+                            "selected_route": decision.selected_route,
+                            "actual_route": selected_route,
+                            "actual_latency_ms": actual_latency,
+                            "oracle_route": oracle_record["route"],
+                            "oracle_latency_ms": oracle_latency,
+                            "actual_regret_ms": actual_latency - oracle_latency,
+                            "output_hash": actual["output_hash"],
+                            "fallback_count": int(actual["fallback_count"]),
+                            "recovery_replay_count": int(
+                                actual["recovery_replay_count"]
+                            ),
+                            "router_decision_overhead_ms": decision_overhead_ms,
+                        }
+                        if (
+                            adaptive_record["fallback_count"]
+                            or adaptive_record["recovery_replay_count"]
+                        ):
+                            raise RuntimeError(
+                                "adaptive execution recovered or fell back"
+                            )
+                        adaptive_records.append(adaptive_record)
+                        destination.write(
+                            json.dumps(adaptive_record, sort_keys=True) + "\n"
+                        )
+                        destination.flush()
     except BaseException as exc:
         primary_error = exc
     finally:
@@ -1607,7 +1721,6 @@ def run_production_benchmark(
     if primary_error is not None:
         raise primary_error
 
-    revision = validation_module._git_revision()
     case_summaries = []
     for case, normalized_case in zip(cases, normalized_cases):
         case_id = str(normalized_case["case_id"])
@@ -1638,6 +1751,14 @@ def run_production_benchmark(
             "publication_acceptable": all(
                 value["publication_acceptable"] for value in case_summaries
             ),
+        }
+    if adaptive_records:
+        summary["adaptive_execution"] = {
+            "record_count": len(adaptive_records),
+            "output_jsonl": str(adaptive_output_path),
+            "all_output_hashes_match_candidates": True,
+            "zero_fallback_and_recovery": True,
+            "records": adaptive_records,
         }
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
