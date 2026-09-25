@@ -16,6 +16,7 @@ import importlib.util
 import json
 import logging
 import math
+import os
 import random
 import statistics
 import subprocess
@@ -37,6 +38,14 @@ ATTENTION_ROW_OBSERVATION_POINT = "qkv_projection_input"
 ROOT = Path(__file__).resolve().parents[2]
 CLUSTER1_PATH = Path(__file__).with_name("cluster1_exact_handoff_trace.py")
 CLUSTER2_PATH = Path(__file__).with_name("cluster2_active_only_validation.py")
+ABLATION_POLICIES = (
+    "full_replay",
+    "kv_only",
+    "gdn_only",
+    "kv_gdn_conservative",
+    "kv_gdn_oracle",
+    "adaptive",
+)
 
 
 @contextlib.contextmanager
@@ -85,6 +94,39 @@ class DeferredCudaTiming:
 
     def __radd__(self, other: Any) -> float:
         return float(other) + self.milliseconds()
+
+
+@dataclass(frozen=True)
+class RegionStateRestoreControls:
+    """Independent state-restore decisions for one Region-DAG forward."""
+
+    attention_state: bool
+    gdn_state: bool
+
+
+def resolve_region_state_restore_controls(
+    *,
+    restore: Optional[bool] = None,
+    restore_attention_state: Optional[bool] = None,
+    restore_gdn_state: Optional[bool] = None,
+) -> RegionStateRestoreControls:
+    """Resolve the legacy coupled flag or the explicit independent controls."""
+    explicit = restore_attention_state is not None or restore_gdn_state is not None
+    if restore is not None and explicit:
+        raise ValueError(
+            "legacy restore cannot be combined with independent attention/GDN "
+            "restore controls"
+        )
+    if restore is not None:
+        value = bool(restore)
+        return RegionStateRestoreControls(value, value)
+    if restore_attention_state is None or restore_gdn_state is None:
+        raise ValueError(
+            "restore_attention_state and restore_gdn_state must be supplied together"
+        )
+    return RegionStateRestoreControls(
+        bool(restore_attention_state), bool(restore_gdn_state)
+    )
 
 
 REQUIRED_RECORD_FIELDS = frozenset(
@@ -234,6 +276,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Separate JSONL for actually executed adaptive-route evidence.",
     )
+    parser.add_argument(
+        "--ablation-policy",
+        choices=ABLATION_POLICIES,
+        default=None,
+        help=(
+            "Execute one component-ablation policy. Omit this option to preserve "
+            "the legacy route benchmark. HYBRID_ABLATION_POLICY is used only when "
+            "this option is absent."
+        ),
+    )
     parser.add_argument("--debug-sync-stages", action="store_true")
     parser.add_argument("--correctness-artifact", type=Path)
     parser.add_argument("--preflight-json", type=Path)
@@ -242,6 +294,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = build_parser().parse_args(argv)
+    if args.ablation_policy is None:
+        environment_policy = os.environ.get("HYBRID_ABLATION_POLICY")
+        if environment_policy:
+            if environment_policy not in ABLATION_POLICIES:
+                raise ValueError(
+                    "HYBRID_ABLATION_POLICY must be one of "
+                    f"{ABLATION_POLICIES}: {environment_policy!r}"
+                )
+            args.ablation_policy = environment_policy
     if args.tp_size != 1:
         raise ValueError("--tp-size must be 1 until rank-aware evidence exists")
     if args.device < 0:
@@ -270,6 +331,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                 "production_efficiency requires --correctness-artifact and "
                 "--preflight-json"
             )
+        if args.ablation_policy == "adaptive" and not args.adaptive_router_policy:
+            raise ValueError(
+                "--ablation-policy adaptive requires --adaptive-router-policy and "
+                "--adaptive-output-jsonl"
+            )
+    elif args.ablation_policy is not None:
+        raise ValueError(
+            "--ablation-policy is supported only with --profile "
+            "production_efficiency"
+        )
     elif args.timed_repetitions < 10:
         raise ValueError("validation profiles require at least 10 repetitions")
     return args
@@ -1412,6 +1483,12 @@ class Cluster3ValidationRuntime:
         req.region_dag_allow_full_replay = False
         req.region_dag_initialized = initialized
         req.region_dag_restore_required = initialized and plan.gdn_replay_start > 0
+        req.region_dag_restore_attention_state = bool(
+            initialized and plan.gdn_replay_start > 0
+        )
+        req.region_dag_restore_gdn_state = bool(
+            initialized and plan.gdn_replay_start > 0
+        )
         req.region_dag_model_identity = str(Path(self.args.model_path).resolve())
         req.region_dag_model_revision = str(
             getattr(self.model_runner.server_args, "revision", "") or "local-checkpoint"
@@ -1636,7 +1713,9 @@ class Cluster3ValidationRuntime:
         spec: Any,
         case: ValidationCase,
         *,
-        restore: bool,
+        restore: Optional[bool] = None,
+        restore_attention_state: Optional[bool] = None,
+        restore_gdn_state: Optional[bool] = None,
         profilers: Any = (),
         collect_component_timing: bool = True,
     ) -> tuple[Any, dict[str, float]]:
@@ -1645,6 +1724,17 @@ class Cluster3ValidationRuntime:
         from sglang.srt.dllm.region.profiling import profile_many_phase
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+        controls = resolve_region_state_restore_controls(
+            restore=restore,
+            restore_attention_state=restore_attention_state,
+            restore_gdn_state=restore_gdn_state,
+        )
+        if controls.attention_state != controls.gdn_state:
+            raise RuntimeError(
+                "independent attention/GDN row schedules are unavailable: the "
+                "current decoder forward has one flattened row set and no per-layer "
+                "stable-prefix activation checkpoints"
+            )
         with profile_many_phase(profilers, "runtime_plan_build"):
             plan = build_region_dag_runtime_plan(
                 spec, case.edited_regions, profilers=profilers
@@ -1666,17 +1756,23 @@ class Cluster3ValidationRuntime:
                 req,
                 spec,
                 plan,
-                mode="canonical_cached" if restore else "canonical_segmented",
+                mode=(
+                    "canonical_cached"
+                    if controls.attention_state
+                    else "canonical_segmented"
+                ),
                 initialized=True,
                 profilers=profilers,
             )
             req.region_dag_frontier_established = True
-            req.region_dag_restore_required = bool(restore)
+            req.region_dag_restore_required = controls.gdn_state
+            req.region_dag_restore_attention_state = controls.attention_state
+            req.region_dag_restore_gdn_state = controls.gdn_state
         with profile_many_phase(profilers, "frontier_key_construction"):
             self._bind_frontiers(req)
         with profile_many_phase(profilers, "schedule_batch_initialization"):
             batch = self._new_batch(req)
-        phase = "kv_restore" if restore else "request_setup"
+        phase = "kv_restore" if controls.attention_state else "request_setup"
         with profile_many_phase(profilers, "schedule_batch_prepare", cuda=True):
             with profile_many_phase(profilers, phase, cuda=True):
                 _, gather_scatter_ms = self._maybe_cuda_timed(
@@ -1685,7 +1781,11 @@ class Cluster3ValidationRuntime:
                     collect_component_timing=collect_component_timing,
                 )
         batch.region_dag_query_positions_cpu = [plan.attention_query_positions]
-        batch.region_dag_restore_required_cpu = [bool(restore)]
+        batch.region_dag_attention_state_reused_cpu = [controls.attention_state]
+        batch.region_dag_gdn_restore_required_cpu = [controls.gdn_state]
+        # Compatibility alias for older executors. GDN restoration is no longer
+        # inferred from whether attention prefix locations were materialized.
+        batch.region_dag_restore_required_cpu = [controls.gdn_state]
         batch.region_dag_reference_cpu = [False]
         with profile_many_phase(profilers, "worker_batch_construction"):
             worker_batch = batch.get_model_worker_batch()
@@ -1695,10 +1795,16 @@ class Cluster3ValidationRuntime:
                 nvtx_phase="region_mask_build",
                 collect_component_timing=collect_component_timing,
             )
-        if not restore:
+        if not controls.gdn_state:
             forward_batch.region_dag_diagnostic_live_prefix_cpu = [True]
-        if bool(forward_batch.region_dag_restore_required_cpu[0]) != bool(restore):
-            raise RuntimeError("canonical suffix restore contract was not preserved")
+        if bool(forward_batch.region_dag_attention_state_reused_cpu[0]) != bool(
+            controls.attention_state
+        ):
+            raise RuntimeError("attention-state restore contract was not preserved")
+        if bool(forward_batch.region_dag_gdn_restore_required_cpu[0]) != bool(
+            controls.gdn_state
+        ):
+            raise RuntimeError("GDN-state restore contract was not preserved")
         if int(forward_batch.input_ids.numel()) != plan.query_count:
             raise RuntimeError("canonical suffix did not schedule exact replay rows")
         return forward_batch, {

@@ -3243,6 +3243,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 else None
             ),
+            region_dag_attention_state_reused_cpu=(
+                getattr(self, "region_dag_attention_state_reused_cpu", None)
+                or [
+                    bool(getattr(req, "region_dag_restore_attention_state", False))
+                    for req in self.reqs
+                ]
+                if self.reqs
+                and all(
+                    getattr(req, "region_dag_execution_spec", None) is not None
+                    for req in self.reqs
+                )
+                else None
+            ),
+            region_dag_gdn_restore_required_cpu=(
+                getattr(self, "region_dag_gdn_restore_required_cpu", None)
+                or [
+                    bool(getattr(req, "region_dag_restore_gdn_state", False))
+                    for req in self.reqs
+                ]
+                if self.reqs
+                and all(
+                    getattr(req, "region_dag_execution_spec", None) is not None
+                    for req in self.reqs
+                )
+                else None
+            ),
             region_dag_restore_required_cpu=(
                 getattr(self, "region_dag_restore_required_cpu", None)
                 or [bool(req.region_dag_restore_required) for req in self.reqs]
@@ -3513,6 +3539,8 @@ class ModelWorkerBatch:
     region_dag_runtime_plans_cpu: Optional[List[Any]] = None
     region_dag_query_positions_cpu: Optional[List[Tuple[int, ...]]] = None
     region_dag_frontier_keys_cpu: Optional[List[Dict[int, Any]]] = None
+    region_dag_attention_state_reused_cpu: Optional[List[bool]] = None
+    region_dag_gdn_restore_required_cpu: Optional[List[bool]] = None
     region_dag_restore_required_cpu: Optional[List[bool]] = None
     region_dag_reference_cpu: Optional[List[bool]] = None
     region_dag_allow_full_replay_cpu: Optional[List[bool]] = None

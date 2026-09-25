@@ -656,7 +656,12 @@ class GDNDllmBackend:
         specs = forward_batch.region_dag_execution_specs_cpu
         query_positions = forward_batch.region_dag_query_positions_cpu
         frontier_keys = forward_batch.region_dag_frontier_keys_cpu
-        restore_required = forward_batch.region_dag_restore_required_cpu
+        restore_required = getattr(
+            forward_batch, "region_dag_gdn_restore_required_cpu", None
+        )
+        if restore_required is None:
+            # Backward-compatible metadata from pre-ablation callers.
+            restore_required = forward_batch.region_dag_restore_required_cpu
         references = forward_batch.region_dag_reference_cpu
         diagnostic_live_prefixes = getattr(
             forward_batch, "region_dag_diagnostic_live_prefix_cpu", None

@@ -81,6 +81,8 @@ class ReqDllmMixin:
         self.region_dag_frontier_established = False
         self.region_dag_frontier_establishing = False
         self.region_dag_restore_required = False
+        self.region_dag_restore_attention_state = False
+        self.region_dag_restore_gdn_state = False
         self.region_dag_frontier_keys = {}
         self.region_dag_model_identity = ""
         self.region_dag_model_revision = ""

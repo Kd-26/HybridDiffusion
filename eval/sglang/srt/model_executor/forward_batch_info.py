@@ -442,6 +442,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     region_dag_runtime_plans_cpu: Optional[List[Any]] = None
     region_dag_query_positions_cpu: Optional[List[Tuple[int, ...]]] = None
     region_dag_frontier_keys_cpu: Optional[List[Dict[int, Any]]] = None
+    region_dag_attention_state_reused_cpu: Optional[List[bool]] = None
+    region_dag_gdn_restore_required_cpu: Optional[List[bool]] = None
     region_dag_restore_required_cpu: Optional[List[bool]] = None
     region_dag_reference_cpu: Optional[List[bool]] = None
     region_dag_allow_full_replay_cpu: Optional[List[bool]] = None
@@ -587,6 +589,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 "region_dag_runtime_plans_cpu",
                 "region_dag_query_positions_cpu",
                 "region_dag_frontier_keys_cpu",
+                "region_dag_attention_state_reused_cpu",
+                "region_dag_gdn_restore_required_cpu",
                 "region_dag_restore_required_cpu",
                 "region_dag_reference_cpu",
                 "region_dag_allow_full_replay_cpu",
