@@ -223,8 +223,7 @@ def alloc_token_slots(
             f"{available_and_evictable_str(tree_cache)}"
         )
         logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
+        safe_pretty_print(tree_cache)
         raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
@@ -291,8 +290,7 @@ def alloc_paged_token_slots_extend(
             f"{available_and_evictable_str(tree_cache)}"
         )
         logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
+        safe_pretty_print(tree_cache)
         raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
@@ -417,8 +415,7 @@ def alloc_paged_token_slots_decode(
             f"{available_and_evictable_str(tree_cache)}"
         )
         logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
+        safe_pretty_print(tree_cache)
         raise RuntimeError(error_msg)
 
     return out_cache_loc
@@ -505,7 +502,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             getattr(req, "mamba_pool_idx", None),
             req_pool_idx=req.req_pool_idx,
             rid=getattr(req, "rid", None),
-            has_ping_pong=getattr(req, "mamba_ping_pong_track_buffer", None) is not None,
+            has_ping_pong=getattr(req, "mamba_ping_pong_track_buffer", None)
+            is not None,
         )
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
@@ -554,5 +552,37 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     tree_cache.req_to_token_pool.free(req)
 
 
-def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
-    return tree_cache.available_and_evictable_str()
+def available_and_evictable_str(tree_cache: BasePrefixCache | None) -> str:
+    """Best-effort OOM context that never replaces the allocation failure."""
+    if tree_cache is None:
+        return "Cache diagnostics unavailable: no prefix cache was supplied."
+    describe = getattr(tree_cache, "available_and_evictable_str", None)
+    if callable(describe):
+        try:
+            return str(describe())
+        except Exception as exc:  # pragma: no cover - defensive diagnostic path
+            return f"Cache diagnostics failed: {type(exc).__name__}: {exc}"
+    allocator = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    available = getattr(allocator, "available_size", None)
+    if callable(available):
+        try:
+            return (
+                "Cache diagnostics unavailable on "
+                f"{type(tree_cache).__name__}; allocator_available={int(available())}."
+            )
+        except Exception as exc:  # pragma: no cover - defensive diagnostic path
+            return f"Allocator diagnostics failed: {type(exc).__name__}: {exc}"
+    return (
+        "Cache diagnostics unavailable on "
+        f"{type(tree_cache).__name__}: no supported diagnostic method."
+    )
+
+
+def safe_pretty_print(tree_cache: BasePrefixCache | None) -> None:
+    pretty_print = getattr(tree_cache, "pretty_print", None)
+    if not callable(pretty_print):
+        return
+    try:
+        pretty_print()
+    except Exception as exc:  # pragma: no cover - diagnostic must not mask OOM
+        logger.warning("Cache pretty-print failed during allocation error: %s", exc)
