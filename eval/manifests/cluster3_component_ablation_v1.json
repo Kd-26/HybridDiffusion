@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"case_id": "p256-a16-s2-b1", "total_tokens_per_request": 272, "prefix_tokens": 256, "active_spans": [[256, 272]], "diffusion_steps": 2, "batch_size": 1},
+    {"case_id": "p256-a16-s8-b1", "total_tokens_per_request": 272, "prefix_tokens": 256, "active_spans": [[256, 272]], "diffusion_steps": 8, "batch_size": 1},
+    {"case_id": "p256-a64-s2-b1", "total_tokens_per_request": 320, "prefix_tokens": 256, "active_spans": [[256, 320]], "diffusion_steps": 2, "batch_size": 1},
+    {"case_id": "p256-a64-s8-b1", "total_tokens_per_request": 320, "prefix_tokens": 256, "active_spans": [[256, 320]], "diffusion_steps": 8, "batch_size": 1},
+    {"case_id": "p1024-a16-s2-b1", "total_tokens_per_request": 1040, "prefix_tokens": 1024, "active_spans": [[1024, 1040]], "diffusion_steps": 2, "batch_size": 1},
+    {"case_id": "p1024-a16-s8-b1", "total_tokens_per_request": 1040, "prefix_tokens": 1024, "active_spans": [[1024, 1040]], "diffusion_steps": 8, "batch_size": 1},
+    {"case_id": "p1024-a64-s2-b1", "total_tokens_per_request": 1088, "prefix_tokens": 1024, "active_spans": [[1024, 1088]], "diffusion_steps": 2, "batch_size": 1},
+    {"case_id": "p1024-a64-s8-b1", "total_tokens_per_request": 1088, "prefix_tokens": 1024, "active_spans": [[1024, 1088]], "diffusion_steps": 8, "batch_size": 1},
+    {"case_id": "p4096-a16-s2-b1", "total_tokens_per_request": 4112, "prefix_tokens": 4096, "active_spans": [[4096, 4112]], "diffusion_steps": 2, "batch_size": 1},
+    {"case_id": "p4096-a16-s8-b1", "total_tokens_per_request": 4112, "prefix_tokens": 4096, "active_spans": [[4096, 4112]], "diffusion_steps": 8, "batch_size": 1},
+    {"case_id": "p4096-a64-s2-b1", "total_tokens_per_request": 4160, "prefix_tokens": 4096, "active_spans": [[4096, 4160]], "diffusion_steps": 2, "batch_size": 1},
+    {"case_id": "p4096-a64-s8-b1", "total_tokens_per_request": 4160, "prefix_tokens": 4096, "active_spans": [[4096, 4160]], "diffusion_steps": 8, "batch_size": 1}
+  ]
+}
