@@ -20,6 +20,7 @@ import statistics
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
@@ -28,6 +29,15 @@ SCHEMA_VERSION = 1
 ACCEPTED_CORRECTNESS_REVISION = "057dcab2261895a0e32357f5d57c65e1eb4b3b8c"
 ROUTES = ("full_replay", "cold_handoff_build", "warm_cached_suffix")
 VARIANTS = ("uninstrumented", "minimally_profiled")
+ABLATION_POLICIES = (
+    "full_replay",
+    "kv_only",
+    "gdn_only",
+    "kv_gdn_conservative",
+    "kv_gdn_oracle",
+    "adaptive",
+)
+FIXED_ABLATION_POLICIES = ABLATION_POLICIES[:-1]
 CUDA_PHASES = (
     "production_prepare_cuda",
     "production_model_cuda",
@@ -48,6 +58,159 @@ FORBIDDEN_PRODUCTION_ENVIRONMENT = (
     "SGLANG_HYBRID_EXACT_HANDOFF_DEBUG",
     "SGLANG_HYBRID_EXACT_HANDOFF_DEBUG_SYNC",
 )
+
+
+class UnsupportedAblationPolicyError(RuntimeError):
+    """The requested component policy cannot execute on this runtime."""
+
+
+@dataclass(frozen=True)
+class AblationPolicySpec:
+    name: str
+    attention_state_reused: Optional[bool]
+    gdn_state_reused: Optional[bool]
+    gdn_replay_policy: str
+    runtime_route: Optional[str]
+    component_attribution: bool
+    supported: bool
+    unsupported_reason: Optional[str] = None
+
+
+_DIVERGENT_ROW_SCHEDULE_REASON = (
+    "the current decoder forward uses one flattened row set for attention and GDN "
+    "and has no per-layer stable-prefix activation checkpoints; executing one "
+    "component on the suffix while replaying the other on the full sequence would "
+    "either redo the reduced component or introduce an unmeasured activation cache"
+)
+_ORACLE_STATE_REASON = (
+    "the runtime stores cumulative GDN prefix frontiers, not independently "
+    "composable per-region entry/exit states; an exact non-contiguous Region-DAG "
+    "closure cannot be restored and stitched without changing recurrent semantics"
+)
+
+_ABLATION_POLICY_SPECS = {
+    "full_replay": AblationPolicySpec(
+        "full_replay", False, False, "full_sequence", "full_replay", True, True
+    ),
+    "kv_only": AblationPolicySpec(
+        "kv_only",
+        True,
+        False,
+        "full_sequence",
+        None,
+        True,
+        False,
+        _DIVERGENT_ROW_SCHEDULE_REASON,
+    ),
+    "gdn_only": AblationPolicySpec(
+        "gdn_only",
+        False,
+        True,
+        "conservative_dependency_closure",
+        None,
+        True,
+        False,
+        _DIVERGENT_ROW_SCHEDULE_REASON,
+    ),
+    "kv_gdn_conservative": AblationPolicySpec(
+        "kv_gdn_conservative",
+        True,
+        True,
+        "conservative_dependency_closure",
+        "warm_cached_suffix",
+        True,
+        True,
+    ),
+    "kv_gdn_oracle": AblationPolicySpec(
+        "kv_gdn_oracle",
+        True,
+        True,
+        "exact_region_dag_closure",
+        None,
+        True,
+        False,
+        _ORACLE_STATE_REASON,
+    ),
+    "adaptive": AblationPolicySpec(
+        "adaptive", None, None, "adaptive_router", None, False, True
+    ),
+}
+
+
+def ablation_policy_spec(policy: str) -> AblationPolicySpec:
+    try:
+        return _ABLATION_POLICY_SPECS[str(policy)]
+    except KeyError as exc:
+        raise ValueError(f"unknown ablation policy: {policy!r}") from exc
+
+
+def require_implementable_ablation_policy(policy: str) -> AblationPolicySpec:
+    spec = ablation_policy_spec(policy)
+    if not spec.supported:
+        raise UnsupportedAblationPolicyError(
+            f"ablation policy {policy!r} is not implementable: "
+            f"{spec.unsupported_reason}"
+        )
+    return spec
+
+
+def capacity_for_prefix(prefix_tokens: int) -> int:
+    """Capacity contract for isolated suffix-ablation jobs."""
+    prefix_tokens = int(prefix_tokens)
+    if prefix_tokens <= 0:
+        raise ValueError("prefix_tokens must be positive")
+    return 16384 if prefix_tokens >= 4096 else 8192
+
+
+def expected_ablation_work(
+    policy: str,
+    *,
+    sequence_length: int,
+    conservative_replay_positions: int,
+    diffusion_steps: int,
+    oracle_replay_positions: Optional[int] = None,
+) -> dict[str, int]:
+    """Return the policy contract in token positions, never layer-multiplied."""
+    sequence_length = int(sequence_length)
+    conservative = int(conservative_replay_positions)
+    steps = int(diffusion_steps)
+    if sequence_length <= 0 or steps <= 0 or not 0 < conservative < sequence_length:
+        raise ValueError("ablation work shape is invalid")
+    prefix = sequence_length - conservative
+    if policy == "full_replay":
+        attention = gdn = sequence_length
+        restored_kv = restored_gdn = 0
+    elif policy == "kv_only":
+        attention, gdn = conservative, sequence_length
+        restored_kv, restored_gdn = prefix, 0
+    elif policy == "gdn_only":
+        attention, gdn = sequence_length, conservative
+        restored_kv, restored_gdn = 0, prefix
+    elif policy == "kv_gdn_conservative":
+        attention = gdn = conservative
+        restored_kv = restored_gdn = prefix
+    elif policy == "kv_gdn_oracle":
+        if oracle_replay_positions is None:
+            raise UnsupportedAblationPolicyError(
+                "oracle work requires independently restorable per-region GDN state"
+            )
+        oracle = int(oracle_replay_positions)
+        if oracle <= 0 or oracle > conservative:
+            raise ValueError(
+                "oracle replay must be positive and no larger than conservative"
+            )
+        attention, gdn = conservative, oracle
+        restored_kv, restored_gdn = prefix, sequence_length - oracle
+    else:
+        raise ValueError(
+            "adaptive work is decision-dependent, not component attribution"
+        )
+    return {
+        "executed_attention_query_positions": attention * steps,
+        "executed_gdn_replay_positions": gdn * steps,
+        "restored_kv_positions": restored_kv * steps,
+        "restored_gdn_positions": restored_gdn * steps,
+    }
 
 
 def _load_local_module(name: str, path: Path) -> Any:
@@ -137,7 +300,16 @@ def _require_paired_output_hash(
     variant: str,
     repetition: int,
 ) -> None:
-    if str(candidate.get("output_hash", "")) == str(reference.get("output_hash", "")):
+    reference_ids = [
+        int(value) for value in reference.get("generated_top1_token_ids", ())
+    ]
+    candidate_ids = [
+        int(value) for value in candidate.get("generated_top1_token_ids", ())
+    ]
+    if (
+        str(candidate.get("output_hash", "")) == str(reference.get("output_hash", ""))
+        and candidate_ids == reference_ids
+    ):
         return
     diagnostic = _output_mismatch_diagnostic(
         reference,
@@ -147,10 +319,75 @@ def _require_paired_output_hash(
         repetition=repetition,
     )
     raise RuntimeError(
-        "production output hash differs from paired full replay: "
+        "production output hash differs from paired full replay or token IDs differ: "
         f"route={route} variant={variant} repetition={repetition} "
         f"diagnostic={json.dumps(diagnostic, sort_keys=True)}"
     )
+
+
+def validate_ablation_measurement_record(
+    record: Mapping[str, Any],
+    *,
+    sequence_length: int,
+    conservative_replay_positions: int,
+    diffusion_steps: int,
+) -> None:
+    """Fail closed when labels, switches, or observed component work disagree."""
+    policy = str(record.get("ablation_policy", ""))
+    spec = require_implementable_ablation_policy(policy)
+    if not spec.component_attribution:
+        raise RuntimeError("adaptive records are not component-attribution records")
+    required = (
+        "attention_state_reused",
+        "gdn_state_reused",
+        "gdn_replay_policy",
+        "executed_attention_query_positions",
+        "executed_gdn_replay_positions",
+        "restored_kv_positions",
+        "restored_gdn_positions",
+        "fallback_count",
+        "recovery_replay_count",
+        "output_hash",
+        "generated_top1_token_ids",
+        "peak_allocated_gpu_memory_bytes",
+        "uninstrumented_cuda_latency_ms",
+        "minimally_profiled_cuda_latency_ms",
+    )
+    missing = [name for name in required if name not in record]
+    if missing:
+        raise RuntimeError(f"ablation measurement is missing fields: {missing}")
+    if bool(record["attention_state_reused"]) != spec.attention_state_reused:
+        raise RuntimeError("executed attention-state switch differs from policy")
+    if bool(record["gdn_state_reused"]) != spec.gdn_state_reused:
+        raise RuntimeError("executed GDN-state switch differs from policy")
+    if str(record["gdn_replay_policy"]) != spec.gdn_replay_policy:
+        raise RuntimeError("executed GDN replay policy differs from policy label")
+    expected = expected_ablation_work(
+        policy,
+        sequence_length=sequence_length,
+        conservative_replay_positions=conservative_replay_positions,
+        diffusion_steps=diffusion_steps,
+    )
+    mismatches = {
+        name: (int(record[name]), value)
+        for name, value in expected.items()
+        if int(record[name]) != value
+    }
+    if mismatches:
+        raise RuntimeError(f"ablation work accounting mismatch: {mismatches}")
+    if int(record["fallback_count"]) or int(record["recovery_replay_count"]):
+        raise RuntimeError("ablation measurement recovered or fell back")
+    if not record["output_hash"] or not record["generated_top1_token_ids"]:
+        raise RuntimeError("ablation measurement lacks compact output evidence")
+    if int(record["peak_allocated_gpu_memory_bytes"]) <= 0:
+        raise RuntimeError("ablation measurement lacks peak-memory evidence")
+    for name in (
+        "uninstrumented_cuda_latency_ms",
+        "minimally_profiled_cuda_latency_ms",
+    ):
+        value = record[name]
+        if value is None or not math.isfinite(float(value)) or float(value) < 0:
+            raise RuntimeError(f"ablation measurement has invalid {name}")
 
 
 def _stats(
@@ -529,16 +766,52 @@ def _prepare_restored_suffix(
     )
 
 
+def _prepare_ablation_suffix(
+    runtime: Any,
+    req: Any,
+    edited_tokens: list[int],
+    edited_spec: Any,
+    case: Any,
+    timer: ProductionTimingEnvelope,
+    *,
+    attention_state_reused: bool,
+    gdn_state_reused: bool,
+) -> tuple[Any, dict[str, float]]:
+    """Prepare explicit component controls without routing through one boolean."""
+    return _prepare_call(
+        timer,
+        lambda: runtime._prepare_frontier_suffix(
+            req,
+            edited_tokens,
+            edited_spec,
+            case,
+            restore_attention_state=bool(attention_state_reused),
+            restore_gdn_state=bool(gdn_state_reused),
+            collect_component_timing=False,
+        ),
+    )
+
+
 def _capture_prefix_reuse_observation(req: Any, forward_batch: Any) -> dict[str, Any]:
     """Retain device evidence without inspecting or synchronizing it in timing."""
     restore_flags = getattr(forward_batch, "region_dag_restore_required_cpu", None)
     restore_required = bool(
         restore_flags and len(restore_flags) == 1 and bool(restore_flags[0])
     )
+    attention_flags = getattr(
+        forward_batch, "region_dag_attention_state_reused_cpu", None
+    )
+    gdn_flags = getattr(forward_batch, "region_dag_gdn_restore_required_cpu", None)
     return {
         "req_pool_idx": getattr(req, "req_pool_idx", None),
         "prefix_indices": getattr(req, "prefix_indices", None),
         "restore_required": restore_required,
+        "attention_state_reused": bool(
+            attention_flags and len(attention_flags) == 1 and bool(attention_flags[0])
+        ),
+        "gdn_state_reused": bool(
+            gdn_flags and len(gdn_flags) == 1 and bool(gdn_flags[0])
+        ),
     }
 
 
@@ -628,6 +901,7 @@ def execute_production_measurement(
     variant: str,
     repetition: int,
     *,
+    ablation_policy: Optional[str] = None,
     stable_state_guard_factory: Optional[Callable[[Any, Any, int], Any]] = None,
     component_timer_factory: Optional[Callable[[Any], Any]] = None,
 ) -> dict[str, Any]:
@@ -635,6 +909,16 @@ def execute_production_measurement(
         raise RuntimeError(f"invalid production route label: {route}")
     if variant not in VARIANTS:
         raise RuntimeError(f"invalid production benchmark variant: {variant}")
+    policy_spec = None
+    if ablation_policy is not None:
+        policy_spec = require_implementable_ablation_policy(ablation_policy)
+        if not policy_spec.component_attribution:
+            raise RuntimeError("adaptive execution is handled by the system router")
+        if route != policy_spec.runtime_route:
+            raise RuntimeError(
+                "executed route does not match requested ablation policy: "
+                f"policy={ablation_policy} route={route}"
+            )
     _validate_production_environment()
 
     torch = __import__("torch")
@@ -751,18 +1035,37 @@ def execute_production_measurement(
                     and full_replay_prefix_positions_preserved
                     and full_replay_suffix_positions_preserved
                 )
+                if policy_spec is not None and (
+                    bool(getattr(req, "region_dag_restore_attention_state", False))
+                    or bool(getattr(req, "region_dag_restore_gdn_state", False))
+                ):
+                    raise RuntimeError(
+                        "full replay unexpectedly enabled cached component state"
+                    )
             else:
                 req = warm_req if route == "warm_cached_suffix" else cold_req
                 if req is None:
                     raise RuntimeError("production suffix route has no valid frontier")
-                batch, _ = _prepare_restored_suffix(
-                    runtime,
-                    req,
-                    edited_tokens,
-                    edited_spec,
-                    case,
-                    timer,
-                )
+                if policy_spec is None:
+                    batch, _ = _prepare_restored_suffix(
+                        runtime,
+                        req,
+                        edited_tokens,
+                        edited_spec,
+                        case,
+                        timer,
+                    )
+                else:
+                    batch, _ = _prepare_ablation_suffix(
+                        runtime,
+                        req,
+                        edited_tokens,
+                        edited_spec,
+                        case,
+                        timer,
+                        attention_state_reused=bool(policy_spec.attention_state_reused),
+                        gdn_state_reused=bool(policy_spec.gdn_state_reused),
+                    )
                 positions = _query_positions(batch)
                 stable_queries_absent = stable_queries_absent and all(
                     position >= replay_start for position in positions
@@ -777,9 +1080,18 @@ def execute_production_measurement(
                     and len(restore_flags) == 1
                     and bool(restore_flags[0])
                 )
-                prefix_reuse_observations.append(
-                    _capture_prefix_reuse_observation(req, batch)
-                )
+                observation = _capture_prefix_reuse_observation(req, batch)
+                if policy_spec is not None and (
+                    observation["attention_state_reused"]
+                    != bool(policy_spec.attention_state_reused)
+                    or observation["gdn_state_reused"]
+                    != bool(policy_spec.gdn_state_reused)
+                ):
+                    raise RuntimeError(
+                        "runtime restore metadata differs from the requested "
+                        "ablation policy"
+                    )
+                prefix_reuse_observations.append(observation)
                 if bool(restore_flags) and bool(restore_flags[0]):
                     _, gdn_layers = _layer_counts(runtime)
                     gdn_restores += gdn_layers
@@ -858,10 +1170,37 @@ def execute_production_measurement(
             raise RuntimeError("warm cached route did not restore every suffix step")
         if recovery_replays or fallback_count:
             raise RuntimeError("warm cached route recovered or fell back")
+    executed_policy = (
+        policy_spec.name
+        if policy_spec is not None
+        else {
+            "full_replay": "full_replay",
+            "warm_cached_suffix": "kv_gdn_conservative",
+            "cold_handoff_build": "legacy_cold_handoff_build",
+        }[route]
+    )
+    attention_state_reused = route in ("cold_handoff_build", "warm_cached_suffix")
+    gdn_state_reused = route in ("cold_handoff_build", "warm_cached_suffix")
+    if policy_spec is not None:
+        attention_state_reused = bool(policy_spec.attention_state_reused)
+        gdn_state_reused = bool(policy_spec.gdn_state_reused)
+    route_latency = float(timing["production_route_total_cuda_ms"])
     return {
         "schema_version": SCHEMA_VERSION,
         "profile": "production_efficiency",
         "route": route,
+        "ablation_policy": executed_policy,
+        "attention_state_reused": attention_state_reused,
+        "gdn_state_reused": gdn_state_reused,
+        "gdn_replay_policy": (
+            policy_spec.gdn_replay_policy
+            if policy_spec is not None
+            else (
+                "full_sequence"
+                if route == "full_replay"
+                else "conservative_dependency_closure"
+            )
+        ),
         "variant": variant,
         "repetition_index": repetition,
         "timing": timing,
@@ -881,6 +1220,12 @@ def execute_production_measurement(
         "kv_reuse_evidence": kv_reuse_evidence,
         "cache_misses": sum(int(value) for value in work["query_counts"]),
         "gdn_state_restores": gdn_restores,
+        "executed_attention_query_positions": executed_query_positions,
+        "executed_gdn_replay_positions": executed_query_positions,
+        "restored_kv_positions": cache_hits,
+        "restored_gdn_positions": (
+            replay_start * case.diffusion_steps if gdn_state_reused else 0
+        ),
         "recovery_replay_count": recovery_replays,
         "fallback_count": fallback_count,
         "active_token_count": len(active),
@@ -892,6 +1237,12 @@ def execute_production_measurement(
         ],
         "gdn_replay_token_layer_positions": work["gdn_replay_token_layer_positions"],
         "peak_allocated_gpu_memory_bytes": peak_memory,
+        "uninstrumented_cuda_latency_ms": (
+            route_latency if variant == "uninstrumented" else None
+        ),
+        "minimally_profiled_cuda_latency_ms": (
+            route_latency if variant == "minimally_profiled" else None
+        ),
         "cache_build_cuda_ms": warm_cache_build_cuda_ms,
         "workload_fingerprint": workload_fingerprint,
         "reference_execution": REFERENCE_EXECUTION,
@@ -1486,6 +1837,36 @@ def production_hardware(device: int) -> dict[str, Any]:
     }
 
 
+def _write_unsupported_ablation_artifacts(
+    args: Any, policy_spec: AblationPolicySpec
+) -> None:
+    output_path = Path(args.output_jsonl)
+    summary_path = Path(args.summary_json)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("", encoding="utf-8")
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "cluster3_component_ablation",
+        "requested_policy": policy_spec.name,
+        "completed_policies": [],
+        "failed_policies": [],
+        "unsupported_policies": [
+            {
+                "policy": policy_spec.name,
+                "reason": policy_spec.unsupported_reason,
+            }
+        ],
+        "correctness_pass": False,
+        "publication_gate_pass": False,
+        "all_publication_gates_pass": False,
+        "publication_acceptable": False,
+    }
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
 def run_production_benchmark(
     args: Any,
     *,
@@ -1501,7 +1882,26 @@ def run_production_benchmark(
         )
     measured_repetitions = int(args.timed_repetitions)
     warmups = int(getattr(args, "warmups", WARMUP_REPETITIONS))
+    requested_ablation_policy = getattr(args, "ablation_policy", None)
+    requested_policy_spec = None
+    if requested_ablation_policy is not None:
+        requested_policy_spec = ablation_policy_spec(requested_ablation_policy)
+        if not requested_policy_spec.supported:
+            _write_unsupported_ablation_artifacts(args, requested_policy_spec)
+            raise UnsupportedAblationPolicyError(
+                f"ablation policy {requested_ablation_policy!r} is not "
+                f"implementable: {requested_policy_spec.unsupported_reason}"
+            )
     routes = tuple(getattr(args, "routes", ROUTES))
+    if (
+        requested_policy_spec is not None
+        and requested_policy_spec.component_attribution
+    ):
+        routes = (
+            ("full_replay",)
+            if requested_policy_spec.name == "full_replay"
+            else ("full_replay", str(requested_policy_spec.runtime_route))
+        )
     if measured_repetitions <= 0 or warmups < 0:
         raise RuntimeError(
             "production repetitions must be positive and warmups nonnegative"
@@ -1562,10 +1962,29 @@ def run_production_benchmark(
             "production benchmark token capacity is too small: "
             f"required={required_capacity} configured={args.max_total_tokens}"
         )
+    if (
+        requested_policy_spec is not None
+        and requested_policy_spec.component_attribution
+    ):
+        ablation_capacity = max(
+            capacity_for_prefix(int(value["prefix_tokens"]))
+            for value in normalized_cases
+        )
+        if int(args.max_total_tokens) < ablation_capacity:
+            raise RuntimeError(
+                "component ablation violates the fixed capacity policy: "
+                f"required={ablation_capacity} configured={args.max_total_tokens}"
+            )
     adaptive_policy_path = getattr(args, "adaptive_router_policy", None)
     adaptive_output_path = getattr(args, "adaptive_output_jsonl", None)
     if bool(adaptive_policy_path) != bool(adaptive_output_path):
         raise RuntimeError("adaptive policy and output path must be supplied together")
+    if (
+        requested_policy_spec is not None
+        and requested_policy_spec.name == "adaptive"
+        and not adaptive_policy_path
+    ):
+        raise RuntimeError("adaptive ablation requires a router policy and output path")
     adaptive_router = None
     router_module = None
     if adaptive_policy_path:
@@ -1606,7 +2025,18 @@ def run_production_benchmark(
                 case_id = str(normalized_case["case_id"])
                 for route in routes:
                     for repetition in range(-warmups, measured_repetitions):
+                        paired_variant_records = []
                         for variant in VARIANTS:
+                            measurement_kwargs = {}
+                            if (
+                                requested_policy_spec is not None
+                                and requested_policy_spec.component_attribution
+                            ):
+                                measurement_kwargs["ablation_policy"] = (
+                                    "full_replay"
+                                    if route == "full_replay"
+                                    else requested_policy_spec.name
+                                )
                             measured = measurement_runner(
                                 runtime,
                                 validation_module,
@@ -1614,6 +2044,7 @@ def run_production_benchmark(
                                 route,
                                 variant,
                                 repetition,
+                                **measurement_kwargs,
                             )
                             if repetition < 0:
                                 continue
@@ -1632,6 +2063,52 @@ def run_production_benchmark(
                                     variant=variant,
                                     repetition=repetition,
                                 )
+                            paired_variant_records.append(record)
+                        if repetition < 0:
+                            continue
+                        if (
+                            requested_policy_spec is not None
+                            and requested_policy_spec.component_attribution
+                        ):
+                            by_variant = {
+                                str(record["variant"]): record
+                                for record in paired_variant_records
+                            }
+                            if set(by_variant) != set(VARIANTS):
+                                raise RuntimeError(
+                                    "ablation repetition lacks both timing variants"
+                                )
+                            uninstrumented_latency = float(
+                                by_variant["uninstrumented"]["timing"][
+                                    "production_route_total_cuda_ms"
+                                ]
+                            )
+                            profiled_latency = float(
+                                by_variant["minimally_profiled"]["timing"][
+                                    "production_route_total_cuda_ms"
+                                ]
+                            )
+                            for record in paired_variant_records:
+                                record["uninstrumented_cuda_latency_ms"] = (
+                                    uninstrumented_latency
+                                )
+                                record["minimally_profiled_cuda_latency_ms"] = (
+                                    profiled_latency
+                                )
+                                validate_ablation_measurement_record(
+                                    record,
+                                    sequence_length=int(
+                                        normalized_case["total_tokens_per_request"]
+                                    ),
+                                    conservative_replay_positions=(
+                                        int(normalized_case["total_tokens_per_request"])
+                                        - int(normalized_case["prefix_tokens"])
+                                    ),
+                                    diffusion_steps=int(
+                                        normalized_case["diffusion_steps"]
+                                    ),
+                                )
+                        for record in paired_variant_records:
                             records.append(record)
                             destination.write(json.dumps(record, sort_keys=True) + "\n")
                             destination.flush()
@@ -1669,6 +2146,21 @@ def run_production_benchmark(
                                 repetition,
                             )
                         )
+                        profiled_actual = None
+                        if (
+                            requested_policy_spec is not None
+                            and requested_policy_spec.name == "adaptive"
+                        ):
+                            profiled_actual = dict(
+                                measurement_runner(
+                                    runtime,
+                                    validation_module,
+                                    case,
+                                    selected_route,
+                                    "minimally_profiled",
+                                    repetition,
+                                )
+                            )
                         reference = full_replay_records[
                             (case_id, "uninstrumented", repetition)
                         ]
@@ -1679,6 +2171,16 @@ def run_production_benchmark(
                             variant="adaptive",
                             repetition=repetition,
                         )
+                        if profiled_actual is not None:
+                            _require_paired_output_hash(
+                                full_replay_records[
+                                    (case_id, "minimally_profiled", repetition)
+                                ],
+                                profiled_actual,
+                                route=selected_route,
+                                variant="adaptive_minimally_profiled",
+                                repetition=repetition,
+                            )
                         candidates = [
                             record
                             for record in records
@@ -1703,6 +2205,8 @@ def run_production_benchmark(
                         )
                         adaptive_record = {
                             "schema_version": SCHEMA_VERSION,
+                            "ablation_policy": "adaptive",
+                            "component_attribution": False,
                             "case_id": case_id,
                             "normalized_case": dict(normalized_case),
                             "repetition_index": repetition,
@@ -1713,7 +2217,40 @@ def run_production_benchmark(
                             "oracle_route": oracle_record["route"],
                             "oracle_latency_ms": oracle_latency,
                             "actual_regret_ms": actual_latency - oracle_latency,
+                            "attention_state_reused": bool(
+                                actual["attention_state_reused"]
+                            ),
+                            "gdn_state_reused": bool(actual["gdn_state_reused"]),
+                            "gdn_replay_policy": str(actual["gdn_replay_policy"]),
+                            "executed_attention_query_positions": int(
+                                actual["executed_attention_query_positions"]
+                            ),
+                            "executed_gdn_replay_positions": int(
+                                actual["executed_gdn_replay_positions"]
+                            ),
+                            "restored_kv_positions": int(
+                                actual["restored_kv_positions"]
+                            ),
+                            "restored_gdn_positions": int(
+                                actual["restored_gdn_positions"]
+                            ),
                             "output_hash": actual["output_hash"],
+                            "generated_top1_token_ids": list(
+                                actual["generated_top1_token_ids"]
+                            ),
+                            "peak_allocated_gpu_memory_bytes": int(
+                                actual["peak_allocated_gpu_memory_bytes"]
+                            ),
+                            "uninstrumented_cuda_latency_ms": actual_latency,
+                            "minimally_profiled_cuda_latency_ms": (
+                                float(
+                                    profiled_actual["timing"][
+                                        "production_route_total_cuda_ms"
+                                    ]
+                                )
+                                if profiled_actual is not None
+                                else None
+                            ),
                             "fallback_count": int(actual["fallback_count"]),
                             "recovery_replay_count": int(
                                 actual["recovery_replay_count"]
@@ -1723,6 +2260,13 @@ def run_production_benchmark(
                         if (
                             adaptive_record["fallback_count"]
                             or adaptive_record["recovery_replay_count"]
+                            or (
+                                profiled_actual is not None
+                                and (
+                                    int(profiled_actual["fallback_count"])
+                                    or int(profiled_actual["recovery_replay_count"])
+                                )
+                            )
                         ):
                             raise RuntimeError(
                                 "adaptive execution recovered or fell back"
@@ -1781,6 +2325,18 @@ def run_production_benchmark(
             "all_output_hashes_match_candidates": True,
             "zero_fallback_and_recovery": True,
             "records": adaptive_records,
+        }
+    if requested_policy_spec is not None:
+        policy_pass = bool(summary["publication_acceptable"])
+        summary["component_ablation"] = {
+            "requested_policy": requested_policy_spec.name,
+            "component_attribution": requested_policy_spec.component_attribution,
+            "completed_policies": ([requested_policy_spec.name] if policy_pass else []),
+            "failed_policies": ([] if policy_pass else [requested_policy_spec.name]),
+            "unsupported_policies": [],
+            "correctness_pass": policy_pass,
+            "publication_gate_pass": policy_pass,
+            "all_publication_gates_pass": policy_pass,
         }
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
