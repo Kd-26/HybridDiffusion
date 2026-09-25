@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "case_id": "long-favorable-suffix",
+      "total_tokens_per_request": 2080,
+      "prefix_tokens": 2048,
+      "active_spans": [[2048, 2080]],
+      "diffusion_steps": 4,
+      "batch_size": 1
+    },
+    {
+      "case_id": "typical-suffix",
+      "total_tokens_per_request": 1152,
+      "prefix_tokens": 1024,
+      "active_spans": [[1024, 1152]],
+      "diffusion_steps": 4,
+      "batch_size": 1
+    },
+    {
+      "case_id": "four-fragmented-regions",
+      "total_tokens_per_request": 1536,
+      "active_spans": [[256, 272], [640, 656], [1024, 1040], [1280, 1296]],
+      "diffusion_steps": 4,
+      "batch_size": 1,
+      "regions": [
+        {"region_id": "S0", "start": 0, "end": 256, "stable": true, "parents": []},
+        {"region_id": "X0", "start": 256, "end": 272, "stable": false, "parents": ["S0"]},
+        {"region_id": "S1", "start": 272, "end": 640, "stable": true, "parents": ["S0"]},
+        {"region_id": "X1", "start": 640, "end": 656, "stable": false, "parents": ["S1", "X0"]},
+        {"region_id": "S2", "start": 656, "end": 1024, "stable": true, "parents": ["S1"]},
+        {"region_id": "X2", "start": 1024, "end": 1040, "stable": false, "parents": ["S2", "X1"]},
+        {"region_id": "S3", "start": 1040, "end": 1280, "stable": true, "parents": ["S2"]},
+        {"region_id": "X3", "start": 1280, "end": 1296, "stable": false, "parents": ["S3", "X2"]},
+        {"region_id": "S4", "start": 1296, "end": 1536, "stable": true, "parents": ["S3"]}
+      ]
+    }
+  ]
+}

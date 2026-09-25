@@ -627,6 +627,9 @@ def execute_production_measurement(
     route: str,
     variant: str,
     repetition: int,
+    *,
+    stable_state_guard_factory: Optional[Callable[[Any, Any, int], Any]] = None,
+    component_timer_factory: Optional[Callable[[Any], Any]] = None,
 ) -> dict[str, Any]:
     if route not in ROUTES:
         raise RuntimeError(f"invalid production route label: {route}")
@@ -656,6 +659,9 @@ def execute_production_measurement(
         warm_req, warm_cache_build_cuda_ms = _untimed_frontier_setup(
             runtime, validation, case, original_tokens
         )
+    stable_state_guard = None
+    if stable_state_guard_factory is not None and warm_req is not None:
+        stable_state_guard = stable_state_guard_factory(runtime, warm_req, replay_start)
 
     torch.cuda.reset_peak_memory_stats(runtime.device)
     timer = ProductionTimingEnvelope(
@@ -683,7 +689,13 @@ def execute_production_measurement(
     prefix_reuse_observations: list[dict[str, Any]] = []
     cold_req = None
 
-    with timer.route():
+    component_context = (
+        component_timer_factory(runtime)
+        if variant == "minimally_profiled" and component_timer_factory is not None
+        else contextlib.nullcontext(None)
+    )
+    component_timing = None
+    with component_context as component_timer, timer.route():
         if route == "cold_handoff_build":
             base_spec = validation.build_execution_spec(
                 case, original_tokens, edited=False
@@ -779,6 +791,9 @@ def execute_production_measurement(
             recovery_replays += int(metrics.recovery_replays)
             fallback_count += int(metrics.fallback_count)
 
+    if component_timer is not None:
+        component_timing = component_timer.snapshot()
+
     timing = timer.result()
     if route in ("cold_handoff_build", "warm_cached_suffix"):
         kv_reuse_evidence = verify_prefix_kv_reuse_after_timing(
@@ -800,6 +815,11 @@ def execute_production_measurement(
         }
     cache_hits = int(kv_reuse_evidence["observed_reused_positions"])
     output_hash, top1_ids = compact_output_hash_after_timing(outputs, timer)
+    stable_state_unchanged = True
+    if stable_state_guard is not None:
+        stable_state_unchanged = bool(stable_state_guard())
+        if not stable_state_unchanged:
+            raise RuntimeError("warm route mutated reusable KV/GDN state")
     peak_memory = int(torch.cuda.max_memory_allocated(runtime.device))
     expected_query_positions = {
         "full_replay": case.sequence_length * case.diffusion_steps,
@@ -895,6 +915,8 @@ def execute_production_measurement(
             or (replay_start > 0 and cache_hits > 0 and restore_contract_observed)
         ),
         "trace_hooks_installed": False,
+        "stable_state_unchanged": stable_state_unchanged,
+        "component_timing": component_timing,
     }
 
 
